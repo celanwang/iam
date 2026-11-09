@@ -31,4 +31,10 @@ docs(design): add design outline
 More detail in a second paragraph...
 ```
 
+## Changelog
+
+- For notable docs/features/fixes, add a short English bullet under
+  `CHANGELOG.md` → `## [Unreleased]` (`Added` / `Changed` / `Fixed` / …).
+- Do not dump every commit into the changelog.
+
 Do not use `--no-verify` unless the user explicitly asks.

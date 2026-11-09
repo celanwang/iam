@@ -5,6 +5,7 @@ A general IM engine built for 10B scale.
 ## Docs
 
 - Design direction: [`docs/design.md`](docs/design.md)
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 - Contributing (branches, commits, PRs): [`CONTRIBUTING.md`](CONTRIBUTING.md)
 
 ## Stack (locked)

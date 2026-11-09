@@ -43,6 +43,17 @@ Avoid multi-paragraph messages, Chinese commit subjects, and stacking unrelated 
 - Keep the PR scoped to one concern when practical.
 - Design freezes and architecture changes should reference `docs/design.md`.
 
+## Changelog
+
+- Notable changes belong in [`CHANGELOG.md`](CHANGELOG.md) under `[Unreleased]`.
+- Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) categories:
+  `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.
+- Write entries in English, short and concrete; group by category, not by commit.
+- Do not list every commit. Skip pure chores unless they affect contributors
+  (for example ignore rules or required workflow docs).
+- When cutting a release, move `[Unreleased]` items into a dated `## [vX.Y.Z]`
+  section that matches the git tag.
+
 ## Design source of truth
 
 - Product and architecture direction: [`docs/design.md`](docs/design.md)
