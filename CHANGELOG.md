@@ -17,5 +17,3 @@ a dated version section when cutting a release.
 - Project design direction for a Rust-based general IM engine (`docs/design.md`).
 - Contributor conventions for branching, one-line English commits, and PRs
   (`CONTRIBUTING.md`).
-- Cursor project rules for git workflow and locked project basics
-  (`.cursor/rules/`).
