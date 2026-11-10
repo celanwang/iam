@@ -19,6 +19,10 @@ a dated version section when cutting a release.
   state transitions, recovery flows, and acceptance scenarios (`docs/protocol.md`).
 - Contributor conventions for branching, one-line English commits, and PRs
   (`CONTRIBUTING.md`).
+- Protocol core crates: frozen `iam.protocol` IDL, `iam-protocol` frame/codec,
+  in-memory `iam-core` AUTH/SEND/PUSH/SYNC semantics, and `iam-loop` closed-loop
+  integration tests.
+
 
 ### Changed
 
