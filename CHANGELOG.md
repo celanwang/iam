@@ -29,8 +29,16 @@ a dated version section when cutting a release.
   token key-id/purpose checks, SYNC `max_bytes` paging, entrance `RATE_LIMITED`,
   and ERROR matrix / account / HISTORY loop coverage.
 
+### Fixed
 
+- Enforce send-result expiry and closure cleanup consistently, retain terminal
+  rejections, and invalidate connections on closing protocol errors.
+- Isolate tenant data and device sessions and deliver messages to other sender devices.
 
+### Security
+
+- Encrypt opaque tokens with random nonces and per-engine keys, bind tenant
+  identity, and support retained verification keys during rotation.
 
 ### Changed
 

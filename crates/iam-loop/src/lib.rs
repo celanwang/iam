@@ -55,7 +55,7 @@ impl LoopWorld {
         let mut engine = Engine::new(now_ms);
         engine.store.seed_user(1, 100, b"token-a".to_vec());
         engine.store.seed_user(1, 200, b"token-b".to_vec());
-        engine.store.seed_direct(1, 100, 200);
+        engine.store.seed_direct(1, 1, 100, 200);
         let mut peers = HashMap::new();
         peers.insert("a", Peer::new());
         peers.insert("b", Peer::new());
@@ -292,7 +292,12 @@ impl LoopWorld {
             let peer = self.peers.get_mut(name).unwrap();
             (peer.next_req_id(), peer.connection_id)
         };
-        let conv = self.engine.store.conversations.get(&conversation_id).unwrap();
+        let conv = self
+            .engine
+            .store
+            .conversations
+            .get(&(1, conversation_id))
+            .unwrap();
         let body = HistoryRequest {
             context: Some(StreamContext {
                 target: Some(SyncTarget {

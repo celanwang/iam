@@ -19,6 +19,7 @@ pub struct UserRecord {
 
 #[derive(Debug, Clone)]
 pub struct Conversation {
+    pub tenant_id: u64,
     pub conversation_id: u64,
     pub kind: ConversationKind,
     pub history_id: Id128,
@@ -94,12 +95,12 @@ pub struct AccountStream {
 #[derive(Default)]
 pub struct MemoryStore {
     pub users_by_token: HashMap<Vec<u8>, UserRecord>,
-    pub conversations: HashMap<u64, Conversation>,
-    pub messages: HashMap<(u64, Id128), StoredMessage>,
+    pub conversations: HashMap<(u64, u64), Conversation>,
+    pub messages: HashMap<(u64, u64, Id128), StoredMessage>,
     pub idempotency: HashMap<IdemKey, IdempotencyRecord>,
     pub connections: HashMap<Id128, ConnState>,
-    pub device_conn: HashMap<Id128, Id128>,
-    pub account_streams: HashMap<u64, AccountStream>,
+    pub device_conn: HashMap<(u64, u64, Id128), Id128>,
+    pub account_streams: HashMap<(u64, u64), AccountStream>,
     pub revoked_auth_epochs: HashSet<Id128>,
     /// Monotonic close proof watermark over client_msg time coverage (ms).
     pub close_watermark_ms: i64,
@@ -130,23 +131,26 @@ impl MemoryStore {
                 access_token: token,
             },
         );
-        self.ensure_account_stream(user_id);
+        self.ensure_account_stream(tenant_id, user_id);
     }
 
-    pub fn ensure_account_stream(&mut self, user_id: u64) {
-        self.account_streams.entry(user_id).or_insert_with(|| AccountStream {
-            epoch: generate_id128(),
-            next_event_seq: 1,
-            events: Vec::new(),
-        });
+    pub fn ensure_account_stream(&mut self, tenant_id: u64, user_id: u64) {
+        self.account_streams
+            .entry((tenant_id, user_id))
+            .or_insert_with(|| AccountStream {
+                epoch: generate_id128(),
+                next_event_seq: 1,
+                events: Vec::new(),
+            });
     }
 
-    pub fn seed_direct(&mut self, conversation_id: u64, a: u64, b: u64) -> Id128 {
+    pub fn seed_direct(&mut self, tenant_id: u64, conversation_id: u64, a: u64, b: u64) -> Id128 {
         let history_id = generate_id128();
         let mut members = HashSet::new();
         members.insert(a);
         members.insert(b);
         let conv = Conversation {
+            tenant_id,
             conversation_id,
             kind: ConversationKind::Direct,
             history_id,
@@ -156,23 +160,29 @@ impl MemoryStore {
             next_event_seq: 1,
             events: Vec::new(),
         };
-        self.conversations.insert(conversation_id, conv.clone());
+        self.conversations
+            .insert((tenant_id, conversation_id), conv.clone());
         for uid in [a, b] {
-            self.ensure_account_stream(uid);
+            self.ensure_account_stream(tenant_id, uid);
             self.push_account_upsert(uid, &conv);
         }
         history_id
     }
 
     pub fn push_account_upsert(&mut self, user_id: u64, conv: &Conversation) {
-        let stream = self.account_streams.get_mut(&user_id).unwrap();
+        let stream = self
+            .account_streams
+            .get_mut(&(conv.tenant_id, user_id))
+            .unwrap();
         let event_seq = stream.next_event_seq;
         stream.next_event_seq += 1;
         stream.events.push(StoredEvent {
             event_seq,
             change: Change {
                 event_seq: Some(event_seq),
-                payload: Some(change::Payload::ConversationUpsert(conversation_state(conv))),
+                payload: Some(change::Payload::ConversationUpsert(conversation_state(
+                    conv,
+                ))),
             },
         });
     }
@@ -199,7 +209,7 @@ impl MemoryStore {
     pub fn cleanup_expired_idempotency(&mut self) {
         let now = self.now_ms;
         let wm = self.close_watermark_ms;
-        if self.recovery_incomplete {
+        if self.recovery_incomplete || self.clock_unreliable() {
             return;
         }
         self.idempotency.retain(|_, rec| {
@@ -208,7 +218,7 @@ impl MemoryStore {
                 | IdempotencyRecord::RejectedFinal { query_until_ms, .. } => *query_until_ms,
             };
             // Keep unless server reached query_until AND watermark covers that range.
-            !(now >= query_until && wm >= query_until)
+            !(now >= query_until && wm >= query_until - QUERY_EXTRA_MS)
         });
     }
 
@@ -233,14 +243,24 @@ impl MemoryStore {
         (t, accept_until, query_until)
     }
 
-    pub fn messages_in_conversation_ordered(&self, conversation_id: u64) -> Vec<&StoredMessage> {
+    pub fn messages_in_conversation_ordered(
+        &self,
+        tenant_id: u64,
+        conversation_id: u64,
+    ) -> Vec<&StoredMessage> {
         let mut msgs: Vec<_> = self
             .messages
             .iter()
-            .filter(|((cid, _), _)| *cid == conversation_id)
+            .filter(|((tid, cid, _), _)| *tid == tenant_id && *cid == conversation_id)
             .map(|(_, m)| m)
             .collect();
-        msgs.sort_by_key(|m| m.view.position.as_ref().and_then(|p| p.create_seq).unwrap_or(0));
+        msgs.sort_by_key(|m| {
+            m.view
+                .position
+                .as_ref()
+                .and_then(|p| p.create_seq)
+                .unwrap_or(0)
+        });
         msgs
     }
 }

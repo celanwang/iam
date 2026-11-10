@@ -1,8 +1,8 @@
-use hmac::{Hmac, Mac};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    XChaCha20Poly1305, XNonce,
+};
 use iam_protocol::Id128;
-use sha2::Sha256;
-
-type HmacSha256 = Hmac<Sha256>;
 
 const CURSOR_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const PAGE_TTL_MS: i64 = 15 * 60 * 1000;
@@ -11,6 +11,7 @@ const SNAPSHOT_TTL_MS: i64 = 15 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncCursor {
+    pub tenant_id: u64,
     pub user_id: u64,
     pub device_id: Id128,
     /// 0 when `is_account`
@@ -41,6 +42,7 @@ pub struct ResumeToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotToken {
+    pub tenant_id: u64,
     pub user_id: u64,
     pub device_id: Id128,
     pub is_account: bool,
@@ -57,6 +59,7 @@ pub struct SnapshotToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryToken {
+    pub tenant_id: u64,
     pub user_id: u64,
     pub device_id: Id128,
     pub conversation_id: u64,
@@ -71,46 +74,70 @@ pub struct HistoryToken {
 
 pub struct TokenSigner {
     key: [u8; 32],
+    verification_keys: Vec<(u32, [u8; 32])>,
     /// Key identifier bound into every token (protocol key-id obligation).
     pub key_id: u32,
 }
 
 impl TokenSigner {
     pub fn new(key: [u8; 32]) -> Self {
-        Self { key, key_id: 1 }
+        Self::with_key_id(key, 1)
     }
 
     pub fn with_key_id(key: [u8; 32], key_id: u32) -> Self {
-        Self { key, key_id }
+        Self {
+            key,
+            key_id,
+            verification_keys: vec![(key_id, key)],
+        }
     }
 
     fn sign(&self, payload: &[u8]) -> Vec<u8> {
-        let mut mac = HmacSha256::new_from_slice(&self.key).expect("hmac key");
-        mac.update(payload);
-        let sig = mac.finalize().into_bytes();
-        let mut out = payload.to_vec();
-        out.extend_from_slice(&sig);
+        let mut nonce = [0u8; 24];
+        getrandom::fill(&mut nonce).expect("secure randomness unavailable");
+        let cipher = XChaCha20Poly1305::new((&self.key).into());
+        let ciphertext = cipher
+            .encrypt(XNonce::from_slice(&nonce), payload)
+            .expect("bounded token encryption");
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&ciphertext);
         out
     }
 
-    fn verify_prefix<'a>(
-        &self,
-        bytes: &'a [u8],
-        magic: &[u8; 4],
-    ) -> Result<&'a [u8], TokenError> {
-        // magic(4) + key_id(4) + ... + sig(32)
-        if bytes.len() < 4 + 4 + 32 || &bytes[..4] != magic {
+    fn verify_prefix(&self, bytes: &[u8], magic: &[u8; 4]) -> Result<Vec<u8>, TokenError> {
+        if bytes.len() < 24 + 16 + 8 || bytes.len() > 4096 {
             return Err(TokenError::Invalid);
         }
-        let (payload, sig) = bytes.split_at(bytes.len() - 32);
-        let mut mac = HmacSha256::new_from_slice(&self.key).expect("hmac key");
-        mac.update(payload);
-        mac.verify_slice(sig).map_err(|_| TokenError::Invalid)?;
-        let kid = u32::from_be_bytes(payload[4..8].try_into().unwrap());
-        if kid != self.key_id {
+        for (key_id, key) in &self.verification_keys {
+            let cipher = XChaCha20Poly1305::new(key.into());
+            let Ok(payload) = cipher.decrypt(XNonce::from_slice(&bytes[..24]), &bytes[24..]) else {
+                continue;
+            };
+            if payload.len() < 8 || &payload[..4] != magic {
+                return Err(TokenError::Invalid);
+            }
+            let kid = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+            if kid != *key_id {
+                return Err(TokenError::Invalid);
+            }
+            return Ok(payload);
+        }
+        Err(TokenError::Invalid)
+    }
+
+    /// Retain a retired key until all tokens issued with it have expired.
+    pub fn retain_verification_key(
+        &mut self,
+        key_id: u32,
+        key: [u8; 32],
+    ) -> Result<(), TokenError> {
+        if self.verification_keys.len() >= 16
+            || self.verification_keys.iter().any(|(id, _)| *id == key_id)
+        {
             return Err(TokenError::Invalid);
         }
-        Ok(payload)
+        self.verification_keys.push((key_id, key));
+        Ok(())
     }
 
     fn push_header(&self, payload: &mut Vec<u8>, magic: &[u8; 4]) {
@@ -122,6 +149,7 @@ impl TokenSigner {
         let mut payload = Vec::new();
         self.push_header(&mut payload, b"cur1");
         payload.push(if c.is_account { 1 } else { 0 });
+        payload.extend_from_slice(&c.tenant_id.to_be_bytes());
         payload.extend_from_slice(&c.user_id.to_be_bytes());
         payload.extend_from_slice(&c.device_id);
         payload.extend_from_slice(&c.conversation_id.to_be_bytes());
@@ -134,27 +162,36 @@ impl TokenSigner {
 
     pub fn verify_cursor(&self, bytes: &[u8], now_ms: i64) -> Result<SyncCursor, TokenError> {
         let payload = self.verify_prefix(bytes, b"cur1")?;
-        if payload.len() < 4 + 4 + 1 + 8 + 16 + 8 + 16 + 8 + 8 + 8 {
+        if payload.len() != 4 + 4 + 1 + 8 + 8 + 16 + 8 + 16 + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
         }
         let mut o = 8;
         let is_account = payload[o] == 1;
         o += 1;
-        let user_id = read_u64(payload, &mut o);
+        let tenant_id = read_u64(&payload, &mut o);
+        let user_id = read_u64(&payload, &mut o);
         let mut device_id = [0u8; 16];
         device_id.copy_from_slice(&payload[o..o + 16]);
         o += 16;
-        let conversation_id = read_u64(payload, &mut o);
+        let conversation_id = read_u64(&payload, &mut o);
         let mut epoch = [0u8; 16];
         epoch.copy_from_slice(&payload[o..o + 16]);
         o += 16;
-        let access_version = read_u64(payload, &mut o);
-        let covered_through = read_u64(payload, &mut o);
-        let issued_at_ms = read_i64(payload, &mut o);
-        if now_ms >= issued_at_ms + CURSOR_TTL_MS {
+        let access_version = read_u64(&payload, &mut o);
+        let covered_through = read_u64(&payload, &mut o);
+        let issued_at_ms = read_i64(&payload, &mut o);
+        if issued_at_ms < 0 || issued_at_ms > now_ms {
+            return Err(TokenError::Invalid);
+        }
+        if now_ms
+            >= issued_at_ms
+                .checked_add(CURSOR_TTL_MS)
+                .ok_or(TokenError::Invalid)?
+        {
             return Err(TokenError::Expired);
         }
         Ok(SyncCursor {
+            tenant_id,
             user_id,
             device_id,
             conversation_id,
@@ -184,15 +221,22 @@ impl TokenSigner {
             return Err(TokenError::Invalid);
         }
         let cur_len = u32::from_be_bytes(payload[8..12].try_into().unwrap()) as usize;
-        if payload.len() < 12 + cur_len + 8 + 8 + 8 {
+        if payload.len() != 12 + cur_len + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
         }
         let cursor = self.verify_cursor(&payload[12..12 + cur_len], now_ms)?;
         let mut o = 12 + cur_len;
-        let upper_bound = read_u64(payload, &mut o);
-        let scanned_through = read_u64(payload, &mut o);
-        let round_started_ms = read_i64(payload, &mut o);
-        if now_ms >= round_started_ms + PAGE_TTL_MS {
+        let upper_bound = read_u64(&payload, &mut o);
+        let scanned_through = read_u64(&payload, &mut o);
+        let round_started_ms = read_i64(&payload, &mut o);
+        if round_started_ms < 0 || round_started_ms > now_ms {
+            return Err(TokenError::Invalid);
+        }
+        if now_ms
+            >= round_started_ms
+                .checked_add(PAGE_TTL_MS)
+                .ok_or(TokenError::Invalid)?
+        {
             return Err(TokenError::Expired);
         }
         Ok(SyncPageToken {
@@ -216,20 +260,27 @@ impl TokenSigner {
 
     pub fn verify_resume(&self, bytes: &[u8], now_ms: i64) -> Result<ResumeToken, TokenError> {
         let payload = self.verify_prefix(bytes, b"rs01")?;
-        if payload.len() < 4 + 4 + 8 + 8 + 16 + 16 + 8 {
+        if payload.len() != 4 + 4 + 8 + 8 + 16 + 16 + 8 {
             return Err(TokenError::Invalid);
         }
         let mut o = 8;
-        let tenant_id = read_u64(payload, &mut o);
-        let user_id = read_u64(payload, &mut o);
+        let tenant_id = read_u64(&payload, &mut o);
+        let user_id = read_u64(&payload, &mut o);
         let mut device_id = [0u8; 16];
         device_id.copy_from_slice(&payload[o..o + 16]);
         o += 16;
         let mut auth_epoch = [0u8; 16];
         auth_epoch.copy_from_slice(&payload[o..o + 16]);
         o += 16;
-        let issued_at_ms = read_i64(payload, &mut o);
-        if now_ms >= issued_at_ms + RESUME_TTL_MS {
+        let issued_at_ms = read_i64(&payload, &mut o);
+        if issued_at_ms < 0 || issued_at_ms > now_ms {
+            return Err(TokenError::Invalid);
+        }
+        if now_ms
+            >= issued_at_ms
+                .checked_add(RESUME_TTL_MS)
+                .ok_or(TokenError::Invalid)?
+        {
             return Err(TokenError::Expired);
         }
         Ok(ResumeToken {
@@ -245,6 +296,7 @@ impl TokenSigner {
         let mut payload = Vec::new();
         self.push_header(&mut payload, b"sn01");
         payload.push(if s.is_account { 1 } else { 0 });
+        payload.extend_from_slice(&s.tenant_id.to_be_bytes());
         payload.extend_from_slice(&s.user_id.to_be_bytes());
         payload.extend_from_slice(&s.device_id);
         payload.extend_from_slice(&s.conversation_id.to_be_bytes());
@@ -261,33 +313,42 @@ impl TokenSigner {
 
     pub fn verify_snapshot(&self, bytes: &[u8], now_ms: i64) -> Result<SnapshotToken, TokenError> {
         let payload = self.verify_prefix(bytes, b"sn01")?;
-        if payload.len() < 4 + 4 + 1 + 8 + 16 + 8 + 16 + 16 + 8 + 8 + 8 + 8 + 8 + 8 {
+        if payload.len() != 4 + 4 + 1 + 8 + 8 + 16 + 8 + 16 + 16 + 8 + 8 + 8 + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
         }
         let mut o = 8;
         let is_account = payload[o] == 1;
         o += 1;
-        let user_id = read_u64(payload, &mut o);
+        let tenant_id = read_u64(&payload, &mut o);
+        let user_id = read_u64(&payload, &mut o);
         let mut device_id = [0u8; 16];
         device_id.copy_from_slice(&payload[o..o + 16]);
         o += 16;
-        let conversation_id = read_u64(payload, &mut o);
+        let conversation_id = read_u64(&payload, &mut o);
         let mut snapshot_id = [0u8; 16];
         snapshot_id.copy_from_slice(&payload[o..o + 16]);
         o += 16;
         let mut epoch = [0u8; 16];
         epoch.copy_from_slice(&payload[o..o + 16]);
         o += 16;
-        let access_version = read_u64(payload, &mut o);
-        let upper_bound = read_u64(payload, &mut o);
-        let from_create_seq = read_u64(payload, &mut o);
-        let through_create_seq = read_u64(payload, &mut o);
-        let scanned_items = read_u64(payload, &mut o);
-        let created_at_ms = read_i64(payload, &mut o);
-        if now_ms >= created_at_ms + SNAPSHOT_TTL_MS {
+        let access_version = read_u64(&payload, &mut o);
+        let upper_bound = read_u64(&payload, &mut o);
+        let from_create_seq = read_u64(&payload, &mut o);
+        let through_create_seq = read_u64(&payload, &mut o);
+        let scanned_items = read_u64(&payload, &mut o);
+        let created_at_ms = read_i64(&payload, &mut o);
+        if created_at_ms < 0 || created_at_ms > now_ms {
+            return Err(TokenError::Invalid);
+        }
+        if now_ms
+            >= created_at_ms
+                .checked_add(SNAPSHOT_TTL_MS)
+                .ok_or(TokenError::Invalid)?
+        {
             return Err(TokenError::Expired);
         }
         Ok(SnapshotToken {
+            tenant_id,
             user_id,
             device_id,
             is_account,
@@ -306,6 +367,7 @@ impl TokenSigner {
     pub fn sign_history(&self, h: &HistoryToken) -> Vec<u8> {
         let mut payload = Vec::new();
         self.push_header(&mut payload, b"hi01");
+        payload.extend_from_slice(&h.tenant_id.to_be_bytes());
         payload.extend_from_slice(&h.user_id.to_be_bytes());
         payload.extend_from_slice(&h.device_id);
         payload.extend_from_slice(&h.conversation_id.to_be_bytes());
@@ -321,28 +383,37 @@ impl TokenSigner {
 
     pub fn verify_history(&self, bytes: &[u8], now_ms: i64) -> Result<HistoryToken, TokenError> {
         let payload = self.verify_prefix(bytes, b"hi01")?;
-        if payload.len() < 4 + 4 + 8 + 16 + 8 + 16 + 8 + 8 + 8 + 8 + 8 + 8 {
+        if payload.len() != 4 + 4 + 8 + 8 + 16 + 8 + 16 + 8 + 8 + 8 + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
         }
         let mut o = 8;
-        let user_id = read_u64(payload, &mut o);
+        let tenant_id = read_u64(&payload, &mut o);
+        let user_id = read_u64(&payload, &mut o);
         let mut device_id = [0u8; 16];
         device_id.copy_from_slice(&payload[o..o + 16]);
         o += 16;
-        let conversation_id = read_u64(payload, &mut o);
+        let conversation_id = read_u64(&payload, &mut o);
         let mut epoch = [0u8; 16];
         epoch.copy_from_slice(&payload[o..o + 16]);
         o += 16;
-        let access_version = read_u64(payload, &mut o);
-        let before_create_seq = read_u64(payload, &mut o);
-        let upper_bound = read_u64(payload, &mut o);
-        let retention_floor_seq = read_u64(payload, &mut o);
-        let scanned_through_seq = read_u64(payload, &mut o);
-        let round_started_ms = read_i64(payload, &mut o);
-        if now_ms >= round_started_ms + PAGE_TTL_MS {
+        let access_version = read_u64(&payload, &mut o);
+        let before_create_seq = read_u64(&payload, &mut o);
+        let upper_bound = read_u64(&payload, &mut o);
+        let retention_floor_seq = read_u64(&payload, &mut o);
+        let scanned_through_seq = read_u64(&payload, &mut o);
+        let round_started_ms = read_i64(&payload, &mut o);
+        if round_started_ms < 0 || round_started_ms > now_ms {
+            return Err(TokenError::Invalid);
+        }
+        if now_ms
+            >= round_started_ms
+                .checked_add(PAGE_TTL_MS)
+                .ok_or(TokenError::Invalid)?
+        {
             return Err(TokenError::Expired);
         }
         Ok(HistoryToken {
+            tenant_id,
             user_id,
             device_id,
             conversation_id,

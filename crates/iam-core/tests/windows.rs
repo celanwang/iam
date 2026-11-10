@@ -27,9 +27,12 @@ fn client_msg_at(now_ms: i64) -> [u8; 16] {
 }
 
 fn auth(engine: &mut Engine) -> [u8; 16] {
-    let device = Uuid::now_v7().into_bytes();
+    auth_as(engine, b"token-a", Uuid::now_v7().into_bytes())
+}
+
+fn auth_as(engine: &mut Engine, token: &[u8], device: [u8; 16]) -> [u8; 16] {
     let body = AuthRequest {
-        access_token: Some(b"token-a".to_vec().into()),
+        access_token: Some(token.to_vec().into()),
         device_id: Some(device.to_vec().into()),
         requested_capabilities: vec![],
     };
@@ -59,7 +62,14 @@ fn send(
             })),
         }),
     };
-    let bytes = encode_frame(MsgType::Send, &Head { req_id: Some(req_id) }, &body).unwrap();
+    let bytes = encode_frame(
+        MsgType::Send,
+        &Head {
+            req_id: Some(req_id),
+        },
+        &body,
+    )
+    .unwrap();
     let mut dec = FrameDecoder::new();
     dec.push(&bytes);
     let frame = decode_frame(&dec.next_frame().unwrap().unwrap()).unwrap();
@@ -81,7 +91,7 @@ fn seeded() -> Engine {
     let mut engine = Engine::new(T);
     engine.store.seed_user(1, 100, b"token-a".to_vec());
     engine.store.seed_user(1, 200, b"token-b".to_vec());
-    engine.store.seed_direct(1, 100, 200);
+    engine.store.seed_direct(1, 1, 100, 200);
     engine
 }
 
@@ -91,7 +101,7 @@ fn allow_at_skew_boundary_and_reject_beyond() {
     let mut engine = Engine::new(T - 120_000);
     engine.store.seed_user(1, 100, b"token-a".to_vec());
     engine.store.seed_user(1, 200, b"token-b".to_vec());
-    engine.store.seed_direct(1, 100, 200);
+    engine.store.seed_direct(1, 1, 100, 200);
     let cid = auth(&mut engine);
     let ok = send(&mut engine, cid, 2, client_msg_at(T), "ok");
     assert!(matches!(
@@ -102,7 +112,7 @@ fn allow_at_skew_boundary_and_reject_beyond() {
     let mut engine = Engine::new(T - 120_001);
     engine.store.seed_user(1, 100, b"token-a".to_vec());
     engine.store.seed_user(1, 200, b"token-b".to_vec());
-    engine.store.seed_direct(1, 100, 200);
+    engine.store.seed_direct(1, 1, 100, 200);
     let cid = auth(&mut engine);
     let bad = send(&mut engine, cid, 2, client_msg_at(T), "skew");
     match bad.outcome.unwrap().value.unwrap() {
@@ -122,7 +132,7 @@ fn exactly_at_accept_until_needs_close_watermark() {
     let mut engine = Engine::new(ACCEPT_UNTIL);
     engine.store.seed_user(1, 100, b"token-a".to_vec());
     engine.store.seed_user(1, 200, b"token-b".to_vec());
-    engine.store.seed_direct(1, 100, 200);
+    engine.store.seed_direct(1, 1, 100, 200);
     let cid = auth(&mut engine);
     let open = send(&mut engine, cid, 2, client_msg_at(T), "late");
     match open.outcome.unwrap().value.unwrap() {
@@ -240,4 +250,123 @@ fn retry_after_accept_window_still_returns_receipt() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+fn status(engine: &mut Engine, cid: [u8; 16], req_id: u64, cmid: [u8; 16]) -> send_outcome::Value {
+    let req = iam_protocol::pb::SendStatusRequest {
+        key: Some(MessageKey {
+            conversation_id: Some(1),
+            client_msg_id: Some(cmid.to_vec().into()),
+        }),
+    };
+    let bytes = encode_frame(
+        MsgType::SendStatus,
+        &Head {
+            req_id: Some(req_id),
+        },
+        &req,
+    )
+    .unwrap();
+    let mut d = FrameDecoder::new();
+    d.push(&bytes);
+    let frame = decode_frame(&d.next_frame().unwrap().unwrap()).unwrap();
+    let (_, out) = engine.handle(Some(cid), &frame).unwrap();
+    let mut d = FrameDecoder::new();
+    d.push(&out.responses[0]);
+    match decode_frame(&d.next_frame().unwrap().unwrap())
+        .unwrap()
+        .body
+    {
+        DecodedBody::SendStatusAck(r) => r.outcome.unwrap().value.unwrap(),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn query_deadline_is_identical_before_and_after_cleanup() {
+    let mut engine = seeded();
+    let cid = auth(&mut engine);
+    let id = client_msg_at(T);
+    send(&mut engine, cid, 2, id, "once");
+    engine.store.set_now(QUERY_UNTIL);
+    // Closure covers the acceptance deadline, not the later query deadline.
+    engine.store.advance_close_watermark(ACCEPT_UNTIL);
+    for req_id in [3, 4] {
+        match status(&mut engine, cid, req_id, id) {
+            send_outcome::Value::Unresolved(u) => {
+                assert_eq!(
+                    u.error.unwrap().code,
+                    Some(iam_protocol::pb::ErrorCode::ResultExpired as i32)
+                );
+                assert_eq!(u.acceptance_closed, Some(true));
+            }
+            other => panic!("{other:?}"),
+        }
+        engine.store.cleanup_expired_idempotency();
+        assert!(engine.store.idempotency.is_empty());
+    }
+}
+
+#[test]
+fn missing_conversation_rejection_survives_later_creation() {
+    let mut engine = seeded();
+    let cid = auth(&mut engine);
+    let id = client_msg_at(T);
+    engine.store.conversations.remove(&(1, 1));
+    let first = send(&mut engine, cid, 2, id, "once");
+    engine.store.seed_direct(1, 1, 100, 200);
+    let second = send(&mut engine, cid, 3, id, "once");
+    assert_eq!(first.outcome, second.outcome);
+    assert!(matches!(
+        second.outcome.unwrap().value,
+        Some(send_outcome::Value::RejectedFinal(_))
+    ));
+    assert!(engine.store.messages.is_empty());
+}
+
+#[test]
+fn recovery_does_not_turn_missing_result_into_permission_to_resend() {
+    let mut engine = seeded();
+    let cid = auth(&mut engine);
+    engine.store.recovery_incomplete = true;
+    match status(&mut engine, cid, 2, client_msg_at(T)) {
+        send_outcome::Value::Unresolved(u) => assert_eq!(
+            u.error.unwrap().code,
+            Some(iam_protocol::pb::ErrorCode::ResultUnavailable as i32)
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_auth_request_number_closes_session() {
+    let mut engine = seeded();
+    let cid = auth(&mut engine);
+    let bytes = iam_protocol::encode_heartbeat(1).unwrap();
+    let mut d = FrameDecoder::new();
+    d.push(&bytes);
+    let frame = decode_frame(&d.next_frame().unwrap().unwrap()).unwrap();
+    let (next, _) = engine.handle(Some(cid), &frame).unwrap();
+    assert!(next.is_none());
+    assert!(!engine.store.connections.contains_key(&cid));
+    assert!(engine.store.device_conn.is_empty());
+}
+
+#[test]
+fn tenant_identity_isolates_sessions_messages_and_accounts() {
+    let mut engine = seeded();
+    engine.store.seed_user(2, 100, b"other-a".to_vec());
+    engine.store.seed_user(2, 200, b"other-b".to_vec());
+    engine.store.seed_direct(2, 1, 100, 200);
+    let device = Uuid::now_v7().into_bytes();
+    let first = auth_as(&mut engine, b"token-a", device);
+    let second = auth_as(&mut engine, b"other-a", device);
+    assert!(engine.store.connections.contains_key(&first));
+    let id = client_msg_at(T);
+    send(&mut engine, first, 2, id, "tenant one");
+    send(&mut engine, second, 2, id, "tenant two");
+    assert_eq!(engine.store.messages_in_conversation_ordered(1, 1).len(), 1);
+    assert_eq!(engine.store.messages_in_conversation_ordered(2, 1).len(), 1);
+    assert_eq!(engine.store.account_streams.len(), 4);
+    assert_eq!(engine.store.idempotency.len(), 2);
 }

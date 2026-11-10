@@ -1,6 +1,4 @@
-use iam_loop::{
-    parse_error, parse_history_ack, parse_sync_ack, LoopWorld,
-};
+use iam_loop::{parse_error, parse_history_ack, parse_sync_ack, LoopWorld};
 use iam_protocol::pb::{
     change, history_response, sync_response, sync_target, ErrorCode, Head, HeartbeatRequest,
     PushAck, RetryAction,
@@ -58,11 +56,11 @@ fn error_req_id_not_increasing_closes() {
 }
 
 #[test]
-fn error_unknown_command() {
+fn wrong_direction_closes_connection() {
     let mut world = LoopWorld::new(1_700_000_000_000);
     world.auth("a", b"token-a");
     let cid = world.peers.get("a").unwrap().connection_id;
-    // Server-only AUTH_ACK used as client command → unsupported command.
+    // Server-only AUTH_ACK used as client command must close the connection.
     let body = iam_protocol::pb::AuthResponse {
         value: Some(iam_protocol::pb::auth_response::Value::Error(
             iam_protocol::pb::ErrorInfo {
@@ -78,9 +76,9 @@ fn error_unknown_command() {
     let err = parse_error(&out.responses[0]);
     assert_eq!(
         err.error.as_ref().unwrap().code,
-        Some(ErrorCode::UnsupportedCommand as i32)
+        Some(ErrorCode::InvalidArgument as i32)
     );
-    assert_eq!(err.close_connection, Some(false));
+    assert_eq!(err.close_connection, Some(true));
 }
 
 #[test]

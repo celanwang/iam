@@ -6,12 +6,12 @@ use crate::token::{
     HistoryToken, ResumeToken, SnapshotToken, SyncCursor, SyncPageToken, TokenError, TokenSigner,
 };
 use iam_protocol::pb::{
-    change, send_outcome, snapshot_item, snapshot_response, sync_response, sync_target, AuthRequest,
-    AuthResponse, Change, ErrorCode, ErrorInfo, Head, HeartbeatAck, HistoryPage, HistoryRequest,
-    HistoryResponse, MessageKey, MessageRef, PageLimit, ProtocolLimits, Push, ReconnectRequest,
-    ReconnectResponse, ResetReason, ResetRequired, RetryAction, SendOutcome, SendReceipt,
-    SendRequest, SendResponse, SendStatusRequest, SendStatusResponse, SendUnresolved, Session,
-    SnapshotPage, SnapshotRequest, SnapshotResponse, SyncPage, SyncRequest, SyncResponse,
+    change, send_outcome, snapshot_item, snapshot_response, sync_response, sync_target,
+    AuthRequest, AuthResponse, Change, ErrorCode, ErrorInfo, Head, HeartbeatAck, HistoryPage,
+    HistoryRequest, HistoryResponse, MessageKey, MessageRef, PageLimit, ProtocolLimits, Push,
+    ReconnectRequest, ReconnectResponse, ResetReason, ResetRequired, RetryAction, SendOutcome,
+    SendReceipt, SendRequest, SendResponse, SendStatusRequest, SendStatusResponse, SendUnresolved,
+    Session, SnapshotPage, SnapshotRequest, SnapshotResponse, SyncPage, SyncRequest, SyncResponse,
 };
 use iam_protocol::{
     encode_frame, encode_protocol_error, error_info, generate_id128, validate_id128,
@@ -42,9 +42,11 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(now_ms: i64) -> Self {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("secure randomness unavailable");
         Self {
             store: MemoryStore::new(now_ms),
-            tokens: TokenSigner::new([7u8; 32]),
+            tokens: TokenSigner::new(key),
         }
     }
 
@@ -81,7 +83,7 @@ impl Engine {
             DecodedBody::PushAck(ack) => self.handle_push_ack(connection_id, ack.push_id, frame),
             DecodedBody::Error(_) => self.wire_error(
                 frame,
-                None,
+                connection_id,
                 ErrorCode::InvalidArgument,
                 RetryAction::None,
                 true,
@@ -90,16 +92,16 @@ impl Engine {
             _ => self.wire_error(
                 frame,
                 connection_id,
-                ErrorCode::UnsupportedCommand,
+                ErrorCode::InvalidArgument,
                 RetryAction::None,
-                false,
+                true,
                 None,
             ),
         }
     }
 
     fn wire_error(
-        &self,
+        &mut self,
         frame: &DecodedFrame,
         connection_id: Option<Id128>,
         code: ErrorCode,
@@ -107,6 +109,18 @@ impl Engine {
         close: bool,
         detail: Option<&str>,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
+        let connection_id = if close {
+            if let Some(cid) = connection_id {
+                if let Some(conn) = self.store.connections.remove(&cid) {
+                    self.store
+                        .device_conn
+                        .remove(&(conn.tenant_id, conn.user_id, conn.device_id));
+                }
+            }
+            None
+        } else {
+            connection_id
+        };
         let req_id = frame.head.req_id.filter(|&r| r != 0);
         let bytes = encode_protocol_error(
             req_id,
@@ -132,7 +146,11 @@ impl Engine {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for c in requested {
-            if c.is_empty() || c.len() > 32 || !c.chars().all(|ch| matches!(ch, 'a'..='z' | '0'..='9' | '_'))
+            if c.is_empty()
+                || c.len() > 32
+                || !c
+                    .chars()
+                    .all(|ch| matches!(ch, 'a'..='z' | '0'..='9' | '_'))
                 || !c.starts_with(|ch: char| matches!(ch, 'a'..='z'))
             {
                 return Err(CoreError::Msg("bad capability"));
@@ -150,11 +168,11 @@ impl Engine {
 
     fn replace_device_connection(
         &mut self,
-        device_id: Id128,
+        owner: (u64, u64, Id128),
         new_cid: Id128,
     ) -> Result<Vec<(Id128, Vec<u8>)>, CoreError> {
         let mut pushes = Vec::new();
-        if let Some(old) = self.store.device_conn.insert(device_id, new_cid) {
+        if let Some(old) = self.store.device_conn.insert(owner, new_cid) {
             if old != new_cid {
                 if let Some(_old_conn) = self.store.connections.remove(&old) {
                     let err = encode_protocol_error(
@@ -219,7 +237,13 @@ impl Engine {
                     ))),
                 };
                 let out = self.encode_response(MsgType::AuthAck, frame.head.req_id, &body)?;
-                return Ok((None, EngineOutput { responses: vec![out], pushes: vec![] }));
+                return Ok((
+                    None,
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
             }
         };
         let token = match req.access_token.as_ref() {
@@ -232,7 +256,13 @@ impl Engine {
                     ))),
                 };
                 let out = self.encode_response(MsgType::AuthAck, frame.head.req_id, &body)?;
-                return Ok((None, EngineOutput { responses: vec![out], pushes: vec![] }));
+                return Ok((
+                    None,
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
             }
         };
         let device_id = match req.device_id.as_ref().map(|b| validate_id128(b.as_ref())) {
@@ -245,7 +275,13 @@ impl Engine {
                     ))),
                 };
                 let out = self.encode_response(MsgType::AuthAck, frame.head.req_id, &body)?;
-                return Ok((None, EngineOutput { responses: vec![out], pushes: vec![] }));
+                return Ok((
+                    None,
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
             }
         };
         let user = match self.store.users_by_token.get(token).cloned() {
@@ -258,13 +294,20 @@ impl Engine {
                     ))),
                 };
                 let out = self.encode_response(MsgType::AuthAck, frame.head.req_id, &body)?;
-                return Ok((None, EngineOutput { responses: vec![out], pushes: vec![] }));
+                return Ok((
+                    None,
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
             }
         };
 
         let connection_id = generate_id128();
         let auth_epoch = generate_id128();
-        let pushes = self.replace_device_connection(device_id, connection_id)?;
+        let pushes = self
+            .replace_device_connection((user.tenant_id, user.user_id, device_id), connection_id)?;
         self.store.connections.insert(
             connection_id,
             ConnState {
@@ -273,7 +316,7 @@ impl Engine {
                 tenant_id: user.tenant_id,
                 device_id,
                 auth_epoch,
-                last_req_id: 0,
+                last_req_id: frame.head.req_id.unwrap_or(0),
                 push_ack: caps.iter().any(|c| c == "push_ack"),
                 next_push_id: 1,
                 outbound: VecDeque::new(),
@@ -328,67 +371,95 @@ impl Engine {
             Ok(c) => c,
             Err(_) => {
                 let body = ReconnectResponse {
-                    value: Some(iam_protocol::pb::reconnect_response::Value::Error(error_info(
-                        ErrorCode::InvalidArgument,
-                        RetryAction::None,
-                    ))),
+                    value: Some(iam_protocol::pb::reconnect_response::Value::Error(
+                        error_info(ErrorCode::InvalidArgument, RetryAction::None),
+                    )),
                 };
                 let out = self.encode_response(MsgType::ReconnectAck, frame.head.req_id, &body)?;
-                return Ok((None, EngineOutput { responses: vec![out], pushes: vec![] }));
+                return Ok((
+                    None,
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
             }
         };
         let device_id = match req.device_id.as_ref().map(|b| validate_id128(b.as_ref())) {
             Some(Ok(id)) => id,
             _ => {
                 let body = ReconnectResponse {
-                    value: Some(iam_protocol::pb::reconnect_response::Value::Error(error_info(
-                        ErrorCode::InvalidArgument,
-                        RetryAction::None,
-                    ))),
+                    value: Some(iam_protocol::pb::reconnect_response::Value::Error(
+                        error_info(ErrorCode::InvalidArgument, RetryAction::None),
+                    )),
                 };
                 let out = self.encode_response(MsgType::ReconnectAck, frame.head.req_id, &body)?;
-                return Ok((None, EngineOutput { responses: vec![out], pushes: vec![] }));
+                return Ok((
+                    None,
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
             }
         };
         let resume_bytes = match req.resume_token.as_ref() {
             Some(t) if (1..=4096).contains(&t.len()) => t.as_ref(),
             _ => {
                 let body = ReconnectResponse {
-                    value: Some(iam_protocol::pb::reconnect_response::Value::Error(error_info(
-                        ErrorCode::Unauthenticated,
-                        RetryAction::Reauthenticate,
-                    ))),
+                    value: Some(iam_protocol::pb::reconnect_response::Value::Error(
+                        error_info(ErrorCode::Unauthenticated, RetryAction::Reauthenticate),
+                    )),
                 };
                 let out = self.encode_response(MsgType::ReconnectAck, frame.head.req_id, &body)?;
-                return Ok((None, EngineOutput { responses: vec![out], pushes: vec![] }));
+                return Ok((
+                    None,
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
             }
         };
         let resume = match self.tokens.verify_resume(resume_bytes, self.store.now_ms) {
             Ok(r) if r.device_id == device_id => r,
             _ => {
                 let body = ReconnectResponse {
-                    value: Some(iam_protocol::pb::reconnect_response::Value::Error(error_info(
-                        ErrorCode::Unauthenticated,
-                        RetryAction::Reauthenticate,
-                    ))),
+                    value: Some(iam_protocol::pb::reconnect_response::Value::Error(
+                        error_info(ErrorCode::Unauthenticated, RetryAction::Reauthenticate),
+                    )),
                 };
                 let out = self.encode_response(MsgType::ReconnectAck, frame.head.req_id, &body)?;
-                return Ok((None, EngineOutput { responses: vec![out], pushes: vec![] }));
+                return Ok((
+                    None,
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
             }
         };
         if self.store.revoked_auth_epochs.contains(&resume.auth_epoch) {
             let body = ReconnectResponse {
-                value: Some(iam_protocol::pb::reconnect_response::Value::Error(error_info(
-                    ErrorCode::Unauthenticated,
-                    RetryAction::Reauthenticate,
-                ))),
+                value: Some(iam_protocol::pb::reconnect_response::Value::Error(
+                    error_info(ErrorCode::Unauthenticated, RetryAction::Reauthenticate),
+                )),
             };
             let out = self.encode_response(MsgType::ReconnectAck, frame.head.req_id, &body)?;
-            return Ok((None, EngineOutput { responses: vec![out], pushes: vec![] }));
+            return Ok((
+                None,
+                EngineOutput {
+                    responses: vec![out],
+                    pushes: vec![],
+                },
+            ));
         }
 
         let connection_id = generate_id128();
-        let pushes = self.replace_device_connection(device_id, connection_id)?;
+        let pushes = self.replace_device_connection(
+            (resume.tenant_id, resume.user_id, device_id),
+            connection_id,
+        )?;
         self.store.connections.insert(
             connection_id,
             ConnState {
@@ -397,7 +468,7 @@ impl Engine {
                 tenant_id: resume.tenant_id,
                 device_id,
                 auth_epoch: resume.auth_epoch,
-                last_req_id: 0,
+                last_req_id: frame.head.req_id.unwrap_or(0),
                 push_ack: caps.iter().any(|c| c == "push_ack"),
                 next_push_id: 1,
                 outbound: VecDeque::new(),
@@ -420,7 +491,9 @@ impl Engine {
             new_resume,
         );
         let body = ReconnectResponse {
-            value: Some(iam_protocol::pb::reconnect_response::Value::Session(session)),
+            value: Some(iam_protocol::pb::reconnect_response::Value::Session(
+                session,
+            )),
         };
         let out = self.encode_response(MsgType::ReconnectAck, frame.head.req_id, &body)?;
         Ok((
@@ -448,7 +521,13 @@ impl Engine {
             server_time_ms: Some(self.store.now_ms),
         };
         let out = self.encode_response(MsgType::HeartbeatAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
     }
 
     fn handle_send(
@@ -560,6 +639,10 @@ impl Engine {
         let (t, accept_until, query_until) = MemoryStore::windows_for_client_msg(&client_msg_id);
         let now = self.store.now_ms;
 
+        if now >= query_until {
+            return self.send_ack(cid, frame, key, self.expired_outcome(accept_until));
+        }
+
         if let Some(rec) = self.store.idempotency.get(&idem).cloned() {
             return self.replay_idem(cid, frame, key, &rec, &digest, now);
         }
@@ -615,7 +698,11 @@ impl Engine {
             );
         }
 
-        let Some(conv) = self.store.conversations.get_mut(&conversation_id) else {
+        let Some(conv) = self
+            .store
+            .conversations
+            .get_mut(&(conn.tenant_id, conversation_id))
+        else {
             let outcome = SendOutcome {
                 value: Some(send_outcome::Value::RejectedFinal(ErrorInfo {
                     code: Some(ErrorCode::PermissionDenied as i32),
@@ -624,6 +711,15 @@ impl Engine {
                     detail: None,
                 })),
             };
+            self.store.idempotency.insert(
+                idem,
+                IdempotencyRecord::RejectedFinal {
+                    code: ErrorCode::PermissionDenied as i32,
+                    digest,
+                    accept_until_ms: accept_until,
+                    query_until_ms: query_until,
+                },
+            );
             return self.send_ack(cid, frame, key, outcome);
         };
         if !conv.members.contains(&conn.user_id) {
@@ -647,8 +743,8 @@ impl Engine {
             return self.send_ack(cid, frame, key, outcome);
         }
 
-        let create_seq = conv.next_create_seq;
-        conv.next_create_seq += 1;
+        let create_seq = conv.next_event_seq;
+        conv.next_create_seq = create_seq + 1;
         let event_seq = conv.next_event_seq;
         conv.next_event_seq += 1;
         let history_id = conv.history_id;
@@ -674,7 +770,7 @@ impl Engine {
         let members: Vec<u64> = conv.members.iter().copied().collect();
 
         self.store.messages.insert(
-            (conversation_id, message_id),
+            (conn.tenant_id, conversation_id, message_id),
             crate::store::StoredMessage {
                 view: view.clone(),
                 content_digest: digest,
@@ -711,16 +807,20 @@ impl Engine {
                 value: Some(send_outcome::Value::Committed(receipt)),
             },
         )?;
-        let ctx = stream_context_for_conv(self.store.conversations.get(&conversation_id).unwrap());
+        let ctx = stream_context_for_conv(
+            self.store
+                .conversations
+                .get(&(conn.tenant_id, conversation_id))
+                .unwrap(),
+        );
         for uid in members {
-            if uid == conn.user_id {
-                continue;
-            }
             let targets: Vec<Id128> = self
                 .store
                 .connections
                 .values()
-                .filter(|c| c.user_id == uid)
+                .filter(|c| {
+                    c.tenant_id == conn.tenant_id && c.user_id == uid && c.connection_id != cid
+                })
                 .map(|c| c.connection_id)
                 .collect();
             for peer_cid in targets {
@@ -894,9 +994,11 @@ impl Engine {
             conversation_id,
             client_msg_id,
         };
-        let (_, accept_until, _query_until) = MemoryStore::windows_for_client_msg(&client_msg_id);
+        let (t, accept_until, query_until) = MemoryStore::windows_for_client_msg(&client_msg_id);
         let now = self.store.now_ms;
-        let outcome = if let Some(rec) = self.store.idempotency.get(&idem).cloned() {
+        let outcome = if now >= query_until {
+            self.expired_outcome(accept_until)
+        } else if let Some(rec) = self.store.idempotency.get(&idem).cloned() {
             match rec {
                 IdempotencyRecord::Committed {
                     receipt_message_id,
@@ -926,6 +1028,14 @@ impl Engine {
                     })),
                 },
             }
+        } else if self.store.clock_unreliable() || self.store.recovery_incomplete {
+            unresolved(
+                ErrorCode::ResultUnavailable,
+                RetryAction::QuerySend,
+                self.store.close_watermark_ms >= accept_until,
+            )
+        } else if t > now + ALLOW_SKEW_MS {
+            unresolved(ErrorCode::ClockSkew, RetryAction::None, false)
         } else if now < accept_until {
             unresolved(ErrorCode::NotFound, RetryAction::RetrySend, false)
         } else if self.store.close_watermark_ms >= accept_until {
@@ -940,12 +1050,35 @@ impl Engine {
         } else {
             unresolved(ErrorCode::InProgress, RetryAction::QuerySend, false)
         };
+        if should_release_send_barrier(&outcome) {
+            if let Some(c) = self.store.connections.get_mut(&cid) {
+                if c.inflight_send.get(&conversation_id) == Some(&client_msg_id) {
+                    c.inflight_send.remove(&conversation_id);
+                }
+            }
+        }
         let body = SendStatusResponse {
             key: Some(key.clone()),
             outcome: Some(outcome),
         };
         let out = self.encode_response(MsgType::SendStatusAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
+    }
+
+    fn expired_outcome(&self, accept_until: i64) -> SendOutcome {
+        if self.store.close_watermark_ms >= accept_until {
+            unresolved(ErrorCode::ResultExpired, RetryAction::None, true)
+        } else if self.store.recovery_incomplete || self.store.clock_unreliable() {
+            unresolved(ErrorCode::ResultUnavailable, RetryAction::QuerySend, false)
+        } else {
+            unresolved(ErrorCode::InProgress, RetryAction::QuerySend, false)
+        }
     }
 
     fn require_page_limit(
@@ -996,7 +1129,9 @@ impl Engine {
 
         let target = match req.target.as_ref().and_then(|t| t.value.as_ref()) {
             Some(v) => v,
-            None => return self.sync_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None),
+            None => {
+                return self.sync_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None)
+            }
         };
 
         // Cold start: no cursor and no page_token => reset + snapshot
@@ -1035,9 +1170,10 @@ impl Engine {
                 let stream = self
                     .store
                     .account_streams
-                    .get(&conn.user_id)
+                    .get(&(conn.tenant_id, conn.user_id))
                     .ok_or(CoreError::Msg("no account stream"))?;
                 SnapshotToken {
+                    tenant_id: conn.tenant_id,
                     user_id: conn.user_id,
                     device_id: conn.device_id,
                     is_account: true,
@@ -1053,7 +1189,11 @@ impl Engine {
                 }
             }
             sync_target::Value::Conversation(conversation_id) => {
-                let conv = match self.store.conversations.get(conversation_id) {
+                let conv = match self
+                    .store
+                    .conversations
+                    .get(&(conn.tenant_id, *conversation_id))
+                {
                     Some(c) if c.members.contains(&conn.user_id) => c,
                     _ => {
                         return self.sync_err(
@@ -1064,7 +1204,9 @@ impl Engine {
                         );
                     }
                 };
-                let msgs = self.store.messages_in_conversation_ordered(*conversation_id);
+                let msgs = self
+                    .store
+                    .messages_in_conversation_ordered(conn.tenant_id, *conversation_id);
                 let through = msgs
                     .last()
                     .and_then(|m| m.view.position.as_ref())
@@ -1079,6 +1221,7 @@ impl Engine {
                         .unwrap_or(1)
                 };
                 SnapshotToken {
+                    tenant_id: conn.tenant_id,
                     user_id: conn.user_id,
                     device_id: conn.device_id,
                     is_account: false,
@@ -1102,7 +1245,13 @@ impl Engine {
             })),
         };
         let out = self.encode_response(MsgType::SyncAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
     }
 
     fn sync_conversation_stream(
@@ -1115,7 +1264,12 @@ impl Engine {
         max_items: usize,
         max_bytes: usize,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
-        let conv = match self.store.conversations.get(&conversation_id).cloned() {
+        let conv = match self
+            .store
+            .conversations
+            .get(&(conn.tenant_id, conversation_id))
+            .cloned()
+        {
             Some(c) if c.members.contains(&conn.user_id) => c,
             _ => {
                 return self.sync_err(cid, frame, ErrorCode::PermissionDenied, RetryAction::None);
@@ -1126,6 +1280,7 @@ impl Engine {
             match self.tokens.verify_page(pt.as_ref(), now) {
                 Ok(p)
                     if !p.cursor.is_account
+                        && p.cursor.tenant_id == conn.tenant_id
                         && p.cursor.user_id == conn.user_id
                         && p.cursor.device_id == conn.device_id
                         && p.cursor.conversation_id == conversation_id
@@ -1135,7 +1290,12 @@ impl Engine {
                     (p.scanned_through, p.upper_bound, p.round_started_ms)
                 }
                 Ok(_) => {
-                    return self.sync_err(cid, frame, ErrorCode::InvalidToken, RetryAction::ResumeSync);
+                    return self.sync_err(
+                        cid,
+                        frame,
+                        ErrorCode::InvalidToken,
+                        RetryAction::ResumeSync,
+                    );
                 }
                 Err(TokenError::Expired) => {
                     return self.sync_err(
@@ -1146,13 +1306,19 @@ impl Engine {
                     );
                 }
                 Err(TokenError::Invalid) => {
-                    return self.sync_err(cid, frame, ErrorCode::InvalidToken, RetryAction::ResumeSync);
+                    return self.sync_err(
+                        cid,
+                        frame,
+                        ErrorCode::InvalidToken,
+                        RetryAction::ResumeSync,
+                    );
                 }
             }
         } else if let Some(cur) = req.cursor.as_ref() {
             match self.tokens.verify_cursor(cur.as_ref(), now) {
                 Ok(c)
                     if !c.is_account
+                        && c.tenant_id == conn.tenant_id
                         && c.user_id == conn.user_id
                         && c.device_id == conn.device_id
                         && c.conversation_id == conversation_id =>
@@ -1240,6 +1406,7 @@ impl Engine {
         }
 
         let next_cursor = self.tokens.sign_cursor(&SyncCursor {
+            tenant_id: conn.tenant_id,
             user_id: conn.user_id,
             device_id: conn.device_id,
             conversation_id,
@@ -1252,6 +1419,7 @@ impl Engine {
         let next_page = if covered < upper {
             Some(self.tokens.sign_page(&SyncPageToken {
                 cursor: SyncCursor {
+                    tenant_id: conn.tenant_id,
                     user_id: conn.user_id,
                     device_id: conn.device_id,
                     conversation_id,
@@ -1280,7 +1448,13 @@ impl Engine {
             value: Some(sync_response::Value::Page(page)),
         };
         let out = self.encode_response(MsgType::SyncAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
     }
 
     fn sync_account_stream(
@@ -1295,7 +1469,7 @@ impl Engine {
         let stream = self
             .store
             .account_streams
-            .get(&conn.user_id)
+            .get(&(conn.tenant_id, conn.user_id))
             .cloned()
             .ok_or(CoreError::Msg("no account stream"))?;
         let now = self.store.now_ms;
@@ -1303,6 +1477,7 @@ impl Engine {
             match self.tokens.verify_page(pt.as_ref(), now) {
                 Ok(p)
                     if p.cursor.is_account
+                        && p.cursor.tenant_id == conn.tenant_id
                         && p.cursor.user_id == conn.user_id
                         && p.cursor.device_id == conn.device_id
                         && p.cursor.epoch == stream.epoch =>
@@ -1310,7 +1485,12 @@ impl Engine {
                     (p.scanned_through, p.upper_bound, p.round_started_ms)
                 }
                 Ok(_) => {
-                    return self.sync_err(cid, frame, ErrorCode::InvalidToken, RetryAction::ResumeSync);
+                    return self.sync_err(
+                        cid,
+                        frame,
+                        ErrorCode::InvalidToken,
+                        RetryAction::ResumeSync,
+                    );
                 }
                 Err(TokenError::Expired) => {
                     return self.sync_err(
@@ -1321,13 +1501,19 @@ impl Engine {
                     );
                 }
                 Err(TokenError::Invalid) => {
-                    return self.sync_err(cid, frame, ErrorCode::InvalidToken, RetryAction::ResumeSync);
+                    return self.sync_err(
+                        cid,
+                        frame,
+                        ErrorCode::InvalidToken,
+                        RetryAction::ResumeSync,
+                    );
                 }
             }
         } else if let Some(cur) = req.cursor.as_ref() {
             match self.tokens.verify_cursor(cur.as_ref(), now) {
                 Ok(c)
                     if c.is_account
+                        && c.tenant_id == conn.tenant_id
                         && c.user_id == conn.user_id
                         && c.device_id == conn.device_id =>
                 {
@@ -1402,6 +1588,7 @@ impl Engine {
             covered = upper.min(after.saturating_add(max_items as u64).max(after + 1));
         }
         let next_cursor = self.tokens.sign_cursor(&SyncCursor {
+            tenant_id: conn.tenant_id,
             user_id: conn.user_id,
             device_id: conn.device_id,
             conversation_id: 0,
@@ -1414,6 +1601,7 @@ impl Engine {
         let next_page = if covered < upper {
             Some(self.tokens.sign_page(&SyncPageToken {
                 cursor: SyncCursor {
+                    tenant_id: conn.tenant_id,
                     user_id: conn.user_id,
                     device_id: conn.device_id,
                     conversation_id: 0,
@@ -1442,7 +1630,13 @@ impl Engine {
             value: Some(sync_response::Value::Page(page)),
         };
         let out = self.encode_response(MsgType::SyncAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
     }
 
     fn handle_snapshot(
@@ -1470,16 +1664,25 @@ impl Engine {
         let max_items = req.limit.as_ref().unwrap().max_items.unwrap() as usize;
         let token_bytes = match req.page_token.as_ref() {
             Some(t) => t.as_ref(),
-            None => return self.snapshot_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None),
+            None => {
+                return self.snapshot_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None)
+            }
         };
         let mut snap = match self.tokens.verify_snapshot(token_bytes, self.store.now_ms) {
             Ok(s)
-                if s.user_id == conn.user_id && s.device_id == conn.device_id =>
+                if s.tenant_id == conn.tenant_id
+                    && s.user_id == conn.user_id
+                    && s.device_id == conn.device_id =>
             {
                 s
             }
             Ok(_) => {
-                return self.snapshot_err(cid, frame, ErrorCode::InvalidToken, RetryAction::RestartSync);
+                return self.snapshot_err(
+                    cid,
+                    frame,
+                    ErrorCode::InvalidToken,
+                    RetryAction::RestartSync,
+                );
             }
             Err(TokenError::Expired) => {
                 return self.snapshot_err(
@@ -1490,7 +1693,12 @@ impl Engine {
                 );
             }
             Err(TokenError::Invalid) => {
-                return self.snapshot_err(cid, frame, ErrorCode::InvalidToken, RetryAction::RestartSync);
+                return self.snapshot_err(
+                    cid,
+                    frame,
+                    ErrorCode::InvalidToken,
+                    RetryAction::RestartSync,
+                );
             }
         };
 
@@ -1498,7 +1706,7 @@ impl Engine {
             let stream = self
                 .store
                 .account_streams
-                .get(&conn.user_id)
+                .get(&(conn.tenant_id, conn.user_id))
                 .cloned()
                 .ok_or(CoreError::Msg("no account stream"))?;
             if stream.epoch != snap.epoch {
@@ -1514,13 +1722,17 @@ impl Engine {
                 .store
                 .conversations
                 .values()
-                .filter(|c| c.members.contains(&conn.user_id))
+                .filter(|c| c.tenant_id == conn.tenant_id && c.members.contains(&conn.user_id))
                 .map(|c| c.conversation_id)
                 .collect();
             let end = (start + max_items).min(conv_ids.len());
             let mut items = Vec::new();
             for cid_conv in &conv_ids[start..end] {
-                let c = self.store.conversations.get(cid_conv).unwrap();
+                let c = self
+                    .store
+                    .conversations
+                    .get(&(conn.tenant_id, *cid_conv))
+                    .unwrap();
                 items.push(iam_protocol::pb::SnapshotItem {
                     value: Some(snapshot_item::Value::Conversation(conversation_state(c))),
                 });
@@ -1530,6 +1742,7 @@ impl Engine {
                 (Some(self.tokens.sign_snapshot(&snap)), None)
             } else {
                 let resume = self.tokens.sign_cursor(&SyncCursor {
+                    tenant_id: conn.tenant_id,
                     user_id: conn.user_id,
                     device_id: conn.device_id,
                     conversation_id: 0,
@@ -1554,19 +1767,42 @@ impl Engine {
                 value: Some(snapshot_response::Value::Page(page)),
             };
             let out = self.encode_response(MsgType::SnapshotAck, frame.head.req_id, &body)?;
-            return Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }));
+            return Ok((
+                Some(cid),
+                EngineOutput {
+                    responses: vec![out],
+                    pushes: vec![],
+                },
+            ));
         }
 
-        let conv = match self.store.conversations.get(&snap.conversation_id).cloned() {
+        let conv = match self
+            .store
+            .conversations
+            .get(&(conn.tenant_id, snap.conversation_id))
+            .cloned()
+        {
             Some(c) if c.members.contains(&conn.user_id) => c,
             _ => {
-                return self.snapshot_err(cid, frame, ErrorCode::PermissionDenied, RetryAction::None);
+                return self.snapshot_err(
+                    cid,
+                    frame,
+                    ErrorCode::PermissionDenied,
+                    RetryAction::None,
+                );
             }
         };
         if conv.history_id != snap.epoch || conv.access_version != snap.access_version {
-            return self.snapshot_err(cid, frame, ErrorCode::ContextChanged, RetryAction::RestartSync);
+            return self.snapshot_err(
+                cid,
+                frame,
+                ErrorCode::ContextChanged,
+                RetryAction::RestartSync,
+            );
         }
-        let msgs = self.store.messages_in_conversation_ordered(snap.conversation_id);
+        let msgs = self
+            .store
+            .messages_in_conversation_ordered(conn.tenant_id, snap.conversation_id);
         let start = snap.scanned_items as usize;
         let end = (start + max_items).min(msgs.len());
         let mut items = Vec::new();
@@ -1580,6 +1816,7 @@ impl Engine {
             (Some(self.tokens.sign_snapshot(&snap)), None)
         } else {
             let resume = self.tokens.sign_cursor(&SyncCursor {
+                tenant_id: conn.tenant_id,
                 user_id: conn.user_id,
                 device_id: conn.device_id,
                 conversation_id: snap.conversation_id,
@@ -1607,7 +1844,13 @@ impl Engine {
             value: Some(snapshot_response::Value::Page(page)),
         };
         let out = self.encode_response(MsgType::SnapshotAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
     }
 
     fn handle_history(
@@ -1643,68 +1886,84 @@ impl Engine {
             .and_then(|t| t.value.as_ref())
         {
             Some(sync_target::Value::Conversation(id)) => *id,
-            _ => return self.history_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None),
+            _ => {
+                return self.history_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None)
+            }
         };
-        let conv = match self.store.conversations.get(&conversation_id).cloned() {
+        let conv = match self
+            .store
+            .conversations
+            .get(&(conn.tenant_id, conversation_id))
+            .cloned()
+        {
             Some(c) if c.members.contains(&conn.user_id) => c,
             _ => {
-                return self.history_err(cid, frame, ErrorCode::PermissionDenied, RetryAction::None);
+                return self.history_err(
+                    cid,
+                    frame,
+                    ErrorCode::PermissionDenied,
+                    RetryAction::None,
+                );
             }
         };
         let now = self.store.now_ms;
-        let (before, upper, retention_floor, round_started, scanned) =
-            if let Some(pt) = req.page_token.as_ref() {
-                match self.tokens.verify_history(pt.as_ref(), now) {
-                    Ok(h)
-                        if h.user_id == conn.user_id
-                            && h.device_id == conn.device_id
-                            && h.conversation_id == conversation_id
-                            && h.epoch == conv.history_id
-                            && h.access_version == conv.access_version =>
-                    {
-                        (
-                            h.scanned_through_seq,
-                            h.upper_bound,
-                            h.retention_floor_seq,
-                            h.round_started_ms,
-                            true,
-                        )
-                    }
-                    Ok(_) => {
-                        return self.history_err(
-                            cid,
-                            frame,
-                            ErrorCode::InvalidToken,
-                            RetryAction::RestartHistory,
-                        );
-                    }
-                    Err(TokenError::Expired) => {
-                        return self.history_err(
-                            cid,
-                            frame,
-                            ErrorCode::PageTokenExpired,
-                            RetryAction::RestartHistory,
-                        );
-                    }
-                    Err(TokenError::Invalid) => {
-                        return self.history_err(
-                            cid,
-                            frame,
-                            ErrorCode::InvalidToken,
-                            RetryAction::RestartHistory,
-                        );
-                    }
+        let (before, upper, retention_floor, round_started, scanned) = if let Some(pt) =
+            req.page_token.as_ref()
+        {
+            match self.tokens.verify_history(pt.as_ref(), now) {
+                Ok(h)
+                    if h.tenant_id == conn.tenant_id
+                        && h.user_id == conn.user_id
+                        && h.device_id == conn.device_id
+                        && h.conversation_id == conversation_id
+                        && h.epoch == conv.history_id
+                        && h.access_version == conv.access_version =>
+                {
+                    (
+                        h.scanned_through_seq,
+                        h.upper_bound,
+                        h.retention_floor_seq,
+                        h.round_started_ms,
+                        true,
+                    )
                 }
-            } else {
-                let before = req.before_create_seq.unwrap_or(u64::MAX);
-                if before == 0 {
-                    return self.history_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None);
+                Ok(_) => {
+                    return self.history_err(
+                        cid,
+                        frame,
+                        ErrorCode::InvalidToken,
+                        RetryAction::RestartHistory,
+                    );
                 }
-                let upper = conv.next_event_seq.saturating_sub(1);
-                (before, upper, 1u64, now, false)
-            };
+                Err(TokenError::Expired) => {
+                    return self.history_err(
+                        cid,
+                        frame,
+                        ErrorCode::PageTokenExpired,
+                        RetryAction::RestartHistory,
+                    );
+                }
+                Err(TokenError::Invalid) => {
+                    return self.history_err(
+                        cid,
+                        frame,
+                        ErrorCode::InvalidToken,
+                        RetryAction::RestartHistory,
+                    );
+                }
+            }
+        } else {
+            let before = req.before_create_seq.unwrap_or(u64::MAX);
+            if before == 0 {
+                return self.history_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None);
+            }
+            let upper = conv.next_event_seq.saturating_sub(1);
+            (before, upper, 1u64, now, false)
+        };
         let _ = scanned;
-        let msgs = self.store.messages_in_conversation_ordered(conversation_id);
+        let msgs = self
+            .store
+            .messages_in_conversation_ordered(conn.tenant_id, conversation_id);
         let mut out_msgs = Vec::new();
         let mut next_scan = before;
         for m in msgs.iter().rev() {
@@ -1725,6 +1984,7 @@ impl Engine {
         }
         let next_page = if out_msgs.len() == max_items {
             Some(self.tokens.sign_history(&HistoryToken {
+                tenant_id: conn.tenant_id,
                 user_id: conn.user_id,
                 device_id: conn.device_id,
                 conversation_id,
@@ -1750,7 +2010,13 @@ impl Engine {
             value: Some(iam_protocol::pb::history_response::Value::Page(page)),
         };
         let out = self.encode_response(MsgType::HistoryAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
     }
 
     fn handle_push_ack(
@@ -1782,7 +2048,7 @@ impl Engine {
     }
 
     fn require_auth(
-        &self,
+        &mut self,
         connection_id: Option<Id128>,
         frame: &DecodedFrame,
     ) -> Result<AuthGate, CoreError> {
@@ -1808,6 +2074,20 @@ impl Engine {
             )?;
             return Ok(AuthGate::Respond(out));
         }
+        if self
+            .store
+            .revoked_auth_epochs
+            .contains(&self.store.connections[&cid].auth_epoch)
+        {
+            return Ok(AuthGate::Respond(self.wire_error(
+                frame,
+                Some(cid),
+                ErrorCode::Unauthenticated,
+                RetryAction::Reauthenticate,
+                true,
+                None,
+            )?));
+        }
         Ok(AuthGate::Ok(cid))
     }
 
@@ -1822,7 +2102,13 @@ impl Engine {
             value: Some(sync_response::Value::Error(error_info(code, action))),
         };
         let out = self.encode_response(MsgType::SyncAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
     }
 
     fn snapshot_err(
@@ -1836,7 +2122,13 @@ impl Engine {
             value: Some(snapshot_response::Value::Error(error_info(code, action))),
         };
         let out = self.encode_response(MsgType::SnapshotAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
     }
 
     fn history_err(
@@ -1847,12 +2139,18 @@ impl Engine {
         action: RetryAction,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
         let body = HistoryResponse {
-            value: Some(iam_protocol::pb::history_response::Value::Error(error_info(
-                code, action,
-            ))),
+            value: Some(iam_protocol::pb::history_response::Value::Error(
+                error_info(code, action),
+            )),
         };
         let out = self.encode_response(MsgType::HistoryAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
     }
 
     fn send_ack(
@@ -1865,7 +2163,13 @@ impl Engine {
         if let Some(conversation_id) = key.conversation_id {
             if should_release_send_barrier(&outcome) {
                 if let Some(c) = self.store.connections.get_mut(&cid) {
-                    c.inflight_send.remove(&conversation_id);
+                    if c.inflight_send
+                        .get(&conversation_id)
+                        .map(|id| id.as_slice())
+                        == key.client_msg_id.as_deref()
+                    {
+                        c.inflight_send.remove(&conversation_id);
+                    }
                 }
             }
         }
@@ -1874,7 +2178,13 @@ impl Engine {
             outcome: Some(outcome),
         };
         let out = self.encode_response(MsgType::SendAck, frame.head.req_id, &body)?;
-        Ok((Some(cid), EngineOutput { responses: vec![out], pushes: vec![] }))
+        Ok((
+            Some(cid),
+            EngineOutput {
+                responses: vec![out],
+                pushes: vec![],
+            },
+        ))
     }
 
     fn check_req_id(
