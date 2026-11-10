@@ -1,6 +1,6 @@
 use iam_protocol::pb::{
-    Change, ConversationKind, ConversationState, MessageContent, MessagePosition, MessageRef,
-    MessageState, MessageView, StreamContext, SyncTarget,
+    change, Change, ConversationKind, ConversationState, Empty, MessageContent, MessagePosition,
+    MessageRef, MessageState, MessageView, StreamContext, SyncTarget,
 };
 use iam_protocol::{generate_id128, id128_timestamp_ms, Id128};
 use sha2::{Digest, Sha256};
@@ -75,12 +75,20 @@ pub struct ConnState {
     pub user_id: u64,
     pub tenant_id: u64,
     pub device_id: Id128,
+    pub auth_epoch: Id128,
     pub last_req_id: u64,
     pub push_ack: bool,
     pub next_push_id: u64,
     pub outbound: VecDeque<Vec<u8>>,
     /// conversation_id -> client_msg_id currently blocking serial send
     pub inflight_send: HashMap<u64, Id128>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountStream {
+    pub epoch: Id128,
+    pub next_event_seq: u64,
+    pub events: Vec<StoredEvent>,
 }
 
 #[derive(Default)]
@@ -91,6 +99,8 @@ pub struct MemoryStore {
     pub idempotency: HashMap<IdemKey, IdempotencyRecord>,
     pub connections: HashMap<Id128, ConnState>,
     pub device_conn: HashMap<Id128, Id128>,
+    pub account_streams: HashMap<u64, AccountStream>,
+    pub revoked_auth_epochs: HashSet<Id128>,
     pub close_watermark_ms: i64,
     pub now_ms: i64,
 }
@@ -112,6 +122,15 @@ impl MemoryStore {
                 access_token: token,
             },
         );
+        self.ensure_account_stream(user_id);
+    }
+
+    pub fn ensure_account_stream(&mut self, user_id: u64) {
+        self.account_streams.entry(user_id).or_insert_with(|| AccountStream {
+            epoch: generate_id128(),
+            next_event_seq: 1,
+            events: Vec::new(),
+        });
     }
 
     pub fn seed_direct(&mut self, conversation_id: u64, a: u64, b: u64) -> Id128 {
@@ -119,28 +138,48 @@ impl MemoryStore {
         let mut members = HashSet::new();
         members.insert(a);
         members.insert(b);
-        self.conversations.insert(
+        let conv = Conversation {
             conversation_id,
-            Conversation {
-                conversation_id,
-                kind: ConversationKind::Direct,
-                history_id,
-                access_version: 1,
-                members,
-                next_create_seq: 1,
-                next_event_seq: 1,
-                events: Vec::new(),
-            },
-        );
+            kind: ConversationKind::Direct,
+            history_id,
+            access_version: 1,
+            members: members.clone(),
+            next_create_seq: 1,
+            next_event_seq: 1,
+            events: Vec::new(),
+        };
+        self.conversations.insert(conversation_id, conv.clone());
+        for uid in [a, b] {
+            self.ensure_account_stream(uid);
+            self.push_account_upsert(uid, &conv);
+        }
         history_id
+    }
+
+    pub fn push_account_upsert(&mut self, user_id: u64, conv: &Conversation) {
+        let stream = self.account_streams.get_mut(&user_id).unwrap();
+        let event_seq = stream.next_event_seq;
+        stream.next_event_seq += 1;
+        stream.events.push(StoredEvent {
+            event_seq,
+            change: Change {
+                event_seq: Some(event_seq),
+                payload: Some(change::Payload::ConversationUpsert(conversation_state(conv))),
+            },
+        });
     }
 
     pub fn set_now(&mut self, now_ms: i64) {
         self.now_ms = now_ms;
     }
 
+    pub fn advance_close_watermark(&mut self, watermark_ms: i64) {
+        if watermark_ms > self.close_watermark_ms {
+            self.close_watermark_ms = watermark_ms;
+        }
+    }
+
     pub fn content_digest(content: &MessageContent) -> [u8; 32] {
-        // branch field number (text=1) + utf8 length + bytes
         let text = match content.value.as_ref() {
             Some(iam_protocol::pb::message_content::Value::Text(t)) => {
                 t.text.as_deref().unwrap_or("")
@@ -159,6 +198,17 @@ impl MemoryStore {
         let accept_until = t + ACCEPT_WINDOW_MS;
         let query_until = t + ACCEPT_WINDOW_MS + QUERY_EXTRA_MS;
         (t, accept_until, query_until)
+    }
+
+    pub fn messages_in_conversation_ordered(&self, conversation_id: u64) -> Vec<&StoredMessage> {
+        let mut msgs: Vec<_> = self
+            .messages
+            .iter()
+            .filter(|((cid, _), _)| *cid == conversation_id)
+            .map(|(_, m)| m)
+            .collect();
+        msgs.sort_by_key(|m| m.view.position.as_ref().and_then(|p| p.create_seq).unwrap_or(0));
+        msgs
     }
 }
 
@@ -180,6 +230,16 @@ pub fn stream_context_for_conv(c: &Conversation) -> StreamContext {
         }),
         epoch: Some(c.history_id.to_vec().into()),
         access_version: Some(c.access_version),
+    }
+}
+
+pub fn stream_context_account(epoch: Id128) -> StreamContext {
+    StreamContext {
+        target: Some(SyncTarget {
+            value: Some(iam_protocol::pb::sync_target::Value::Account(Empty {})),
+        }),
+        epoch: Some(epoch.to_vec().into()),
+        access_version: None,
     }
 }
 
