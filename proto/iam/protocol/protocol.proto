@@ -1,0 +1,345 @@
+syntax = "proto3";
+
+package iam.protocol;
+
+// Logical IDL from docs/protocol.md. Field numbers are frozen.
+
+message Empty {}
+
+message Head {
+  optional uint64 req_id = 1;
+}
+
+message ErrorInfo {
+  optional ErrorCode code = 1;
+  optional RetryAction action = 2;
+  optional uint32 retry_after_ms = 3;
+  optional string detail = 4;
+}
+
+enum RetryAction {
+  RETRY_ACTION_UNSPECIFIED = 0;
+  NONE = 1;
+  RETRY_SAME_REQUEST = 2;
+  QUERY_SEND = 3;
+  REAUTHENTICATE = 4;
+  RESTART_SYNC = 5;
+  RETRY_SEND = 6;
+  RESUME_SYNC = 7;
+  RESTART_HISTORY = 8;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  INVALID_ARGUMENT = 1;
+  UNAUTHENTICATED = 2;
+  PERMISSION_DENIED = 3;
+  UNSUPPORTED_VERSION = 4;
+  UNSUPPORTED_COMMAND = 5;
+  UNSUPPORTED_CAPABILITY = 6;
+  MALFORMED_FRAME = 7;
+  RESOURCE_LIMIT = 8;
+  RATE_LIMITED = 9;
+  OVERLOADED = 10;
+  IDEMPOTENCY_CONFLICT = 11;
+  NOT_FOUND = 12;
+  IN_PROGRESS = 13;
+  RESULT_UNAVAILABLE = 14;
+  INVALID_CURSOR = 15;
+  PAGE_TOKEN_EXPIRED = 16;
+  PAGE_BUDGET_TOO_SMALL = 17;
+  INTERNAL_ERROR = 18;
+  CONTEXT_CHANGED = 19;
+  INVALID_TOKEN = 20;
+  REQUEST_EXPIRED = 21;
+  RESULT_EXPIRED = 22;
+  CLOCK_SKEW = 23;
+  UNSUPPORTED_CONTENT = 24;
+  SESSION_REPLACED = 25;
+  UNSUPPORTED_FLAGS = 26;
+}
+
+message MessageKey {
+  optional uint64 conversation_id = 1;
+  optional bytes client_msg_id = 2;
+}
+
+message MessageRef {
+  optional uint64 conversation_id = 1;
+  optional bytes message_id = 2;
+}
+
+message MessagePosition {
+  optional bytes history_id = 1;
+  optional uint64 create_seq = 2;
+}
+
+message MessageContent {
+  oneof value {
+    TextContent text = 1;
+  }
+}
+
+message TextContent {
+  optional string text = 1;
+}
+
+message MessageView {
+  optional MessageRef ref = 1;
+  optional MessagePosition position = 2;
+  optional uint64 revision_seq = 3;
+  optional uint64 sender_id = 4;
+  optional int64 accepted_at_ms = 5;
+  optional MessageState state = 6;
+  optional MessageContent content = 7;
+}
+
+enum MessageState {
+  MESSAGE_STATE_UNSPECIFIED = 0;
+  ACTIVE = 1;
+  RECALLED = 2;
+  DELETED = 3;
+}
+
+message ConversationState {
+  optional uint64 conversation_id = 1;
+  optional ConversationKind kind = 2;
+  optional bytes history_id = 3;
+  optional uint64 access_version = 4;
+}
+
+enum ConversationKind {
+  CONVERSATION_KIND_UNSPECIFIED = 0;
+  DIRECT = 1;
+  GROUP = 2;
+}
+
+message SyncTarget {
+  oneof value {
+    Empty account = 1;
+    uint64 conversation = 2;
+  }
+}
+
+message StreamContext {
+  optional SyncTarget target = 1;
+  optional bytes epoch = 2;
+  optional uint64 access_version = 3;
+}
+
+message Change {
+  optional uint64 event_seq = 1;
+  oneof payload {
+    ConversationState conversation_upsert = 2;
+    uint64 conversation_remove = 3;
+    MessageView message_upsert = 4;
+    MessageRef message_remove = 5;
+  }
+}
+
+message PageLimit {
+  optional uint32 max_items = 1;
+  optional uint32 max_bytes = 2;
+}
+
+message AuthRequest {
+  optional bytes access_token = 1;
+  optional bytes device_id = 2;
+  repeated string requested_capabilities = 3;
+}
+
+message ReconnectRequest {
+  optional bytes resume_token = 1;
+  optional bytes device_id = 2;
+  optional bytes previous_connection_id = 3;
+  repeated string requested_capabilities = 4;
+}
+
+message Session {
+  optional uint64 tenant_id = 1;
+  optional uint64 user_id = 2;
+  optional bytes device_id = 3;
+  optional bytes connection_id = 4;
+  optional bytes resume_token = 5;
+  repeated string enabled_capabilities = 6;
+  optional int64 server_time_ms = 7;
+  optional ProtocolLimits limits = 8;
+}
+
+message AuthResponse {
+  oneof value {
+    Session session = 1;
+    ErrorInfo error = 2;
+  }
+}
+
+message ReconnectResponse {
+  oneof value {
+    Session session = 1;
+    ErrorInfo error = 2;
+  }
+}
+
+message HeartbeatRequest {}
+
+message HeartbeatAck {
+  optional int64 server_time_ms = 1;
+}
+
+message SendRequest {
+  optional MessageKey key = 1;
+  optional MessageContent content = 2;
+}
+
+message SendReceipt {
+  optional MessageRef ref = 1;
+  optional MessagePosition position = 2;
+  optional int64 accepted_at_ms = 3;
+}
+
+message SendOutcome {
+  oneof value {
+    SendReceipt committed = 1;
+    ErrorInfo rejected_final = 2;
+    SendUnresolved unresolved = 3;
+  }
+}
+
+message SendUnresolved {
+  optional ErrorInfo error = 1;
+  optional bool acceptance_closed = 2;
+}
+
+message SendResponse {
+  optional MessageKey key = 1;
+  optional SendOutcome outcome = 2;
+}
+
+message SendStatusRequest {
+  optional MessageKey key = 1;
+}
+
+message SendStatusResponse {
+  optional MessageKey key = 1;
+  optional SendOutcome outcome = 2;
+}
+
+message Push {
+  optional uint64 push_id = 1;
+  optional StreamContext context = 2;
+  repeated Change changes = 3;
+}
+
+message PushAck {
+  optional uint64 push_id = 1;
+}
+
+message SyncRequest {
+  optional SyncTarget target = 1;
+  optional bytes cursor = 2;
+  optional bytes page_token = 3;
+  optional PageLimit limit = 4;
+}
+
+message SyncPage {
+  optional StreamContext context = 1;
+  repeated Change changes = 2;
+  optional uint64 covered_through = 3;
+  optional uint64 upper_bound = 4;
+  optional bytes next_cursor = 5;
+  optional bytes next_page_token = 6;
+}
+
+message ResetRequired {
+  optional ResetReason reason = 1;
+  optional bytes snapshot_token = 2;
+  optional bool data_loss_possible = 3;
+}
+
+enum ResetReason {
+  RESET_REASON_UNSPECIFIED = 0;
+  INITIAL_SYNC = 1;
+  CURSOR_EXPIRED = 2;
+  ACCESS_CHANGED = 3;
+  HISTORY_RESET = 4;
+}
+
+message SyncResponse {
+  oneof value {
+    SyncPage page = 1;
+    ResetRequired reset = 2;
+    ErrorInfo error = 3;
+  }
+}
+
+message SnapshotRequest {
+  optional bytes page_token = 1;
+  optional PageLimit limit = 2;
+}
+
+message HistoryWindow {
+  optional uint64 from_create_seq = 1;
+  optional uint64 through_create_seq = 2;
+}
+
+message SnapshotItem {
+  oneof value {
+    ConversationState conversation = 1;
+    MessageView message = 2;
+  }
+}
+
+message SnapshotPage {
+  optional bytes snapshot_id = 1;
+  optional StreamContext context = 2;
+  optional uint64 upper_bound = 3;
+  optional HistoryWindow history_window = 4;
+  repeated SnapshotItem items = 5;
+  optional bytes next_page_token = 6;
+  optional bytes resume_cursor = 7;
+}
+
+message SnapshotResponse {
+  oneof value {
+    SnapshotPage page = 1;
+    ErrorInfo error = 2;
+  }
+}
+
+message HistoryRequest {
+  optional StreamContext context = 1;
+  optional uint64 before_create_seq = 2;
+  optional bytes page_token = 3;
+  optional PageLimit limit = 4;
+}
+
+message HistoryPage {
+  optional StreamContext context = 1;
+  optional uint64 upper_bound = 2;
+  optional uint64 retention_floor_seq = 3;
+  repeated MessageView messages = 4;
+  optional bytes next_page_token = 5;
+}
+
+message HistoryResponse {
+  oneof value {
+    HistoryPage page = 1;
+    ErrorInfo error = 2;
+  }
+}
+
+message ProtocolError {
+  optional uint32 ref_msg_type = 1;
+  optional ErrorInfo error = 2;
+  optional bool close_connection = 3;
+}
+
+message ProtocolLimits {
+  optional uint32 max_frame_bytes = 1;
+  optional uint32 max_text_bytes = 2;
+  optional uint32 max_page_items = 3;
+  optional uint32 max_page_bytes = 4;
+  optional uint32 max_inflight_requests = 5;
+  optional uint32 heartbeat_interval_ms = 6;
+  optional uint32 idle_timeout_ms = 7;
+}

@@ -1,0 +1,16 @@
+[package]
+name = "iam-loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-process single-chat closed-loop harness"
+
+[dependencies]
+iam-core = { path = "../iam-core" }
+iam-protocol = { path = "../iam-protocol" }
+prost = { workspace = true }
+
+[dev-dependencies]
+iam-core = { path = "../iam-core" }
+iam-protocol = { path = "../iam-protocol" }
+uuid = { workspace = true }

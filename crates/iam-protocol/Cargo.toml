@@ -1,0 +1,21 @@
+[package]
+name = "iam-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IM message protocol framing, Protobuf types, and validation"
+
+[dependencies]
+bytes = { workspace = true }
+hex = { workspace = true }
+prost = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+hex = { workspace = true }

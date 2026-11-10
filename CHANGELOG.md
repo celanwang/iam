@@ -19,6 +19,26 @@ a dated version section when cutting a release.
   state transitions, recovery flows, and acceptance scenarios (`docs/protocol.md`).
 - Contributor conventions for branching, one-line English commits, and PRs
   (`CONTRIBUTING.md`).
+- Protocol core crates: frozen `iam.protocol` IDL, `iam-protocol` frame/codec,
+  in-memory `iam-core` AUTH/SEND/PUSH/SYNC semantics, and `iam-loop` closed-loop
+  integration tests.
+- Protocol wrap-up (in-memory): wire `ERROR` routing, `RECONNECT` with session
+  replace, SYNC cold-start `reset`, `SNAPSHOT` / `HISTORY`, account sync stream,
+  and expanded closed-loop acceptance tests.
+- Protocol compliance reinforcement: accept-window/close-watermark tests,
+  token key-id/purpose checks, SYNC `max_bytes` paging, entrance `RATE_LIMITED`,
+  and ERROR matrix / account / HISTORY loop coverage.
+
+### Fixed
+
+- Enforce send-result expiry and closure cleanup consistently, retain terminal
+  rejections, and invalidate connections on closing protocol errors.
+- Isolate tenant data and device sessions and deliver messages to other sender devices.
+
+### Security
+
+- Encrypt opaque tokens with random nonces and per-engine keys, bind tenant
+  identity, and support retained verification keys during rotation.
 
 ### Changed
 
