@@ -27,8 +27,7 @@ a dated version section when cutting a release.
   and expanded closed-loop acceptance tests.
 - Protocol compliance reinforcement: accept-window/close-watermark tests,
   token key-id/purpose checks, SYNC `max_bytes` paging, entrance `RATE_LIMITED`,
-  ERROR matrix / account / HISTORY loop coverage, and
-  `docs/protocol-acceptance.md` checklist.
+  and ERROR matrix / account / HISTORY loop coverage.
 
 
 
