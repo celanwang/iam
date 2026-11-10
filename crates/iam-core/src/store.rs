@@ -101,14 +101,22 @@ pub struct MemoryStore {
     pub device_conn: HashMap<Id128, Id128>,
     pub account_streams: HashMap<u64, AccountStream>,
     pub revoked_auth_epochs: HashSet<Id128>,
+    /// Monotonic close proof watermark over client_msg time coverage (ms).
     pub close_watermark_ms: i64,
     pub now_ms: i64,
+    /// Highest `now_ms` ever observed; used to detect clock rollback.
+    pub max_observed_now_ms: i64,
+    /// When true, authoritative records may be incomplete — new accepts stop.
+    pub recovery_incomplete: bool,
+    /// Testable entrance overload switch (RATE_LIMITED / OVERLOADED).
+    pub entrance_overloaded: bool,
 }
 
 impl MemoryStore {
     pub fn new(now_ms: i64) -> Self {
         Self {
             now_ms,
+            max_observed_now_ms: now_ms,
             ..Default::default()
         }
     }
@@ -171,12 +179,37 @@ impl MemoryStore {
 
     pub fn set_now(&mut self, now_ms: i64) {
         self.now_ms = now_ms;
+        if now_ms > self.max_observed_now_ms {
+            self.max_observed_now_ms = now_ms;
+        }
+    }
+
+    /// Returns true when server time went backwards vs the highest observed clock.
+    pub fn clock_unreliable(&self) -> bool {
+        self.now_ms < self.max_observed_now_ms
     }
 
     pub fn advance_close_watermark(&mut self, watermark_ms: i64) {
         if watermark_ms > self.close_watermark_ms {
             self.close_watermark_ms = watermark_ms;
         }
+    }
+
+    /// Drop idempotency rows whose query window is fully closed and covered by watermark.
+    pub fn cleanup_expired_idempotency(&mut self) {
+        let now = self.now_ms;
+        let wm = self.close_watermark_ms;
+        if self.recovery_incomplete {
+            return;
+        }
+        self.idempotency.retain(|_, rec| {
+            let query_until = match rec {
+                IdempotencyRecord::Committed { query_until_ms, .. }
+                | IdempotencyRecord::RejectedFinal { query_until_ms, .. } => *query_until_ms,
+            };
+            // Keep unless server reached query_until AND watermark covers that range.
+            !(now >= query_until && wm >= query_until)
+        });
     }
 
     pub fn content_digest(content: &MessageContent) -> [u8; 32] {

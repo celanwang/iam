@@ -3,8 +3,8 @@
 use iam_core::Engine;
 use iam_protocol::pb::{
     message_content, send_outcome, snapshot_response, sync_response, sync_target, AuthRequest,
-    Head, MessageContent, MessageKey, PageLimit, ReconnectRequest, SendRequest, SnapshotRequest,
-    SyncRequest, SyncTarget, TextContent,
+    Empty, Head, HistoryRequest, MessageContent, MessageKey, PageLimit, ReconnectRequest,
+    SendRequest, SnapshotRequest, StreamContext, SyncRequest, SyncTarget, TextContent,
 };
 use iam_protocol::{
     decode_frame, encode_frame, generate_id128, DecodedBody, FrameDecoder, Id128, MsgType,
@@ -257,6 +257,74 @@ impl LoopWorld {
         self.pushes.remove(&cid);
     }
 
+    pub fn sync_account(&mut self, name: &'static str, cursor: Option<Vec<u8>>) -> Vec<u8> {
+        let (req_id, cid) = {
+            let peer = self.peers.get_mut(name).unwrap();
+            (peer.next_req_id(), peer.connection_id)
+        };
+        let body = SyncRequest {
+            target: Some(SyncTarget {
+                value: Some(sync_target::Value::Account(Empty {})),
+            }),
+            cursor: cursor.map(|c| c.into()),
+            page_token: None,
+            limit: Some(default_limit()),
+        };
+        let bytes = encode_frame(
+            MsgType::Sync,
+            &Head {
+                req_id: Some(req_id),
+            },
+            &body,
+        )
+        .unwrap();
+        let (_, out) = self.dispatch(cid, &bytes);
+        out.responses.into_iter().next().expect("sync ack")
+    }
+
+    pub fn history(
+        &mut self,
+        name: &'static str,
+        conversation_id: u64,
+        before_create_seq: Option<u64>,
+    ) -> Vec<u8> {
+        let (req_id, cid) = {
+            let peer = self.peers.get_mut(name).unwrap();
+            (peer.next_req_id(), peer.connection_id)
+        };
+        let conv = self.engine.store.conversations.get(&conversation_id).unwrap();
+        let body = HistoryRequest {
+            context: Some(StreamContext {
+                target: Some(SyncTarget {
+                    value: Some(sync_target::Value::Conversation(conversation_id)),
+                }),
+                epoch: Some(conv.history_id.to_vec().into()),
+                access_version: Some(conv.access_version),
+            }),
+            before_create_seq,
+            page_token: None,
+            limit: Some(default_limit()),
+        };
+        let bytes = encode_frame(
+            MsgType::History,
+            &Head {
+                req_id: Some(req_id),
+            },
+            &body,
+        )
+        .unwrap();
+        let (_, out) = self.dispatch(cid, &bytes);
+        out.responses.into_iter().next().expect("history ack")
+    }
+
+    pub fn dispatch_raw(
+        &mut self,
+        connection_id: Option<Id128>,
+        bytes: &[u8],
+    ) -> (Option<Id128>, iam_core::EngineOutput) {
+        self.dispatch(connection_id, bytes)
+    }
+
     fn collect_pushes(&mut self, pushes: Vec<(Id128, Vec<u8>)>) {
         for (cid, frame) in pushes {
             self.pushes.entry(cid).or_default().push(frame);
@@ -333,6 +401,26 @@ pub fn parse_snapshot_ack(bytes: &[u8]) -> iam_protocol::pb::SnapshotResponse {
     match decode_frame(&frame).unwrap().body {
         DecodedBody::SnapshotAck(r) => r,
         _ => panic!("expected snapshot ack"),
+    }
+}
+
+pub fn parse_history_ack(bytes: &[u8]) -> iam_protocol::pb::HistoryResponse {
+    let mut dec = FrameDecoder::new();
+    dec.push(bytes);
+    let frame = dec.next_frame().unwrap().unwrap();
+    match decode_frame(&frame).unwrap().body {
+        DecodedBody::HistoryAck(r) => r,
+        _ => panic!("expected history ack"),
+    }
+}
+
+pub fn parse_error(bytes: &[u8]) -> iam_protocol::pb::ProtocolError {
+    let mut dec = FrameDecoder::new();
+    dec.push(bytes);
+    let frame = dec.next_frame().unwrap().unwrap();
+    match decode_frame(&frame).unwrap().body {
+        DecodedBody::Error(r) => r,
+        other => panic!("expected ERROR frame, got {other:?}"),
     }
 }
 

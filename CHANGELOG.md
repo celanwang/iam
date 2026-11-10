@@ -25,6 +25,11 @@ a dated version section when cutting a release.
 - Protocol wrap-up (in-memory): wire `ERROR` routing, `RECONNECT` with session
   replace, SYNC cold-start `reset`, `SNAPSHOT` / `HISTORY`, account sync stream,
   and expanded closed-loop acceptance tests.
+- Protocol compliance reinforcement: accept-window/close-watermark tests,
+  token key-id/purpose checks, SYNC `max_bytes` paging, entrance `RATE_LIMITED`,
+  ERROR matrix / account / HISTORY loop coverage, and
+  `docs/protocol-acceptance.md` checklist.
+
 
 
 

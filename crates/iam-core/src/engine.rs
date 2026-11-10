@@ -53,6 +53,22 @@ impl Engine {
         connection_id: Option<Id128>,
         frame: &DecodedFrame,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
+        // Entrance overload applies before command processors (except AUTH/RECONNECT bootstrap).
+        if self.store.entrance_overloaded
+            && !matches!(
+                frame.body,
+                DecodedBody::Auth(_) | DecodedBody::Reconnect(_) | DecodedBody::Error(_)
+            )
+        {
+            return self.wire_error(
+                frame,
+                connection_id,
+                ErrorCode::RateLimited,
+                RetryAction::RetrySameRequest,
+                false,
+                Some("entrance overloaded"),
+            );
+        }
         match &frame.body {
             DecodedBody::Auth(req) => self.handle_auth(connection_id, req, frame),
             DecodedBody::Reconnect(req) => self.handle_reconnect(connection_id, req, frame),
@@ -548,6 +564,20 @@ impl Engine {
             return self.replay_idem(cid, frame, key, &rec, &digest, now);
         }
 
+        // Clock rollback or incomplete recovery: stop new accepts.
+        if self.store.clock_unreliable() || self.store.recovery_incomplete {
+            return self.send_ack(
+                cid,
+                frame,
+                key,
+                unresolved(
+                    ErrorCode::ResultUnavailable,
+                    RetryAction::QuerySend,
+                    self.store.close_watermark_ms >= accept_until,
+                ),
+            );
+        }
+
         if t > now + ALLOW_SKEW_MS {
             return self.send_ack(
                 cid,
@@ -959,10 +989,10 @@ impl Engine {
         if req.cursor.is_some() && req.page_token.is_some() {
             return self.sync_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None);
         }
-        if let Err((code, action)) = self.require_page_limit(&req.limit) {
-            return self.sync_err(cid, frame, code, action);
-        }
-        let max_items = req.limit.as_ref().unwrap().max_items.unwrap() as usize;
+        let (max_items, max_bytes) = match self.require_page_limit(&req.limit) {
+            Ok(v) => v,
+            Err((code, action)) => return self.sync_err(cid, frame, code, action),
+        };
 
         let target = match req.target.as_ref().and_then(|t| t.value.as_ref()) {
             Some(v) => v,
@@ -975,11 +1005,17 @@ impl Engine {
         }
 
         match target {
-            sync_target::Value::Conversation(conversation_id) => {
-                self.sync_conversation_stream(cid, frame, &conn, *conversation_id, req, max_items)
-            }
+            sync_target::Value::Conversation(conversation_id) => self.sync_conversation_stream(
+                cid,
+                frame,
+                &conn,
+                *conversation_id,
+                req,
+                max_items,
+                max_bytes,
+            ),
             sync_target::Value::Account(_) => {
-                self.sync_account_stream(cid, frame, &conn, req, max_items)
+                self.sync_account_stream(cid, frame, &conn, req, max_items, max_bytes)
             }
         }
     }
@@ -1077,6 +1113,7 @@ impl Engine {
         conversation_id: u64,
         req: &SyncRequest,
         max_items: usize,
+        max_bytes: usize,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
         let conv = match self.store.conversations.get(&conversation_id).cloned() {
             Some(c) if c.members.contains(&conn.user_id) => c,
@@ -1176,18 +1213,30 @@ impl Engine {
 
         let mut changes = Vec::new();
         let mut covered = after;
+        let mut used_bytes = 0usize;
         for ev in &conv.events {
             if ev.event_seq <= after || ev.event_seq > upper {
                 continue;
             }
-            if changes.len() >= max_items {
+            let sz = ev.change.encoded_len();
+            if sz > max_bytes {
+                return self.sync_err(
+                    cid,
+                    frame,
+                    ErrorCode::PageBudgetTooSmall,
+                    RetryAction::RetrySameRequest,
+                );
+            }
+            if changes.len() >= max_items || (!changes.is_empty() && used_bytes + sz > max_bytes) {
                 break;
             }
+            used_bytes += sz;
             changes.push(ev.change.clone());
             covered = ev.event_seq;
         }
         if changes.is_empty() && after < upper {
-            covered = upper.min(after + max_items as u64);
+            // filtered/empty coverage still advances
+            covered = upper.min(after.saturating_add(max_items as u64).max(after + 1));
         }
 
         let next_cursor = self.tokens.sign_cursor(&SyncCursor {
@@ -1241,6 +1290,7 @@ impl Engine {
         conn: &ConnState,
         req: &SyncRequest,
         max_items: usize,
+        max_bytes: usize,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
         let stream = self
             .store
@@ -1327,18 +1377,29 @@ impl Engine {
 
         let mut changes = Vec::new();
         let mut covered = after;
+        let mut used_bytes = 0usize;
         for ev in &stream.events {
             if ev.event_seq <= after || ev.event_seq > upper {
                 continue;
             }
-            if changes.len() >= max_items {
+            let sz = ev.change.encoded_len();
+            if sz > max_bytes {
+                return self.sync_err(
+                    cid,
+                    frame,
+                    ErrorCode::PageBudgetTooSmall,
+                    RetryAction::RetrySameRequest,
+                );
+            }
+            if changes.len() >= max_items || (!changes.is_empty() && used_bytes + sz > max_bytes) {
                 break;
             }
+            used_bytes += sz;
             changes.push(ev.change.clone());
             covered = ev.event_seq;
         }
         if changes.is_empty() && after < upper {
-            covered = upper.min(after + max_items as u64);
+            covered = upper.min(after.saturating_add(max_items as u64).max(after + 1));
         }
         let next_cursor = self.tokens.sign_cursor(&SyncCursor {
             user_id: conn.user_id,

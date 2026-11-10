@@ -71,11 +71,17 @@ pub struct HistoryToken {
 
 pub struct TokenSigner {
     key: [u8; 32],
+    /// Key identifier bound into every token (protocol key-id obligation).
+    pub key_id: u32,
 }
 
 impl TokenSigner {
     pub fn new(key: [u8; 32]) -> Self {
-        Self { key }
+        Self { key, key_id: 1 }
+    }
+
+    pub fn with_key_id(key: [u8; 32], key_id: u32) -> Self {
+        Self { key, key_id }
     }
 
     fn sign(&self, payload: &[u8]) -> Vec<u8> {
@@ -91,20 +97,30 @@ impl TokenSigner {
         &self,
         bytes: &'a [u8],
         magic: &[u8; 4],
-    ) -> Result<(&'a [u8], &'a [u8]), TokenError> {
-        if bytes.len() < 4 + 32 || &bytes[..4] != magic {
+    ) -> Result<&'a [u8], TokenError> {
+        // magic(4) + key_id(4) + ... + sig(32)
+        if bytes.len() < 4 + 4 + 32 || &bytes[..4] != magic {
             return Err(TokenError::Invalid);
         }
         let (payload, sig) = bytes.split_at(bytes.len() - 32);
         let mut mac = HmacSha256::new_from_slice(&self.key).expect("hmac key");
         mac.update(payload);
         mac.verify_slice(sig).map_err(|_| TokenError::Invalid)?;
-        Ok((payload, sig))
+        let kid = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+        if kid != self.key_id {
+            return Err(TokenError::Invalid);
+        }
+        Ok(payload)
+    }
+
+    fn push_header(&self, payload: &mut Vec<u8>, magic: &[u8; 4]) {
+        payload.extend_from_slice(magic);
+        payload.extend_from_slice(&self.key_id.to_be_bytes());
     }
 
     pub fn sign_cursor(&self, c: &SyncCursor) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend_from_slice(b"cur1");
+        self.push_header(&mut payload, b"cur1");
         payload.push(if c.is_account { 1 } else { 0 });
         payload.extend_from_slice(&c.user_id.to_be_bytes());
         payload.extend_from_slice(&c.device_id);
@@ -117,11 +133,11 @@ impl TokenSigner {
     }
 
     pub fn verify_cursor(&self, bytes: &[u8], now_ms: i64) -> Result<SyncCursor, TokenError> {
-        let (payload, _) = self.verify_prefix(bytes, b"cur1")?;
-        if payload.len() < 4 + 1 + 8 + 16 + 8 + 16 + 8 + 8 + 8 {
+        let payload = self.verify_prefix(bytes, b"cur1")?;
+        if payload.len() < 4 + 4 + 1 + 8 + 16 + 8 + 16 + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
         }
-        let mut o = 4;
+        let mut o = 8;
         let is_account = payload[o] == 1;
         o += 1;
         let user_id = read_u64(payload, &mut o);
@@ -152,7 +168,7 @@ impl TokenSigner {
 
     pub fn sign_page(&self, p: &SyncPageToken) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend_from_slice(b"pg01");
+        self.push_header(&mut payload, b"pg01");
         let cur = self.sign_cursor(&p.cursor);
         payload.extend_from_slice(&(cur.len() as u32).to_be_bytes());
         payload.extend_from_slice(&cur);
@@ -163,16 +179,16 @@ impl TokenSigner {
     }
 
     pub fn verify_page(&self, bytes: &[u8], now_ms: i64) -> Result<SyncPageToken, TokenError> {
-        let (payload, _) = self.verify_prefix(bytes, b"pg01")?;
-        if payload.len() < 8 {
+        let payload = self.verify_prefix(bytes, b"pg01")?;
+        if payload.len() < 12 {
             return Err(TokenError::Invalid);
         }
-        let cur_len = u32::from_be_bytes(payload[4..8].try_into().unwrap()) as usize;
-        if payload.len() < 8 + cur_len + 8 + 8 + 8 {
+        let cur_len = u32::from_be_bytes(payload[8..12].try_into().unwrap()) as usize;
+        if payload.len() < 12 + cur_len + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
         }
-        let cursor = self.verify_cursor(&payload[8..8 + cur_len], now_ms)?;
-        let mut o = 8 + cur_len;
+        let cursor = self.verify_cursor(&payload[12..12 + cur_len], now_ms)?;
+        let mut o = 12 + cur_len;
         let upper_bound = read_u64(payload, &mut o);
         let scanned_through = read_u64(payload, &mut o);
         let round_started_ms = read_i64(payload, &mut o);
@@ -189,7 +205,7 @@ impl TokenSigner {
 
     pub fn sign_resume(&self, r: &ResumeToken) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend_from_slice(b"rs01");
+        self.push_header(&mut payload, b"rs01");
         payload.extend_from_slice(&r.tenant_id.to_be_bytes());
         payload.extend_from_slice(&r.user_id.to_be_bytes());
         payload.extend_from_slice(&r.device_id);
@@ -199,11 +215,11 @@ impl TokenSigner {
     }
 
     pub fn verify_resume(&self, bytes: &[u8], now_ms: i64) -> Result<ResumeToken, TokenError> {
-        let (payload, _) = self.verify_prefix(bytes, b"rs01")?;
-        if payload.len() < 4 + 8 + 8 + 16 + 16 + 8 {
+        let payload = self.verify_prefix(bytes, b"rs01")?;
+        if payload.len() < 4 + 4 + 8 + 8 + 16 + 16 + 8 {
             return Err(TokenError::Invalid);
         }
-        let mut o = 4;
+        let mut o = 8;
         let tenant_id = read_u64(payload, &mut o);
         let user_id = read_u64(payload, &mut o);
         let mut device_id = [0u8; 16];
@@ -227,7 +243,7 @@ impl TokenSigner {
 
     pub fn sign_snapshot(&self, s: &SnapshotToken) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend_from_slice(b"sn01");
+        self.push_header(&mut payload, b"sn01");
         payload.push(if s.is_account { 1 } else { 0 });
         payload.extend_from_slice(&s.user_id.to_be_bytes());
         payload.extend_from_slice(&s.device_id);
@@ -244,11 +260,11 @@ impl TokenSigner {
     }
 
     pub fn verify_snapshot(&self, bytes: &[u8], now_ms: i64) -> Result<SnapshotToken, TokenError> {
-        let (payload, _) = self.verify_prefix(bytes, b"sn01")?;
-        if payload.len() < 4 + 1 + 8 + 16 + 8 + 16 + 16 + 8 + 8 + 8 + 8 + 8 + 8 {
+        let payload = self.verify_prefix(bytes, b"sn01")?;
+        if payload.len() < 4 + 4 + 1 + 8 + 16 + 8 + 16 + 16 + 8 + 8 + 8 + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
         }
-        let mut o = 4;
+        let mut o = 8;
         let is_account = payload[o] == 1;
         o += 1;
         let user_id = read_u64(payload, &mut o);
@@ -289,7 +305,7 @@ impl TokenSigner {
 
     pub fn sign_history(&self, h: &HistoryToken) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend_from_slice(b"hi01");
+        self.push_header(&mut payload, b"hi01");
         payload.extend_from_slice(&h.user_id.to_be_bytes());
         payload.extend_from_slice(&h.device_id);
         payload.extend_from_slice(&h.conversation_id.to_be_bytes());
@@ -304,11 +320,11 @@ impl TokenSigner {
     }
 
     pub fn verify_history(&self, bytes: &[u8], now_ms: i64) -> Result<HistoryToken, TokenError> {
-        let (payload, _) = self.verify_prefix(bytes, b"hi01")?;
-        if payload.len() < 4 + 8 + 16 + 8 + 16 + 8 + 8 + 8 + 8 + 8 + 8 {
+        let payload = self.verify_prefix(bytes, b"hi01")?;
+        if payload.len() < 4 + 4 + 8 + 16 + 8 + 16 + 8 + 8 + 8 + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
         }
-        let mut o = 4;
+        let mut o = 8;
         let user_id = read_u64(payload, &mut o);
         let mut device_id = [0u8; 16];
         device_id.copy_from_slice(&payload[o..o + 16]);
