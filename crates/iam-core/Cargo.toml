@@ -1,0 +1,13 @@
+[package]
+name = "iam-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-memory authoritative IM protocol semantics"
+
+[dependencies]
+hmac = { workspace = true }
+iam-protocol = { path = "../iam-protocol" }
+prost = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
