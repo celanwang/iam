@@ -195,6 +195,7 @@ dependencies = [
  "prost",
  "sha2",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
