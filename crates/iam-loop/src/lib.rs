@@ -2,8 +2,9 @@
 
 use iam_core::Engine;
 use iam_protocol::pb::{
-    message_content, send_outcome, sync_target, AuthRequest, Head, MessageContent, MessageKey,
-    SendRequest, SyncRequest, SyncTarget, TextContent,
+    message_content, send_outcome, snapshot_response, sync_response, sync_target, AuthRequest,
+    Head, MessageContent, MessageKey, PageLimit, ReconnectRequest, SendRequest, SnapshotRequest,
+    SyncRequest, SyncTarget, TextContent,
 };
 use iam_protocol::{
     decode_frame, encode_frame, generate_id128, DecodedBody, FrameDecoder, Id128, MsgType,
@@ -11,9 +12,17 @@ use iam_protocol::{
 
 use std::collections::HashMap;
 
+fn default_limit() -> PageLimit {
+    PageLimit {
+        max_items: Some(100),
+        max_bytes: Some(256 * 1024),
+    }
+}
+
 pub struct Peer {
     pub connection_id: Option<Id128>,
     pub device_id: Id128,
+    pub resume_token: Option<Vec<u8>>,
     pub inbox: Vec<Vec<u8>>,
     next_req: u64,
 }
@@ -23,6 +32,7 @@ impl Peer {
         Self {
             connection_id: None,
             device_id: generate_id128(),
+            resume_token: None,
             inbox: Vec::new(),
             next_req: 0,
         }
@@ -37,7 +47,6 @@ impl Peer {
 pub struct LoopWorld {
     pub engine: Engine,
     pub peers: HashMap<&'static str, Peer>,
-    /// pending pushes keyed by connection
     pushes: HashMap<Id128, Vec<Vec<u8>>>,
 }
 
@@ -67,13 +76,60 @@ impl LoopWorld {
             device_id: Some(device_id.to_vec().into()),
             requested_capabilities: vec!["push_ack".into()],
         };
-        let head = Head {
-            req_id: Some(req_id),
-        };
-        let bytes = encode_frame(MsgType::Auth, &head, &body).unwrap();
+        let bytes = encode_frame(
+            MsgType::Auth,
+            &Head {
+                req_id: Some(req_id),
+            },
+            &body,
+        )
+        .unwrap();
         let (cid, out) = self.dispatch(None, &bytes);
-        self.peers.get_mut(name).unwrap().connection_id = cid;
+        let ack = out.responses.into_iter().next().expect("auth ack");
+        let resume = match decode_body_auth(&ack) {
+            Some(tok) => tok,
+            None => None,
+        };
+        let peer = self.peers.get_mut(name).unwrap();
+        peer.connection_id = cid;
+        peer.resume_token = resume;
         self.collect_pushes(out.pushes);
+    }
+
+    pub fn reconnect(&mut self, name: &'static str) -> Vec<u8> {
+        let (req_id, device_id, resume) = {
+            let peer = self.peers.get_mut(name).unwrap();
+            (
+                peer.next_req_id(),
+                peer.device_id,
+                peer.resume_token.clone().expect("resume token"),
+            )
+        };
+        let body = ReconnectRequest {
+            resume_token: Some(resume.into()),
+            device_id: Some(device_id.to_vec().into()),
+            previous_connection_id: None,
+            requested_capabilities: vec!["push_ack".into()],
+        };
+        let bytes = encode_frame(
+            MsgType::Reconnect,
+            &Head {
+                req_id: Some(req_id),
+            },
+            &body,
+        )
+        .unwrap();
+        let old_cid = self.peers.get(name).unwrap().connection_id;
+        let (cid, out) = self.dispatch(None, &bytes);
+        let ack = out.responses.into_iter().next().expect("reconnect ack");
+        let peer = self.peers.get_mut(name).unwrap();
+        peer.connection_id = cid;
+        if let Some(tok) = decode_body_reconnect(&ack) {
+            peer.resume_token = Some(tok);
+        }
+        self.collect_pushes(out.pushes);
+        let _ = old_cid;
+        ack
     }
 
     pub fn send_text(
@@ -98,10 +154,14 @@ impl LoopWorld {
                 })),
             }),
         };
-        let head = Head {
-            req_id: Some(req_id),
-        };
-        let bytes = encode_frame(MsgType::Send, &head, &body).unwrap();
+        let bytes = encode_frame(
+            MsgType::Send,
+            &Head {
+                req_id: Some(req_id),
+            },
+            &body,
+        )
+        .unwrap();
         let (_, out) = self.dispatch(cid, &bytes);
         let resp = out.responses.into_iter().next().expect("send ack");
         self.collect_pushes(out.pushes);
@@ -124,14 +184,67 @@ impl LoopWorld {
             }),
             cursor: cursor.map(|c| c.into()),
             page_token: None,
-            limit: None,
+            limit: Some(default_limit()),
         };
-        let head = Head {
-            req_id: Some(req_id),
-        };
-        let bytes = encode_frame(MsgType::Sync, &head, &body).unwrap();
+        let bytes = encode_frame(
+            MsgType::Sync,
+            &Head {
+                req_id: Some(req_id),
+            },
+            &body,
+        )
+        .unwrap();
         let (_, out) = self.dispatch(cid, &bytes);
         out.responses.into_iter().next().expect("sync ack")
+    }
+
+    /// Cold-start recovery: SYNC reset → SNAPSHOT → resume cursor, then incremental SYNC page.
+    pub fn recover_conversation_latest(
+        &mut self,
+        name: &'static str,
+        conversation_id: u64,
+    ) -> iam_protocol::pb::SyncPage {
+        let sync = self.sync_conversation(name, conversation_id, None);
+        let reset = match parse_sync_ack(&sync).value.unwrap() {
+            sync_response::Value::Reset(r) => r,
+            other => panic!("expected reset, got {other:?}"),
+        };
+        let mut token = reset.snapshot_token.expect("snapshot token").to_vec();
+        let resume = loop {
+            let (req_id, cid) = {
+                let peer = self.peers.get_mut(name).unwrap();
+                (peer.next_req_id(), peer.connection_id)
+            };
+            let body = SnapshotRequest {
+                page_token: Some(token.clone().into()),
+                limit: Some(default_limit()),
+            };
+            let bytes = encode_frame(
+                MsgType::Snapshot,
+                &Head {
+                    req_id: Some(req_id),
+                },
+                &body,
+            )
+            .unwrap();
+            let (_, out) = self.dispatch(cid, &bytes);
+            let resp = out.responses.into_iter().next().expect("snapshot ack");
+            match parse_snapshot_ack(&resp).value.unwrap() {
+                snapshot_response::Value::Page(page) => {
+                    if let Some(next) = page.next_page_token {
+                        token = next.to_vec();
+                        continue;
+                    }
+                    break page.resume_cursor.expect("resume cursor").to_vec();
+                }
+                other => panic!("expected snapshot page {other:?}"),
+            }
+        };
+        let sync2 = self.sync_conversation(name, conversation_id, Some(resume));
+        match parse_sync_ack(&sync2).value.unwrap() {
+            sync_response::Value::Page(page) => page,
+            other => panic!("expected page after resume {other:?}"),
+        }
     }
 
     pub fn drain_pushes(&mut self, name: &'static str) -> Vec<Vec<u8>> {
@@ -163,6 +276,36 @@ impl LoopWorld {
     }
 }
 
+fn decode_body_auth(bytes: &[u8]) -> Option<Option<Vec<u8>>> {
+    let mut dec = FrameDecoder::new();
+    dec.push(bytes);
+    let frame = dec.next_frame().unwrap().unwrap();
+    match decode_frame(&frame).unwrap().body {
+        DecodedBody::AuthAck(r) => match r.value {
+            Some(iam_protocol::pb::auth_response::Value::Session(s)) => {
+                Some(s.resume_token.map(|t| t.to_vec()))
+            }
+            _ => Some(None),
+        },
+        _ => None,
+    }
+}
+
+fn decode_body_reconnect(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut dec = FrameDecoder::new();
+    dec.push(bytes);
+    let frame = dec.next_frame().unwrap().unwrap();
+    match decode_frame(&frame).unwrap().body {
+        DecodedBody::ReconnectAck(r) => match r.value {
+            Some(iam_protocol::pb::reconnect_response::Value::Session(s)) => {
+                s.resume_token.map(|t| t.to_vec())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub fn parse_send_ack(bytes: &[u8]) -> iam_protocol::pb::SendResponse {
     let mut dec = FrameDecoder::new();
     dec.push(bytes);
@@ -180,6 +323,16 @@ pub fn parse_sync_ack(bytes: &[u8]) -> iam_protocol::pb::SyncResponse {
     match decode_frame(&frame).unwrap().body {
         DecodedBody::SyncAck(r) => r,
         _ => panic!("expected sync ack"),
+    }
+}
+
+pub fn parse_snapshot_ack(bytes: &[u8]) -> iam_protocol::pb::SnapshotResponse {
+    let mut dec = FrameDecoder::new();
+    dec.push(bytes);
+    let frame = dec.next_frame().unwrap().unwrap();
+    match decode_frame(&frame).unwrap().body {
+        DecodedBody::SnapshotAck(r) => r,
+        _ => panic!("expected snapshot ack"),
     }
 }
 

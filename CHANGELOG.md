@@ -22,6 +22,10 @@ a dated version section when cutting a release.
 - Protocol core crates: frozen `iam.protocol` IDL, `iam-protocol` frame/codec,
   in-memory `iam-core` AUTH/SEND/PUSH/SYNC semantics, and `iam-loop` closed-loop
   integration tests.
+- Protocol wrap-up (in-memory): wire `ERROR` routing, `RECONNECT` with session
+  replace, SYNC cold-start `reset`, `SNAPSHOT` / `HISTORY`, account sync stream,
+  and expanded closed-loop acceptance tests.
+
 
 
 ### Changed
