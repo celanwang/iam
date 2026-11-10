@@ -14,7 +14,7 @@
 | `chore/` | tooling, ignore files, non-product chores |
 | `proto/` | protocol drafts and experiments |
 
-Current design work uses `docs/design`.
+Current design work uses `docs/design`. Protocol design uses `proto/message`.
 
 ## Commits
 

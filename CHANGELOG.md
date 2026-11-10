@@ -15,5 +15,16 @@ a dated version section when cutting a release.
 ### Added
 
 - Project design direction for a Rust-based general IM engine (`docs/design.md`).
+- Basic message protocol design with typed structures, command contracts,
+  state transitions, recovery flows, and acceptance scenarios (`docs/protocol.md`).
 - Contributor conventions for branching, one-line English commits, and PRs
   (`CONTRIBUTING.md`).
+
+### Changed
+
+- Align protocol and design guidance on ordering, idempotency, synchronization,
+  connection recovery, compatibility, and failover boundaries.
+- Expand the protocol design with explicit framing, send outcomes,
+  synchronization, snapshots, history reads, and default limits.
+- Specify stable protocol field numbers, capability negotiation, token lifetimes,
+  bounded idempotency, identifier encoding, and deterministic error handling.
