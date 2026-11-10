@@ -198,6 +198,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "iam-loop"
+version = "0.1.0"
+dependencies = [
+ "iam-core",
+ "iam-protocol",
+ "prost",
+ "uuid",
+]
+
+[[package]]
 name = "iam-protocol"
 version = "0.1.0"
 dependencies = [

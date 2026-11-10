@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/iam-protocol",
     "crates/iam-core",
+    "crates/iam-loop",
 ]
 
 [workspace.package]
