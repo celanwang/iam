@@ -33,8 +33,8 @@ a dated version section when cutting a release.
 
 ### Changed
 
-- Clarify `docs/storage.md`: durable vs ephemeral state, SEND transaction steps,
-  close-watermark definition, outcome decision table, and open defaults.
+- Align `docs/storage.md` with `protocol.md` style: normative prose, logical
+  records, commit/window/read rules, and acceptance scenarios.
 - Shorten README implementation-scope notes; keep a brief in-memory kernel
   summary and deferred next-stage list.
 
