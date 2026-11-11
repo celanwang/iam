@@ -243,6 +243,36 @@ impl MemoryStore {
         (t, accept_until, query_until)
     }
 
+    /// Rebuild a fixed historical view from the retained authoritative event log.
+    pub fn message_views_at(
+        &self,
+        tenant_id: u64,
+        conversation_id: u64,
+        upper: u64,
+    ) -> Vec<MessageView> {
+        let mut views = HashMap::new();
+        if let Some(conv) = self.conversations.get(&(tenant_id, conversation_id)) {
+            for ev in conv.events.iter().filter(|ev| ev.event_seq <= upper) {
+                match ev.change.payload.as_ref() {
+                    Some(change::Payload::MessageUpsert(view)) => {
+                        if let Some(id) = view.r#ref.as_ref().and_then(|r| r.message_id.clone()) {
+                            views.insert(id, view.clone());
+                        }
+                    }
+                    Some(change::Payload::MessageRemove(r)) => {
+                        if let Some(id) = &r.message_id {
+                            views.remove(id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut views: Vec<_> = views.into_values().collect();
+        views.sort_by_key(|v| v.position.as_ref().and_then(|p| p.create_seq).unwrap_or(0));
+        views
+    }
+
     pub fn messages_in_conversation_ordered(
         &self,
         tenant_id: u64,

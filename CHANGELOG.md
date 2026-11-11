@@ -31,6 +31,9 @@ a dated version section when cutting a release.
 
 ### Fixed
 
+- Rebuild snapshot and history pages at fixed upper bounds, recheck access,
+  validate history contexts, and apply byte budgets to complete paging responses.
+
 - Enforce send-result expiry and closure cleanup consistently, retain terminal
   rejections, and invalidate connections on closing protocol errors.
 - Isolate tenant data and device sessions and deliver messages to other sender devices.

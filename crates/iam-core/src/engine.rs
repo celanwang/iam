@@ -1,6 +1,6 @@
 use crate::store::{
-    active_message_view, conversation_state, stream_context_account, stream_context_for_conv,
-    ConnState, IdemKey, IdempotencyRecord, MemoryStore, ALLOW_SKEW_MS,
+    active_message_view, stream_context_account, stream_context_for_conv, ConnState, IdemKey,
+    IdempotencyRecord, MemoryStore, ALLOW_SKEW_MS,
 };
 use crate::token::{
     HistoryToken, ResumeToken, SnapshotToken, SyncCursor, SyncPageToken, TokenError, TokenSigner,
@@ -1204,19 +1204,24 @@ impl Engine {
                         );
                     }
                 };
-                let msgs = self
-                    .store
-                    .messages_in_conversation_ordered(conn.tenant_id, *conversation_id);
+                let mut msgs = self.store.message_views_at(
+                    conn.tenant_id,
+                    *conversation_id,
+                    conv.next_event_seq.saturating_sub(1),
+                );
+                if msgs.len() > 100 {
+                    msgs.drain(..msgs.len() - 100);
+                }
                 let through = msgs
                     .last()
-                    .and_then(|m| m.view.position.as_ref())
+                    .and_then(|m| m.position.as_ref())
                     .and_then(|p| p.create_seq)
                     .unwrap_or(0);
                 let from = if through == 0 {
                     0
                 } else {
                     msgs.first()
-                        .and_then(|m| m.view.position.as_ref())
+                        .and_then(|m| m.position.as_ref())
                         .and_then(|p| p.create_seq)
                         .unwrap_or(1)
                 };
@@ -1377,84 +1382,24 @@ impl Engine {
             unreachable!("cold start handled earlier");
         };
 
-        let mut changes = Vec::new();
-        let mut covered = after;
-        let mut used_bytes = 0usize;
-        for ev in &conv.events {
-            if ev.event_seq <= after || ev.event_seq > upper {
-                continue;
-            }
-            let sz = ev.change.encoded_len();
-            if sz > max_bytes {
-                return self.sync_err(
-                    cid,
-                    frame,
-                    ErrorCode::PageBudgetTooSmall,
-                    RetryAction::RetrySameRequest,
-                );
-            }
-            if changes.len() >= max_items || (!changes.is_empty() && used_bytes + sz > max_bytes) {
-                break;
-            }
-            used_bytes += sz;
-            changes.push(ev.change.clone());
-            covered = ev.event_seq;
-        }
-        if changes.is_empty() && after < upper {
-            // filtered/empty coverage still advances
-            covered = upper.min(after.saturating_add(max_items as u64).max(after + 1));
-        }
-
-        let next_cursor = self.tokens.sign_cursor(&SyncCursor {
-            tenant_id: conn.tenant_id,
-            user_id: conn.user_id,
-            device_id: conn.device_id,
-            conversation_id,
-            epoch: conv.history_id,
-            access_version: conv.access_version,
-            covered_through: covered,
-            issued_at_ms: now,
-            is_account: false,
-        });
-        let next_page = if covered < upper {
-            Some(self.tokens.sign_page(&SyncPageToken {
-                cursor: SyncCursor {
-                    tenant_id: conn.tenant_id,
-                    user_id: conn.user_id,
-                    device_id: conn.device_id,
-                    conversation_id,
-                    epoch: conv.history_id,
-                    access_version: conv.access_version,
-                    covered_through: covered,
-                    issued_at_ms: now,
-                    is_account: false,
-                },
-                upper_bound: upper,
-                scanned_through: covered,
-                round_started_ms: round_start,
-            }))
-        } else {
-            None
-        };
-        let page = SyncPage {
-            context: Some(stream_context_for_conv(&conv)),
+        let changes = conv
+            .events
+            .iter()
+            .filter(|ev| ev.event_seq > after && ev.event_seq <= upper)
+            .take(max_items)
+            .map(|ev| ev.change.clone())
+            .collect();
+        self.finish_sync_page(
+            cid,
+            frame,
+            conn,
+            stream_context_for_conv(&conv),
             changes,
-            covered_through: Some(covered),
-            upper_bound: Some(upper),
-            next_cursor: Some(next_cursor.into()),
-            next_page_token: next_page.map(|p| p.into()),
-        };
-        let body = SyncResponse {
-            value: Some(sync_response::Value::Page(page)),
-        };
-        let out = self.encode_response(MsgType::SyncAck, frame.head.req_id, &body)?;
-        Ok((
-            Some(cid),
-            EngineOutput {
-                responses: vec![out],
-                pushes: vec![],
-            },
-        ))
+            after,
+            upper,
+            round_start,
+            max_bytes,
+        )
     }
 
     fn sync_account_stream(
@@ -1561,15 +1506,41 @@ impl Engine {
             unreachable!("cold start handled earlier");
         };
 
-        let mut changes = Vec::new();
-        let mut covered = after;
-        let mut used_bytes = 0usize;
-        for ev in &stream.events {
-            if ev.event_seq <= after || ev.event_seq > upper {
-                continue;
-            }
-            let sz = ev.change.encoded_len();
-            if sz > max_bytes {
+        let changes = stream
+            .events
+            .iter()
+            .filter(|ev| ev.event_seq > after && ev.event_seq <= upper)
+            .take(max_items)
+            .map(|ev| ev.change.clone())
+            .collect();
+        self.finish_sync_page(
+            cid,
+            frame,
+            conn,
+            stream_context_account(stream.epoch),
+            changes,
+            after,
+            upper,
+            round_start,
+            max_bytes,
+        )
+    }
+
+    fn finish_sync_page(
+        &self,
+        cid: Id128,
+        frame: &DecodedFrame,
+        conn: &ConnState,
+        context: iam_protocol::pb::StreamContext,
+        mut changes: Vec<Change>,
+        after: u64,
+        upper: u64,
+        round_start: i64,
+        max_bytes: usize,
+    ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
+        let had_changes = !changes.is_empty();
+        loop {
+            if had_changes && changes.is_empty() {
                 return self.sync_err(
                     cid,
                     frame,
@@ -1577,66 +1548,68 @@ impl Engine {
                     RetryAction::RetrySameRequest,
                 );
             }
-            if changes.len() >= max_items || (!changes.is_empty() && used_bytes + sz > max_bytes) {
-                break;
+            let covered = changes
+                .last()
+                .and_then(|c| c.event_seq)
+                .unwrap_or(upper.max(after));
+            let is_account = matches!(
+                context.target.as_ref().and_then(|t| t.value.as_ref()),
+                Some(sync_target::Value::Account(_))
+            );
+            let conversation_id = match context.target.as_ref().and_then(|t| t.value.as_ref()) {
+                Some(sync_target::Value::Conversation(id)) => *id,
+                _ => 0,
+            };
+            let cursor = SyncCursor {
+                tenant_id: conn.tenant_id,
+                user_id: conn.user_id,
+                device_id: conn.device_id,
+                conversation_id,
+                epoch: validate_id128(context.epoch.as_ref().unwrap())?,
+                access_version: context.access_version.unwrap_or(0),
+                covered_through: covered,
+                issued_at_ms: self.store.now_ms,
+                is_account,
+            };
+            let next_page_token = (covered < upper).then(|| {
+                self.tokens
+                    .sign_page(&SyncPageToken {
+                        cursor: cursor.clone(),
+                        upper_bound: upper,
+                        scanned_through: covered,
+                        round_started_ms: round_start,
+                    })
+                    .into()
+            });
+            let body = SyncResponse {
+                value: Some(sync_response::Value::Page(SyncPage {
+                    context: Some(context.clone()),
+                    changes: changes.clone(),
+                    covered_through: Some(covered),
+                    upper_bound: Some(upper),
+                    next_cursor: Some(self.tokens.sign_cursor(&cursor).into()),
+                    next_page_token,
+                })),
+            };
+            if body.encoded_len() <= max_bytes {
+                let out = self.encode_response(MsgType::SyncAck, frame.head.req_id, &body)?;
+                return Ok((
+                    Some(cid),
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
             }
-            used_bytes += sz;
-            changes.push(ev.change.clone());
-            covered = ev.event_seq;
+            if changes.pop().is_none() {
+                return self.sync_err(
+                    cid,
+                    frame,
+                    ErrorCode::PageBudgetTooSmall,
+                    RetryAction::RetrySameRequest,
+                );
+            }
         }
-        if changes.is_empty() && after < upper {
-            covered = upper.min(after.saturating_add(max_items as u64).max(after + 1));
-        }
-        let next_cursor = self.tokens.sign_cursor(&SyncCursor {
-            tenant_id: conn.tenant_id,
-            user_id: conn.user_id,
-            device_id: conn.device_id,
-            conversation_id: 0,
-            epoch: stream.epoch,
-            access_version: 0,
-            covered_through: covered,
-            issued_at_ms: now,
-            is_account: true,
-        });
-        let next_page = if covered < upper {
-            Some(self.tokens.sign_page(&SyncPageToken {
-                cursor: SyncCursor {
-                    tenant_id: conn.tenant_id,
-                    user_id: conn.user_id,
-                    device_id: conn.device_id,
-                    conversation_id: 0,
-                    epoch: stream.epoch,
-                    access_version: 0,
-                    covered_through: covered,
-                    issued_at_ms: now,
-                    is_account: true,
-                },
-                upper_bound: upper,
-                scanned_through: covered,
-                round_started_ms: round_start,
-            }))
-        } else {
-            None
-        };
-        let page = SyncPage {
-            context: Some(stream_context_account(stream.epoch)),
-            changes,
-            covered_through: Some(covered),
-            upper_bound: Some(upper),
-            next_cursor: Some(next_cursor.into()),
-            next_page_token: next_page.map(|p| p.into()),
-        };
-        let body = SyncResponse {
-            value: Some(sync_response::Value::Page(page)),
-        };
-        let out = self.encode_response(MsgType::SyncAck, frame.head.req_id, &body)?;
-        Ok((
-            Some(cid),
-            EngineOutput {
-                responses: vec![out],
-                pushes: vec![],
-            },
-        ))
     }
 
     fn handle_snapshot(
@@ -1702,13 +1675,8 @@ impl Engine {
             }
         };
 
-        if snap.is_account {
-            let stream = self
-                .store
-                .account_streams
-                .get(&(conn.tenant_id, conn.user_id))
-                .cloned()
-                .ok_or(CoreError::Msg("no account stream"))?;
+        let (context, history_window, all_items) = if snap.is_account {
+            let stream = &self.store.account_streams[&(conn.tenant_id, conn.user_id)];
             if stream.epoch != snap.epoch {
                 return self.snapshot_err(
                     cid,
@@ -1717,140 +1685,156 @@ impl Engine {
                     RetryAction::RestartSync,
                 );
             }
-            let start = snap.scanned_items as usize;
-            let conv_ids: Vec<u64> = self
+            let mut states = std::collections::BTreeMap::new();
+            for event in stream
+                .events
+                .iter()
+                .filter(|e| e.event_seq <= snap.upper_bound)
+            {
+                match event.change.payload.as_ref() {
+                    Some(change::Payload::ConversationUpsert(state)) => {
+                        states.insert(state.conversation_id.unwrap(), state.clone());
+                    }
+                    Some(change::Payload::ConversationRemove(id)) => {
+                        states.remove(id);
+                    }
+                    _ => {}
+                }
+            }
+            // Never disclose a frozen view after its access context has been revoked.
+            for (id, state) in &states {
+                match self.store.conversations.get(&(conn.tenant_id, *id)) {
+                    Some(c)
+                        if c.members.contains(&conn.user_id)
+                            && state.history_id.as_deref() == Some(c.history_id.as_slice())
+                            && state.access_version == Some(c.access_version) => {}
+                    _ => {
+                        return self.snapshot_err(
+                            cid,
+                            frame,
+                            ErrorCode::ContextChanged,
+                            RetryAction::RestartSync,
+                        )
+                    }
+                }
+            }
+            let items = states
+                .into_values()
+                .map(|v| iam_protocol::pb::SnapshotItem {
+                    value: Some(snapshot_item::Value::Conversation(v)),
+                })
+                .collect::<Vec<_>>();
+            (stream_context_account(stream.epoch), None, items)
+        } else {
+            let conv = match self
                 .store
                 .conversations
-                .values()
-                .filter(|c| c.tenant_id == conn.tenant_id && c.members.contains(&conn.user_id))
-                .map(|c| c.conversation_id)
-                .collect();
-            let end = (start + max_items).min(conv_ids.len());
-            let mut items = Vec::new();
-            for cid_conv in &conv_ids[start..end] {
-                let c = self
-                    .store
-                    .conversations
-                    .get(&(conn.tenant_id, *cid_conv))
-                    .unwrap();
-                items.push(iam_protocol::pb::SnapshotItem {
-                    value: Some(snapshot_item::Value::Conversation(conversation_state(c))),
-                });
-            }
-            snap.scanned_items = end as u64;
-            let (next_page_token, resume_cursor) = if end < conv_ids.len() {
-                (Some(self.tokens.sign_snapshot(&snap)), None)
-            } else {
-                let resume = self.tokens.sign_cursor(&SyncCursor {
-                    tenant_id: conn.tenant_id,
-                    user_id: conn.user_id,
-                    device_id: conn.device_id,
-                    conversation_id: 0,
-                    epoch: stream.epoch,
-                    access_version: 0,
-                    covered_through: snap.upper_bound,
-                    issued_at_ms: self.store.now_ms,
-                    is_account: true,
-                });
-                (None, Some(resume))
+                .get(&(conn.tenant_id, snap.conversation_id))
+            {
+                Some(c) if c.members.contains(&conn.user_id) => c,
+                _ => {
+                    return self.snapshot_err(
+                        cid,
+                        frame,
+                        ErrorCode::PermissionDenied,
+                        RetryAction::None,
+                    )
+                }
             };
-            let page = SnapshotPage {
-                snapshot_id: Some(snap.snapshot_id.to_vec().into()),
-                context: Some(stream_context_account(stream.epoch)),
-                upper_bound: Some(snap.upper_bound),
-                history_window: None,
-                items,
-                next_page_token: next_page_token.map(|t| t.into()),
-                resume_cursor: resume_cursor.map(|t| t.into()),
-            };
-            let body = SnapshotResponse {
-                value: Some(snapshot_response::Value::Page(page)),
-            };
-            let out = self.encode_response(MsgType::SnapshotAck, frame.head.req_id, &body)?;
-            return Ok((
-                Some(cid),
-                EngineOutput {
-                    responses: vec![out],
-                    pushes: vec![],
-                },
-            ));
-        }
-
-        let conv = match self
-            .store
-            .conversations
-            .get(&(conn.tenant_id, snap.conversation_id))
-            .cloned()
-        {
-            Some(c) if c.members.contains(&conn.user_id) => c,
-            _ => {
+            if conv.history_id != snap.epoch || conv.access_version != snap.access_version {
                 return self.snapshot_err(
                     cid,
                     frame,
-                    ErrorCode::PermissionDenied,
-                    RetryAction::None,
+                    ErrorCode::ContextChanged,
+                    RetryAction::RestartSync,
                 );
             }
+            let items = self
+                .store
+                .message_views_at(conn.tenant_id, snap.conversation_id, snap.upper_bound)
+                .into_iter()
+                .filter(|m| {
+                    m.position
+                        .as_ref()
+                        .and_then(|p| p.create_seq)
+                        .is_some_and(|seq| {
+                            seq >= snap.from_create_seq && seq <= snap.through_create_seq
+                        })
+                })
+                .map(|m| iam_protocol::pb::SnapshotItem {
+                    value: Some(snapshot_item::Value::Message(m)),
+                })
+                .collect::<Vec<_>>();
+            (
+                stream_context_for_conv(conv),
+                Some(iam_protocol::pb::HistoryWindow {
+                    from_create_seq: Some(snap.from_create_seq),
+                    through_create_seq: Some(snap.through_create_seq),
+                }),
+                items,
+            )
         };
-        if conv.history_id != snap.epoch || conv.access_version != snap.access_version {
+        let start = usize::try_from(snap.scanned_items).unwrap_or(usize::MAX);
+        if start > all_items.len() {
             return self.snapshot_err(
                 cid,
                 frame,
-                ErrorCode::ContextChanged,
+                ErrorCode::InvalidToken,
                 RetryAction::RestartSync,
             );
         }
-        let msgs = self
-            .store
-            .messages_in_conversation_ordered(conn.tenant_id, snap.conversation_id);
-        let start = snap.scanned_items as usize;
-        let end = (start + max_items).min(msgs.len());
-        let mut items = Vec::new();
-        for m in &msgs[start..end] {
-            items.push(iam_protocol::pb::SnapshotItem {
-                value: Some(snapshot_item::Value::Message(m.view.clone())),
+        let max_bytes = req.limit.as_ref().unwrap().max_bytes.unwrap() as usize;
+        let mut end = start.saturating_add(max_items).min(all_items.len());
+        loop {
+            snap.scanned_items = end as u64;
+            let next_page_token =
+                (end < all_items.len()).then(|| self.tokens.sign_snapshot(&snap).into());
+            let resume_cursor = (end == all_items.len()).then(|| {
+                self.tokens
+                    .sign_cursor(&SyncCursor {
+                        tenant_id: conn.tenant_id,
+                        user_id: conn.user_id,
+                        device_id: conn.device_id,
+                        conversation_id: snap.conversation_id,
+                        epoch: snap.epoch,
+                        access_version: snap.access_version,
+                        covered_through: snap.upper_bound,
+                        issued_at_ms: self.store.now_ms,
+                        is_account: snap.is_account,
+                    })
+                    .into()
             });
+            let body = SnapshotResponse {
+                value: Some(snapshot_response::Value::Page(SnapshotPage {
+                    snapshot_id: Some(snap.snapshot_id.to_vec().into()),
+                    context: Some(context.clone()),
+                    upper_bound: Some(snap.upper_bound),
+                    history_window: history_window.clone(),
+                    items: all_items[start..end].to_vec(),
+                    next_page_token,
+                    resume_cursor,
+                })),
+            };
+            if body.encoded_len() <= max_bytes && (end > start || start == all_items.len()) {
+                let out = self.encode_response(MsgType::SnapshotAck, frame.head.req_id, &body)?;
+                return Ok((
+                    Some(cid),
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
+            }
+            if end == start {
+                return self.snapshot_err(
+                    cid,
+                    frame,
+                    ErrorCode::PageBudgetTooSmall,
+                    RetryAction::RetrySameRequest,
+                );
+            }
+            end -= 1;
         }
-        snap.scanned_items = end as u64;
-        let (next_page_token, resume_cursor) = if end < msgs.len() {
-            (Some(self.tokens.sign_snapshot(&snap)), None)
-        } else {
-            let resume = self.tokens.sign_cursor(&SyncCursor {
-                tenant_id: conn.tenant_id,
-                user_id: conn.user_id,
-                device_id: conn.device_id,
-                conversation_id: snap.conversation_id,
-                epoch: conv.history_id,
-                access_version: conv.access_version,
-                covered_through: snap.upper_bound,
-                issued_at_ms: self.store.now_ms,
-                is_account: false,
-            });
-            (None, Some(resume))
-        };
-        let page = SnapshotPage {
-            snapshot_id: Some(snap.snapshot_id.to_vec().into()),
-            context: Some(stream_context_for_conv(&conv)),
-            upper_bound: Some(snap.upper_bound),
-            history_window: Some(iam_protocol::pb::HistoryWindow {
-                from_create_seq: Some(snap.from_create_seq),
-                through_create_seq: Some(snap.through_create_seq),
-            }),
-            items,
-            next_page_token: next_page_token.map(|t| t.into()),
-            resume_cursor: resume_cursor.map(|t| t.into()),
-        };
-        let body = SnapshotResponse {
-            value: Some(snapshot_response::Value::Page(page)),
-        };
-        let out = self.encode_response(MsgType::SnapshotAck, frame.head.req_id, &body)?;
-        Ok((
-            Some(cid),
-            EngineOutput {
-                responses: vec![out],
-                pushes: vec![],
-            },
-        ))
     }
 
     fn handle_history(
@@ -1906,6 +1890,25 @@ impl Engine {
                 );
             }
         };
+        let context = req.context.as_ref().unwrap();
+        if context
+            .epoch
+            .as_ref()
+            .is_none_or(|v| validate_id128(v).is_err())
+            || context.access_version.unwrap_or(0) == 0
+        {
+            return self.history_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None);
+        }
+        if context.epoch.as_deref() != Some(conv.history_id.as_slice())
+            || context.access_version != Some(conv.access_version)
+        {
+            return self.history_err(
+                cid,
+                frame,
+                ErrorCode::ContextChanged,
+                RetryAction::RestartHistory,
+            );
+        }
         let now = self.store.now_ms;
         let (before, upper, retention_floor, round_started, scanned) = if let Some(pt) =
             req.page_token.as_ref()
@@ -1961,62 +1964,78 @@ impl Engine {
             (before, upper, 1u64, now, false)
         };
         let _ = scanned;
-        let msgs = self
+        let candidates: Vec<_> = self
             .store
-            .messages_in_conversation_ordered(conn.tenant_id, conversation_id);
-        let mut out_msgs = Vec::new();
-        let mut next_scan = before;
-        for m in msgs.iter().rev() {
-            let seq = m
-                .view
-                .position
-                .as_ref()
-                .and_then(|p| p.create_seq)
-                .unwrap_or(0);
-            if seq == 0 || seq >= before || seq < retention_floor {
-                continue;
+            .message_views_at(conn.tenant_id, conversation_id, upper)
+            .into_iter()
+            .rev()
+            .filter(|m| {
+                m.position
+                    .as_ref()
+                    .and_then(|p| p.create_seq)
+                    .is_some_and(|seq| seq < before && seq >= retention_floor)
+            })
+            .collect();
+        let max_bytes = req.limit.as_ref().unwrap().max_bytes.unwrap() as usize;
+        let mut count = candidates.len().min(max_items);
+        loop {
+            let next_page_token = if count > 0 && count < candidates.len() {
+                Some(
+                    self.tokens
+                        .sign_history(&HistoryToken {
+                            tenant_id: conn.tenant_id,
+                            user_id: conn.user_id,
+                            device_id: conn.device_id,
+                            conversation_id,
+                            epoch: conv.history_id,
+                            access_version: conv.access_version,
+                            before_create_seq: before,
+                            upper_bound: upper,
+                            retention_floor_seq: retention_floor,
+                            scanned_through_seq: candidates[count - 1]
+                                .position
+                                .as_ref()
+                                .unwrap()
+                                .create_seq
+                                .unwrap(),
+                            round_started_ms: round_started,
+                        })
+                        .into(),
+                )
+            } else {
+                None
+            };
+            let body = HistoryResponse {
+                value: Some(iam_protocol::pb::history_response::Value::Page(
+                    HistoryPage {
+                        context: Some(stream_context_for_conv(&conv)),
+                        upper_bound: Some(upper),
+                        retention_floor_seq: Some(retention_floor),
+                        messages: candidates[..count].to_vec(),
+                        next_page_token,
+                    },
+                )),
+            };
+            if body.encoded_len() <= max_bytes && (count > 0 || candidates.is_empty()) {
+                let out = self.encode_response(MsgType::HistoryAck, frame.head.req_id, &body)?;
+                return Ok((
+                    Some(cid),
+                    EngineOutput {
+                        responses: vec![out],
+                        pushes: vec![],
+                    },
+                ));
             }
-            if out_msgs.len() >= max_items {
-                break;
+            if count == 0 {
+                return self.history_err(
+                    cid,
+                    frame,
+                    ErrorCode::PageBudgetTooSmall,
+                    RetryAction::RetrySameRequest,
+                );
             }
-            out_msgs.push(m.view.clone());
-            next_scan = seq;
+            count -= 1;
         }
-        let next_page = if out_msgs.len() == max_items {
-            Some(self.tokens.sign_history(&HistoryToken {
-                tenant_id: conn.tenant_id,
-                user_id: conn.user_id,
-                device_id: conn.device_id,
-                conversation_id,
-                epoch: conv.history_id,
-                access_version: conv.access_version,
-                before_create_seq: before,
-                upper_bound: upper,
-                retention_floor_seq: retention_floor,
-                scanned_through_seq: next_scan,
-                round_started_ms: round_started,
-            }))
-        } else {
-            None
-        };
-        let page = HistoryPage {
-            context: Some(stream_context_for_conv(&conv)),
-            upper_bound: Some(upper),
-            retention_floor_seq: Some(retention_floor),
-            messages: out_msgs,
-            next_page_token: next_page.map(|t| t.into()),
-        };
-        let body = HistoryResponse {
-            value: Some(iam_protocol::pb::history_response::Value::Page(page)),
-        };
-        let out = self.encode_response(MsgType::HistoryAck, frame.head.req_id, &body)?;
-        Ok((
-            Some(cid),
-            EngineOutput {
-                responses: vec![out],
-                pushes: vec![],
-            },
-        ))
     }
 
     fn handle_push_ack(
