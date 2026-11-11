@@ -31,6 +31,13 @@ a dated version section when cutting a release.
 
 ### Fixed
 
+- Validate nested wire occurrences, scalar ranges, required response fields and
+  response invariants before applying data; reject unknown write semantics.
+- Route malformed frames and unsupported commands through protocol errors,
+  preserve business error routing, and persist invalid-text send rejections.
+- Bound frame buffering, count decode fields across the whole frame, generate
+  UUIDv7 identifiers with independent random bits, and bound UTF-8 diagnostics.
+
 - Rebuild snapshot and history pages at fixed upper bounds, recheck access,
   validate history contexts, and apply byte budgets to complete paging responses.
 

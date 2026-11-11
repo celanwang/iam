@@ -370,3 +370,34 @@ fn tenant_identity_isolates_sessions_messages_and_accounts() {
     assert_eq!(engine.store.account_streams.len(), 4);
     assert_eq!(engine.store.idempotency.len(), 2);
 }
+
+#[test]
+fn invalid_text_is_a_saved_rejection_and_cannot_replace_a_commit() {
+    let mut engine = seeded();
+    let cid = auth(&mut engine);
+    let id = client_msg_at(T);
+    let first = send(&mut engine, cid, 2, id, "");
+    assert!(matches!(
+        first.outcome.as_ref().unwrap().value,
+        Some(send_outcome::Value::RejectedFinal(_))
+    ));
+    assert_eq!(send(&mut engine, cid, 3, id, "").outcome, first.outcome);
+    let committed_id = client_msg_at(T);
+    send(&mut engine, cid, 4, committed_id, "kept");
+    match send(&mut engine, cid, 5, committed_id, "")
+        .outcome
+        .unwrap()
+        .value
+        .unwrap()
+    {
+        send_outcome::Value::Unresolved(u) => assert_eq!(
+            u.error.unwrap().code,
+            Some(iam_protocol::pb::ErrorCode::IdempotencyConflict as i32)
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        status(&mut engine, cid, 6, committed_id),
+        send_outcome::Value::Committed(_)
+    ));
+}

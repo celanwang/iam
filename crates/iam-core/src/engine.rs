@@ -35,6 +35,13 @@ pub struct EngineOutput {
     pub pushes: Vec<(Id128, Vec<u8>)>,
 }
 
+struct SyncRound {
+    after: u64,
+    upper: u64,
+    started_ms: i64,
+    max_bytes: usize,
+}
+
 pub struct Engine {
     pub store: MemoryStore,
     pub tokens: TokenSigner,
@@ -50,11 +57,181 @@ impl Engine {
         }
     }
 
+    /// Entry point for a complete frame supplied by a bounded transport decoder.
+    pub fn handle_frame(
+        &mut self,
+        connection_id: Option<Id128>,
+        frame: &iam_protocol::Frame,
+    ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
+        match iam_protocol::decode_frame(frame) {
+            Ok(decoded) => self.handle(connection_id, &decoded),
+            Err(error) => {
+                let head = if iam_protocol::has_duplicate_field(&frame.head, 1) == Ok(false) {
+                    Head::decode(frame.head.as_slice()).unwrap_or_default()
+                } else {
+                    Head::default()
+                };
+                let kind = MsgType::from_u8(frame.header.msg_type);
+                let (code, mut close) = match error {
+                    ProtocolErrorKind::UnsupportedCommand(_) => {
+                        (ErrorCode::UnsupportedCommand, false)
+                    }
+                    ProtocolErrorKind::UnsupportedContent => (ErrorCode::UnsupportedContent, false),
+                    ProtocolErrorKind::UnsupportedCapability => {
+                        (ErrorCode::UnsupportedCapability, false)
+                    }
+                    ProtocolErrorKind::InvalidArgument(_) => (ErrorCode::InvalidArgument, false),
+                    ProtocolErrorKind::UnsupportedVersion(_) => {
+                        (ErrorCode::UnsupportedVersion, true)
+                    }
+                    ProtocolErrorKind::UnsupportedFlags(_) => (ErrorCode::UnsupportedFlags, true),
+                    ProtocolErrorKind::ResourceLimit(_) => (ErrorCode::ResourceLimit, true),
+                    _ => (ErrorCode::MalformedFrame, true),
+                };
+                if let Some(kind) = kind {
+                    close |= iam_protocol::validate_head(kind, &head).is_err()
+                        || !kind.is_client_to_server();
+                    let envelope = DecodedFrame {
+                        msg_type: kind,
+                        head,
+                        body: DecodedBody::Heartbeat(iam_protocol::pb::HeartbeatRequest {}),
+                    };
+                    if !close {
+                        if !matches!(kind, MsgType::Auth | MsgType::Reconnect) {
+                            let cid = match self.require_auth(connection_id, &envelope)? {
+                                AuthGate::Ok(cid) => cid,
+                                AuthGate::Respond(out) => return Ok(out),
+                            };
+                            if kind != MsgType::PushAck {
+                                if let Err(out) = self.check_req_id(cid, &envelope) {
+                                    return Ok(out);
+                                }
+                            }
+                            match kind {
+                                MsgType::Sync => {
+                                    return self.sync_err(cid, &envelope, code, RetryAction::None)
+                                }
+                                MsgType::Snapshot => {
+                                    return self.snapshot_err(
+                                        cid,
+                                        &envelope,
+                                        code,
+                                        RetryAction::None,
+                                    )
+                                }
+                                MsgType::History => {
+                                    return self.history_err(
+                                        cid,
+                                        &envelope,
+                                        code,
+                                        RetryAction::None,
+                                    )
+                                }
+                                _ => {}
+                            }
+                        } else if connection_id.is_none() {
+                            let error = error_info(code, RetryAction::None);
+                            let bytes = if kind == MsgType::Auth {
+                                self.encode_response(
+                                    MsgType::AuthAck,
+                                    head.req_id,
+                                    &AuthResponse {
+                                        value: Some(iam_protocol::pb::auth_response::Value::Error(
+                                            error,
+                                        )),
+                                    },
+                                )?
+                            } else {
+                                self.encode_response(
+                                    MsgType::ReconnectAck,
+                                    head.req_id,
+                                    &ReconnectResponse {
+                                        value: Some(
+                                            iam_protocol::pb::reconnect_response::Value::Error(
+                                                error,
+                                            ),
+                                        ),
+                                    },
+                                )?
+                            };
+                            return Ok((
+                                None,
+                                EngineOutput {
+                                    responses: vec![bytes],
+                                    pushes: vec![],
+                                },
+                            ));
+                        }
+                    }
+                }
+                if close {
+                    self.disconnect(connection_id);
+                }
+                let bytes = encode_protocol_error(
+                    head.req_id.filter(|r| *r != 0),
+                    Some(frame.header.msg_type as u32),
+                    code,
+                    RetryAction::None,
+                    close,
+                    None,
+                )?;
+                Ok((
+                    if close { None } else { connection_id },
+                    EngineOutput {
+                        responses: vec![bytes],
+                        pushes: vec![],
+                    },
+                ))
+            }
+        }
+    }
+
+    /// Called when the transport closes, including unsuccessful error delivery.
+    pub fn disconnect(&mut self, connection_id: Option<Id128>) {
+        if let Some(cid) = connection_id {
+            if let Some(conn) = self.store.connections.remove(&cid) {
+                self.store
+                    .device_conn
+                    .remove(&(conn.tenant_id, conn.user_id, conn.device_id));
+            }
+        }
+    }
+
     pub fn handle(
         &mut self,
         connection_id: Option<Id128>,
         frame: &DecodedFrame,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
+        if !frame.msg_type.is_client_to_server()
+            || iam_protocol::validate_head(frame.msg_type, &frame.head).is_err()
+        {
+            return self.wire_error(
+                frame,
+                connection_id,
+                ErrorCode::InvalidArgument,
+                RetryAction::None,
+                true,
+                None,
+            );
+        }
+        if !matches!(frame.body, DecodedBody::Auth(_) | DecodedBody::Reconnect(_)) {
+            let cid = match self.require_auth(connection_id, frame)? {
+                AuthGate::Ok(cid) => cid,
+                AuthGate::Respond(out) => return Ok(out),
+            };
+            if frame.msg_type != MsgType::PushAck
+                && frame.head.req_id.unwrap_or(0) <= self.store.connections[&cid].last_req_id
+            {
+                return self.wire_error(
+                    frame,
+                    Some(cid),
+                    ErrorCode::InvalidArgument,
+                    RetryAction::None,
+                    true,
+                    None,
+                );
+            }
+        }
         // Entrance overload applies before command processors (except AUTH/RECONNECT bootstrap).
         if self.store.entrance_overloaded
             && !matches!(
@@ -62,6 +239,13 @@ impl Engine {
                 DecodedBody::Auth(_) | DecodedBody::Reconnect(_) | DecodedBody::Error(_)
             )
         {
+            if frame.msg_type != MsgType::PushAck {
+                if let Some(cid) = connection_id {
+                    if let Err(out) = self.check_req_id(cid, frame) {
+                        return Ok(out);
+                    }
+                }
+            }
             return self.wire_error(
                 frame,
                 connection_id,
@@ -110,13 +294,7 @@ impl Engine {
         detail: Option<&str>,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
         let connection_id = if close {
-            if let Some(cid) = connection_id {
-                if let Some(conn) = self.store.connections.remove(&cid) {
-                    self.store
-                        .device_conn
-                        .remove(&(conn.tenant_id, conn.user_id, conn.device_id));
-                }
-            }
+            self.disconnect(connection_id);
             None
         } else {
             connection_id
@@ -151,7 +329,7 @@ impl Engine {
                 || !c
                     .chars()
                     .all(|ch| matches!(ch, 'a'..='z' | '0'..='9' | '_'))
-                || !c.starts_with(|ch: char| matches!(ch, 'a'..='z'))
+                || !c.starts_with(|ch: char| ch.is_ascii_lowercase())
             {
                 return Err(CoreError::Msg("bad capability"));
             }
@@ -576,13 +754,16 @@ impl Engine {
                 );
             }
         };
-        if let Err(e) = validate_message_content(content) {
-            let code = match e {
-                ProtocolErrorKind::UnsupportedContent => ErrorCode::UnsupportedContent,
-                ProtocolErrorKind::ResourceLimit(_) => ErrorCode::ResourceLimit,
-                _ => ErrorCode::InvalidArgument,
-            };
-            return self.wire_error(frame, Some(cid), code, RetryAction::None, false, None);
+        if !matches!(content.value.as_ref(), Some(iam_protocol::pb::message_content::Value::Text(t)) if t.text.is_some())
+        {
+            return self.wire_error(
+                frame,
+                Some(cid),
+                ErrorCode::InvalidArgument,
+                RetryAction::None,
+                false,
+                None,
+            );
         }
 
         let conversation_id = key.conversation_id.unwrap_or(0);
@@ -644,7 +825,7 @@ impl Engine {
         }
 
         if let Some(rec) = self.store.idempotency.get(&idem).cloned() {
-            return self.replay_idem(cid, frame, key, &rec, &digest, now);
+            return self.replay_idem(cid, frame, key, &rec, &digest);
         }
 
         // Clock rollback or incomplete recovery: stop new accepts.
@@ -698,6 +879,33 @@ impl Engine {
             );
         }
 
+        if let Err(error) = validate_message_content(content) {
+            let code = if matches!(error, ProtocolErrorKind::ResourceLimit(_)) {
+                ErrorCode::ResourceLimit
+            } else {
+                ErrorCode::InvalidArgument
+            };
+            self.store.idempotency.insert(
+                idem,
+                IdempotencyRecord::RejectedFinal {
+                    code: code as i32,
+                    digest,
+                    accept_until_ms: accept_until,
+                    query_until_ms: query_until,
+                },
+            );
+            return self.send_ack(
+                cid,
+                frame,
+                key,
+                SendOutcome {
+                    value: Some(send_outcome::Value::RejectedFinal(error_info(
+                        code,
+                        RetryAction::None,
+                    ))),
+                },
+            );
+        }
         let Some(conv) = self
             .store
             .conversations
@@ -849,7 +1057,6 @@ impl Engine {
         key: &MessageKey,
         rec: &IdempotencyRecord,
         digest: &[u8; 32],
-        now: i64,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
         match rec {
             IdempotencyRecord::Committed {
@@ -858,17 +1065,8 @@ impl Engine {
                 history_id,
                 accepted_at_ms,
                 digest: d,
-                query_until_ms,
                 ..
             } => {
-                if now >= *query_until_ms && self.store.close_watermark_ms >= *query_until_ms {
-                    return self.send_ack(
-                        cid,
-                        frame,
-                        key,
-                        unresolved(ErrorCode::ResultExpired, RetryAction::None, true),
-                    );
-                }
                 if d != digest {
                     return self.send_ack(
                         cid,
@@ -899,10 +1097,7 @@ impl Engine {
                 )
             }
             IdempotencyRecord::RejectedFinal {
-                code,
-                digest: d,
-                query_until_ms,
-                ..
+                code, digest: d, ..
             } => {
                 if d != digest {
                     return self.send_ack(
@@ -910,14 +1105,6 @@ impl Engine {
                         frame,
                         key,
                         unresolved(ErrorCode::IdempotencyConflict, RetryAction::QuerySend, true),
-                    );
-                }
-                if now >= *query_until_ms {
-                    return self.send_ack(
-                        cid,
-                        frame,
-                        key,
-                        unresolved(ErrorCode::ResultExpired, RetryAction::None, true),
                     );
                 }
                 self.send_ack(
@@ -970,6 +1157,16 @@ impl Engine {
             }
         };
         let conversation_id = key.conversation_id.unwrap_or(0);
+        if conversation_id == 0 {
+            return self.wire_error(
+                frame,
+                Some(cid),
+                ErrorCode::InvalidArgument,
+                RetryAction::None,
+                false,
+                None,
+            );
+        }
         let client_msg_id = match key
             .client_msg_id
             .as_ref()
@@ -1134,6 +1331,9 @@ impl Engine {
             }
         };
 
+        if matches!(target, sync_target::Value::Conversation(0)) {
+            return self.sync_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None);
+        }
         // Cold start: no cursor and no page_token => reset + snapshot
         if req.cursor.is_none() && req.page_token.is_none() {
             return self.sync_reset(cid, frame, &conn, target, ResetReason::InitialSync, false);
@@ -1146,8 +1346,7 @@ impl Engine {
                 &conn,
                 *conversation_id,
                 req,
-                max_items,
-                max_bytes,
+                (max_items, max_bytes),
             ),
             sync_target::Value::Account(_) => {
                 self.sync_account_stream(cid, frame, &conn, req, max_items, max_bytes)
@@ -1266,9 +1465,9 @@ impl Engine {
         conn: &ConnState,
         conversation_id: u64,
         req: &SyncRequest,
-        max_items: usize,
-        max_bytes: usize,
+        limit: (usize, usize),
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
+        let (max_items, max_bytes) = limit;
         let conv = match self
             .store
             .conversations
@@ -1288,10 +1487,35 @@ impl Engine {
                         && p.cursor.tenant_id == conn.tenant_id
                         && p.cursor.user_id == conn.user_id
                         && p.cursor.device_id == conn.device_id
-                        && p.cursor.conversation_id == conversation_id
-                        && p.cursor.epoch == conv.history_id
-                        && p.cursor.access_version == conv.access_version =>
+                        && p.cursor.conversation_id == conversation_id =>
                 {
+                    if p.cursor.epoch != conv.history_id
+                        || p.cursor.access_version != conv.access_version
+                    {
+                        let reason = if p.cursor.epoch != conv.history_id {
+                            ResetReason::HistoryReset
+                        } else {
+                            ResetReason::AccessChanged
+                        };
+                        return self.sync_reset(
+                            cid,
+                            frame,
+                            conn,
+                            &sync_target::Value::Conversation(conversation_id),
+                            reason,
+                            false,
+                        );
+                    }
+                    if p.upper_bound >= conv.next_event_seq {
+                        return self.sync_reset(
+                            cid,
+                            frame,
+                            conn,
+                            &sync_target::Value::Conversation(conversation_id),
+                            ResetReason::HistoryReset,
+                            true,
+                        );
+                    }
                     (p.scanned_through, p.upper_bound, p.round_started_ms)
                 }
                 Ok(_) => {
@@ -1349,6 +1573,16 @@ impl Engine {
                         );
                     }
                     let upper = conv.next_event_seq.saturating_sub(1);
+                    if c.covered_through > upper {
+                        return self.sync_reset(
+                            cid,
+                            frame,
+                            conn,
+                            &sync_target::Value::Conversation(conversation_id),
+                            ResetReason::HistoryReset,
+                            true,
+                        );
+                    }
                     (c.covered_through, upper, now)
                 }
                 Ok(_) => {
@@ -1395,10 +1629,12 @@ impl Engine {
             conn,
             stream_context_for_conv(&conv),
             changes,
-            after,
-            upper,
-            round_start,
-            max_bytes,
+            SyncRound {
+                after,
+                upper,
+                started_ms: round_start,
+                max_bytes,
+            },
         )
     }
 
@@ -1424,9 +1660,18 @@ impl Engine {
                     if p.cursor.is_account
                         && p.cursor.tenant_id == conn.tenant_id
                         && p.cursor.user_id == conn.user_id
-                        && p.cursor.device_id == conn.device_id
-                        && p.cursor.epoch == stream.epoch =>
+                        && p.cursor.device_id == conn.device_id =>
                 {
+                    if p.cursor.epoch != stream.epoch || p.upper_bound >= stream.next_event_seq {
+                        return self.sync_reset(
+                            cid,
+                            frame,
+                            conn,
+                            &sync_target::Value::Account(iam_protocol::pb::Empty {}),
+                            ResetReason::HistoryReset,
+                            p.upper_bound >= stream.next_event_seq,
+                        );
+                    }
                     (p.scanned_through, p.upper_bound, p.round_started_ms)
                 }
                 Ok(_) => {
@@ -1473,6 +1718,16 @@ impl Engine {
                         );
                     }
                     let upper = stream.next_event_seq.saturating_sub(1);
+                    if c.covered_through > upper {
+                        return self.sync_reset(
+                            cid,
+                            frame,
+                            conn,
+                            &sync_target::Value::Account(iam_protocol::pb::Empty {}),
+                            ResetReason::HistoryReset,
+                            true,
+                        );
+                    }
                     (c.covered_through, upper, now)
                 }
                 Ok(_) => {
@@ -1519,10 +1774,12 @@ impl Engine {
             conn,
             stream_context_account(stream.epoch),
             changes,
-            after,
-            upper,
-            round_start,
-            max_bytes,
+            SyncRound {
+                after,
+                upper,
+                started_ms: round_start,
+                max_bytes,
+            },
         )
     }
 
@@ -1533,11 +1790,14 @@ impl Engine {
         conn: &ConnState,
         context: iam_protocol::pb::StreamContext,
         mut changes: Vec<Change>,
-        after: u64,
-        upper: u64,
-        round_start: i64,
-        max_bytes: usize,
+        round: SyncRound,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
+        let SyncRound {
+            after,
+            upper,
+            started_ms: round_start,
+            max_bytes,
+        } = round;
         let had_changes = !changes.is_empty();
         loop {
             if had_changes && changes.is_empty() {
@@ -1809,7 +2069,7 @@ impl Engine {
                     snapshot_id: Some(snap.snapshot_id.to_vec().into()),
                     context: Some(context.clone()),
                     upper_bound: Some(snap.upper_bound),
-                    history_window: history_window.clone(),
+                    history_window,
                     items: all_items[start..end].to_vec(),
                     next_page_token,
                     resume_cursor,
@@ -1906,7 +2166,7 @@ impl Engine {
                 cid,
                 frame,
                 ErrorCode::ContextChanged,
-                RetryAction::RestartHistory,
+                RetryAction::RestartSync,
             );
         }
         let now = self.store.now_ms;
@@ -1918,10 +2178,24 @@ impl Engine {
                     if h.tenant_id == conn.tenant_id
                         && h.user_id == conn.user_id
                         && h.device_id == conn.device_id
-                        && h.conversation_id == conversation_id
-                        && h.epoch == conv.history_id
-                        && h.access_version == conv.access_version =>
+                        && h.conversation_id == conversation_id =>
                 {
+                    if h.epoch != conv.history_id || h.access_version != conv.access_version {
+                        return self.history_err(
+                            cid,
+                            frame,
+                            ErrorCode::ContextChanged,
+                            RetryAction::RestartSync,
+                        );
+                    }
+                    if h.upper_bound >= conv.next_event_seq {
+                        return self.history_err(
+                            cid,
+                            frame,
+                            ErrorCode::PageTokenExpired,
+                            RetryAction::RestartHistory,
+                        );
+                    }
                     (
                         h.scanned_through_seq,
                         h.upper_bound,
@@ -2041,7 +2315,7 @@ impl Engine {
     fn handle_push_ack(
         &mut self,
         connection_id: Option<Id128>,
-        _push_id: Option<u64>,
+        push_id: Option<u64>,
         frame: &DecodedFrame,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
         let cid = match self.require_auth(connection_id, frame)? {
@@ -2058,6 +2332,16 @@ impl Engine {
                 frame,
                 Some(cid),
                 ErrorCode::UnsupportedCapability,
+                RetryAction::None,
+                false,
+                None,
+            );
+        }
+        if push_id.unwrap_or(0) == 0 {
+            return self.wire_error(
+                frame,
+                Some(cid),
+                ErrorCode::InvalidArgument,
                 RetryAction::None,
                 false,
                 None,

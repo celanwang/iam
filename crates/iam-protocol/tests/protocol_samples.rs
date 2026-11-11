@@ -9,9 +9,7 @@ use prost::Message;
 
 #[test]
 fn head_req_id_one_encodes_as_0801() {
-    let head = Head {
-        req_id: Some(1),
-    };
+    let head = Head { req_id: Some(1) };
     let mut buf = Vec::new();
     head.encode(&mut buf).unwrap();
     assert_eq!(hex::encode(&buf), "0801");
@@ -20,10 +18,7 @@ fn head_req_id_one_encodes_as_0801() {
 #[test]
 fn heartbeat_full_frame_matches_doc() {
     let frame = encode_heartbeat(1).unwrap();
-    assert_eq!(
-        hex::encode(&frame),
-        "0103000000000002000000000801"
-    );
+    assert_eq!(hex::encode(&frame), "0103000000000002000000000801");
     let mut dec = FrameDecoder::new();
     dec.push(&frame);
     let raw = dec.next_frame().unwrap().unwrap();
@@ -151,4 +146,110 @@ fn text_content_roundtrip() {
     match back.value.unwrap() {
         message_content::Value::Text(t) => assert_eq!(t.text.as_deref(), Some("hi")),
     }
+}
+
+fn raw_body(kind: MsgType, body: &[u8]) -> iam_protocol::Result<iam_protocol::DecodedBody> {
+    iam_protocol::decode_body(kind, body)
+}
+
+#[test]
+fn recursive_wire_validation_rejects_duplicates_and_multiple_branches() {
+    // Duplicate SendRequest.key and nested MessageKey.conversation_id.
+    for body in [&[0x0a, 0, 0x0a, 0][..], &[0x0a, 4, 8, 1, 8, 1][..]] {
+        assert!(matches!(
+            raw_body(MsgType::Send, body),
+            Err(iam_protocol::ProtocolErrorKind::MalformedFrame(_))
+        ));
+    }
+    // AUTH_ACK contains both a known and an unknown oneof branch.
+    let err = iam_protocol::pb::ErrorInfo {
+        code: Some(1),
+        action: Some(1),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let mut response = vec![0x12, err.len() as u8];
+    response.extend(err);
+    response.extend([0x1a, 0]);
+    assert!(matches!(
+        raw_body(MsgType::AuthAck, &response),
+        Err(iam_protocol::ProtocolErrorKind::MalformedFrame(_))
+    ));
+}
+
+#[test]
+fn scalar_wire_values_are_not_truncated_or_coerced() {
+    // ProtocolError.close_connection = 2 and PageLimit.max_items > uint32.
+    assert!(matches!(
+        raw_body(MsgType::Error, &[0x18, 2]),
+        Err(iam_protocol::ProtocolErrorKind::MalformedFrame(_))
+    ));
+    assert!(matches!(
+        raw_body(MsgType::Sync, &[0x22, 6, 8, 0x80, 0x80, 0x80, 0x80, 0x10]),
+        Err(iam_protocol::ProtocolErrorKind::MalformedFrame(_))
+    ));
+    let mut overflow = vec![8];
+    overflow.extend([0xff; 9]);
+    overflow.push(2);
+    assert!(raw_body(MsgType::HeartbeatAck, &overflow).is_err());
+    assert!(raw_body(MsgType::HeartbeatAck, &[0]).is_err());
+}
+
+#[test]
+fn unknown_write_fields_and_unknown_response_branches_are_not_discarded() {
+    assert!(matches!(
+        raw_body(MsgType::Send, &[0xa0, 6, 1]),
+        Err(iam_protocol::ProtocolErrorKind::UnsupportedContent)
+    ));
+    assert!(matches!(
+        raw_body(MsgType::AuthAck, &[0x1a, 0]),
+        Err(iam_protocol::ProtocolErrorKind::UnsupportedCapability)
+    ));
+    // An ordinary unknown field is allowed beside a valid heartbeat response.
+    assert!(raw_body(MsgType::HeartbeatAck, &[8, 1, 0xa0, 6, 1]).is_ok());
+}
+
+#[test]
+fn missing_required_response_fields_and_field_floods_are_rejected() {
+    assert!(raw_body(MsgType::SendStatusAck, &[0x0a, 0]).is_err());
+    let mut flood = Vec::new();
+    for _ in 0..16385 {
+        flood.extend([0xa0, 6, 1]);
+    }
+    assert!(matches!(
+        raw_body(MsgType::Auth, &flood),
+        Err(iam_protocol::ProtocolErrorKind::MalformedFrame(_))
+    ));
+}
+
+#[test]
+fn bounded_frame_decoder_stays_failed_after_overflow() {
+    let mut d = FrameDecoder::new();
+    d.push(&vec![0; iam_protocol::FRAME_HARD_MAX as usize + 1]);
+    assert!(d.next_frame().is_err());
+    d.push(&encode_heartbeat(1).unwrap());
+    assert!(d.next_frame().is_err());
+    assert!(d.finish().is_err());
+}
+
+#[test]
+fn contradictory_send_outcome_is_rejected() {
+    use iam_protocol::pb::*;
+    let id = iam_protocol::generate_id128().to_vec();
+    let body = SendStatusResponse {
+        key: Some(MessageKey {
+            conversation_id: Some(1),
+            client_msg_id: Some(id.into()),
+        }),
+        outcome: Some(SendOutcome {
+            value: Some(send_outcome::Value::Unresolved(SendUnresolved {
+                error: Some(iam_protocol::error_info(
+                    ErrorCode::ResultExpired,
+                    RetryAction::None,
+                )),
+                acceptance_closed: Some(false),
+            })),
+        }),
+    };
+    assert!(raw_body(MsgType::SendStatusAck, &body.encode_to_vec()).is_err());
 }

@@ -220,3 +220,54 @@ fn tampered_sync_cursor_rejected() {
 fn _touch(c: change::Payload, t: sync_target::Value) {
     let _ = (c, t);
 }
+
+fn custom_body(kind: u8, req_id: u8, body: &[u8]) -> Vec<u8> {
+    let mut header = iam_protocol::FixedHeader::new(MsgType::Auth, 2, body.len() as u32);
+    header.msg_type = kind;
+    let mut out = Vec::new();
+    header.encode(&mut out);
+    out.extend([8, req_id]);
+    out.extend(body);
+    out
+}
+
+#[test]
+fn malformed_nested_fields_close_but_unknown_commands_do_not() {
+    let mut world = LoopWorld::new(1_700_000_000_000);
+    world.auth("a", b"token-a");
+    let cid = world.peers["a"].connection_id;
+    let (_, out) = world.dispatch_raw(cid, &custom_body(250, 2, &[8, 1]));
+    let e = parse_error(&out.responses[0]);
+    assert_eq!(e.ref_msg_type, Some(250));
+    assert_eq!(e.close_connection, Some(false));
+    assert_eq!(
+        e.error.unwrap().code,
+        Some(ErrorCode::UnsupportedCommand as i32)
+    );
+    let (next, out) = world.dispatch_raw(
+        cid,
+        &custom_body(MsgType::Send as u8, 3, &[0x0a, 4, 8, 1, 8, 1]),
+    );
+    let e = parse_error(&out.responses[0]);
+    assert_eq!(e.close_connection, Some(true));
+    assert_eq!(
+        e.error.unwrap().code,
+        Some(ErrorCode::MalformedFrame as i32)
+    );
+    assert!(next.is_none());
+    assert!(!world.engine.store.connections.contains_key(&cid.unwrap()));
+}
+
+#[test]
+fn unknown_sync_target_uses_business_error_and_does_not_close() {
+    let mut world = LoopWorld::new(1_700_000_000_000);
+    world.auth("a", b"token-a");
+    let cid = world.peers["a"].connection_id;
+    let (next, out) = world.dispatch_raw(
+        cid,
+        &custom_body(MsgType::Sync as u8, 2, &[0x0a, 2, 0x1a, 0]),
+    );
+    assert_eq!(next, cid);
+    assert!(matches!(parse_sync_ack(&out.responses[0]).value,
+        Some(sync_response::Value::Error(e)) if e.code == Some(ErrorCode::UnsupportedCapability as i32)));
+}
