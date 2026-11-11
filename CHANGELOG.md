@@ -14,6 +14,8 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Authoritative persistence-path design for durable send, idempotency, watermarks,
+  and recovery acceptance (`docs/storage.md`).
 - Project design direction for a Rust-based general IM engine (`docs/design.md`).
 - Basic message protocol design with typed structures, command contracts,
   state transitions, recovery flows, and acceptance scenarios (`docs/protocol.md`).
