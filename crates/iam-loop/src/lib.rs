@@ -27,6 +27,12 @@ pub struct Peer {
     next_req: u64,
 }
 
+impl Default for Peer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Peer {
     pub fn new() -> Self {
         Self {
@@ -86,10 +92,7 @@ impl LoopWorld {
         .unwrap();
         let (cid, out) = self.dispatch(None, &bytes);
         let ack = out.responses.into_iter().next().expect("auth ack");
-        let resume = match decode_body_auth(&ack) {
-            Some(tok) => tok,
-            None => None,
-        };
+        let resume = decode_body_auth(&ack).unwrap_or_default();
         let peer = self.peers.get_mut(name).unwrap();
         peer.connection_id = cid;
         peer.resume_token = resume;
@@ -344,8 +347,7 @@ impl LoopWorld {
         let mut dec = FrameDecoder::new();
         dec.push(bytes);
         let frame = dec.next_frame().unwrap().unwrap();
-        let decoded = decode_frame(&frame).unwrap();
-        self.engine.handle(connection_id, &decoded).unwrap()
+        self.engine.handle_frame(connection_id, &frame).unwrap()
     }
 }
 

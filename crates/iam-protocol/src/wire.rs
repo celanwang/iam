@@ -2,12 +2,12 @@ use crate::error::{ProtocolErrorKind, Result};
 use crate::frame::{FixedHeader, Frame, HEADER_LEN};
 use crate::msg_type::MsgType;
 use crate::pb::{
-    self, AuthRequest, AuthResponse, Head, HeartbeatAck, HeartbeatRequest, HistoryRequest,
+    AuthRequest, AuthResponse, Head, HeartbeatAck, HeartbeatRequest, HistoryRequest,
     HistoryResponse, ProtocolError, Push, PushAck, ReconnectRequest, ReconnectResponse,
     SendRequest, SendResponse, SendStatusRequest, SendStatusResponse, SnapshotRequest,
     SnapshotResponse, SyncRequest, SyncResponse,
 };
-use crate::validate::{validate_head, validate_message_content, validate_sync_target};
+use crate::validate::validate_head;
 use prost::Message;
 
 #[derive(Debug, Clone)]
@@ -40,10 +40,8 @@ pub struct DecodedFrame {
     pub body: DecodedBody,
 }
 
-fn decode_pb<T: Message + Default>(bytes: &[u8]) -> Result<T> {
-    // Reject duplicate singular fields / multi-branch at a basic level by
-    // scanning tags when needed for critical messages; prost merge is last-wins.
-    // For Head we enforce via scan_no_duplicate_varint_field.
+fn decode_pb<T: Message + Default + prost::Name>(bytes: &[u8], fields: &mut usize) -> Result<T> {
+    crate::wire_check::check(&T::full_name(), bytes, fields)?;
     T::decode(bytes).map_err(|e| ProtocolErrorKind::Decode(e.to_string()))
 }
 
@@ -88,7 +86,7 @@ fn read_varint(bytes: &[u8]) -> Result<(u64, usize)> {
     let mut result = 0u64;
     let mut shift = 0;
     for (i, b) in bytes.iter().enumerate() {
-        if i >= 10 {
+        if i >= 10 || (i == 9 && *b > 1) {
             return Err(ProtocolErrorKind::MalformedFrame("varint overflow"));
         }
         result |= ((*b as u64) & 0x7f) << shift;
@@ -114,8 +112,9 @@ fn skip_value(bytes: &[u8], wire: u8) -> Result<usize> {
         }
         2 => {
             let (len, n) = read_varint(bytes)?;
-            let len = len as usize;
-            if bytes.len() < n + len {
+            let len = usize::try_from(len)
+                .map_err(|_| ProtocolErrorKind::MalformedFrame("length overflow"))?;
+            if len > bytes.len().saturating_sub(n) {
                 return Err(ProtocolErrorKind::MalformedFrame("short len-delim"));
             }
             Ok(n + len)
@@ -131,135 +130,48 @@ fn skip_value(bytes: &[u8], wire: u8) -> Result<usize> {
 }
 
 pub fn decode_body(msg_type: MsgType, body: &[u8]) -> Result<DecodedBody> {
+    decode_body_counted(msg_type, body, &mut 0)
+}
+
+fn decode_body_counted(msg_type: MsgType, body: &[u8], fields: &mut usize) -> Result<DecodedBody> {
     if body.is_empty() {
         if msg_type.allows_empty_body() {
             return Ok(DecodedBody::Heartbeat(HeartbeatRequest {}));
         }
         return Err(ProtocolErrorKind::InvalidArgument("empty body"));
     }
-    Ok(match msg_type {
-        MsgType::Auth => DecodedBody::Auth(decode_pb(body)?),
-        MsgType::AuthAck => DecodedBody::AuthAck(decode_pb(body)?),
-        MsgType::Heartbeat => DecodedBody::Heartbeat(decode_pb(body)?),
-        MsgType::HeartbeatAck => DecodedBody::HeartbeatAck(decode_pb(body)?),
-        MsgType::Reconnect => DecodedBody::Reconnect(decode_pb(body)?),
-        MsgType::ReconnectAck => DecodedBody::ReconnectAck(decode_pb(body)?),
-        MsgType::Send => {
-            if count_oneof_branches(body, 1, 63)? > 1 {
-                // SendRequest itself isn't a pure oneof; check content later
-            }
-            let req: SendRequest = decode_pb(body)?;
-            if let Some(content) = req.content.as_ref() {
-                // unknown branch only: field present but value None after decode
-                let content_bytes = extract_submessage(body, 2)?;
-                if let Some(cb) = content_bytes {
-                    let branches = count_oneof_branches(&cb, 1, 63)?;
-                    if branches == 0 {
-                        // might be empty message -> missing text
-                    } else if branches == 1 {
-                        // check if field 1
-                        if has_unknown_only_branch(&cb, 1)? {
-                            return Err(ProtocolErrorKind::UnsupportedContent);
-                        }
-                    } else {
-                        return Err(ProtocolErrorKind::MalformedFrame("multi content branch"));
-                    }
-                }
-                validate_message_content(content)?;
-            }
-            DecodedBody::Send(req)
-        }
-        MsgType::SendAck => DecodedBody::SendAck(decode_pb(body)?),
-        MsgType::Push => DecodedBody::Push(decode_pb(body)?),
-        MsgType::PushAck => DecodedBody::PushAck(decode_pb(body)?),
-        MsgType::Sync => {
-            let req: SyncRequest = decode_pb(body)?;
-            if let Some(target) = req.target.as_ref() {
-                let target_bytes = extract_submessage(body, 1)?;
-                if let Some(tb) = target_bytes {
-                    let branches = count_oneof_branches(&tb, 1, 63)?;
-                    if branches > 1 {
-                        return Err(ProtocolErrorKind::MalformedFrame("multi sync target"));
-                    }
-                    if branches == 1 && has_unknown_only_branch(&tb, /*known*/ 0)? {
-                        // unknown only if neither 1 nor 2
-                        if !field_present(&tb, 1)? && !field_present(&tb, 2)? {
-                            return Err(ProtocolErrorKind::InvalidArgument("unknown sync target"));
-                        }
-                    }
-                }
-                validate_sync_target(target)?;
-            }
-            DecodedBody::Sync(req)
-        }
-        MsgType::SyncAck => DecodedBody::SyncAck(decode_pb(body)?),
-        MsgType::Error => DecodedBody::Error(decode_pb(body)?),
-        MsgType::SendStatus => DecodedBody::SendStatus(decode_pb(body)?),
-        MsgType::SendStatusAck => DecodedBody::SendStatusAck(decode_pb(body)?),
-        MsgType::Snapshot => DecodedBody::Snapshot(decode_pb(body)?),
-        MsgType::SnapshotAck => DecodedBody::SnapshotAck(decode_pb(body)?),
-        MsgType::History => DecodedBody::History(decode_pb(body)?),
-        MsgType::HistoryAck => DecodedBody::HistoryAck(decode_pb(body)?),
-    })
-}
-
-fn field_present(bytes: &[u8], field: u32) -> Result<bool> {
-    let mut i = 0;
-    while i < bytes.len() {
-        let (key, n) = read_varint(&bytes[i..])?;
-        i += n;
-        let field_no = (key >> 3) as u32;
-        let wire = (key & 0x7) as u8;
-        if field_no == field {
-            return Ok(true);
-        }
-        i += skip_value(&bytes[i..], wire)?;
-    }
-    Ok(false)
-}
-
-fn has_unknown_only_branch(bytes: &[u8], _known_hint: u32) -> Result<bool> {
-    // true if any branch field in 1..=63 exists that isn't field 1 or 2 for SyncTarget,
-    // or isn't field 1 for MessageContent. Caller decides known set via field_present.
-    let mut i = 0;
-    while i < bytes.len() {
-        let (key, n) = read_varint(&bytes[i..])?;
-        i += n;
-        let field_no = (key >> 3) as u32;
-        let wire = (key & 0x7) as u8;
-        if (1..=63).contains(&field_no) && field_no != 1 && field_no != 2 {
-            return Ok(true);
-        }
-        i += skip_value(&bytes[i..], wire)?;
-    }
-    Ok(false)
-}
-
-fn extract_submessage(bytes: &[u8], field: u32) -> Result<Option<Vec<u8>>> {
-    let mut i = 0;
-    while i < bytes.len() {
-        let (key, n) = read_varint(&bytes[i..])?;
-        i += n;
-        let field_no = (key >> 3) as u32;
-        let wire = (key & 0x7) as u8;
-        if field_no == field {
-            if wire != 2 {
-                return Err(ProtocolErrorKind::MalformedFrame("expected len-delim"));
-            }
-            let (len, n) = read_varint(&bytes[i..])?;
-            i += n;
-            let len = len as usize;
-            if bytes.len() < i + len {
-                return Err(ProtocolErrorKind::MalformedFrame("short submessage"));
-            }
-            return Ok(Some(bytes[i..i + len].to_vec()));
-        }
-        i += skip_value(&bytes[i..], wire)?;
-    }
-    Ok(None)
+    let decoded = match msg_type {
+        MsgType::Auth => DecodedBody::Auth(decode_pb(body, fields)?),
+        MsgType::AuthAck => DecodedBody::AuthAck(decode_pb(body, fields)?),
+        MsgType::Heartbeat => DecodedBody::Heartbeat(decode_pb(body, fields)?),
+        MsgType::HeartbeatAck => DecodedBody::HeartbeatAck(decode_pb(body, fields)?),
+        MsgType::Reconnect => DecodedBody::Reconnect(decode_pb(body, fields)?),
+        MsgType::ReconnectAck => DecodedBody::ReconnectAck(decode_pb(body, fields)?),
+        MsgType::Send => DecodedBody::Send(decode_pb(body, fields)?),
+        MsgType::SendAck => DecodedBody::SendAck(decode_pb(body, fields)?),
+        MsgType::Push => DecodedBody::Push(decode_pb(body, fields)?),
+        MsgType::PushAck => DecodedBody::PushAck(decode_pb(body, fields)?),
+        MsgType::Sync => DecodedBody::Sync(decode_pb(body, fields)?),
+        MsgType::SyncAck => DecodedBody::SyncAck(decode_pb(body, fields)?),
+        MsgType::Error => DecodedBody::Error(decode_pb(body, fields)?),
+        MsgType::SendStatus => DecodedBody::SendStatus(decode_pb(body, fields)?),
+        MsgType::SendStatusAck => DecodedBody::SendStatusAck(decode_pb(body, fields)?),
+        MsgType::Snapshot => DecodedBody::Snapshot(decode_pb(body, fields)?),
+        MsgType::SnapshotAck => DecodedBody::SnapshotAck(decode_pb(body, fields)?),
+        MsgType::History => DecodedBody::History(decode_pb(body, fields)?),
+        MsgType::HistoryAck => DecodedBody::HistoryAck(decode_pb(body, fields)?),
+    };
+    crate::validate::validate_response(&decoded)?;
+    Ok(decoded)
 }
 
 pub fn decode_frame(frame: &Frame) -> Result<DecodedFrame> {
+    frame.header.validate_lengths()?;
+    if frame.head.len() != frame.header.head_len as usize
+        || frame.body.len() != frame.header.body_len as usize
+    {
+        return Err(ProtocolErrorKind::MalformedFrame("frame length mismatch"));
+    }
     let msg_type = MsgType::from_u8(frame.header.msg_type)
         .ok_or(ProtocolErrorKind::UnsupportedCommand(frame.header.msg_type))?;
 
@@ -267,23 +179,20 @@ pub fn decode_frame(frame: &Frame) -> Result<DecodedFrame> {
         return Err(ProtocolErrorKind::InvalidArgument("empty body"));
     }
     if msg_type.allows_empty_body() && frame.header.body_len != 0 {
-        return Err(ProtocolErrorKind::InvalidArgument("heartbeat body must be empty"));
+        return Err(ProtocolErrorKind::InvalidArgument(
+            "heartbeat body must be empty",
+        ));
     }
 
-    if !frame.head.is_empty() {
-        if has_duplicate_field(&frame.head, 1)? {
-            return Err(ProtocolErrorKind::MalformedFrame("duplicate req_id"));
-        }
-    }
-
+    let mut fields = 0;
     let head = if frame.head.is_empty() {
         Head { req_id: None }
     } else {
-        decode_pb::<Head>(&frame.head)?
+        decode_pb::<Head>(&frame.head, &mut fields)?
     };
     validate_head(msg_type, &head)?;
 
-    let body = decode_body(msg_type, &frame.body)?;
+    let body = decode_body_counted(msg_type, &frame.body, &mut fields)?;
     Ok(DecodedFrame {
         msg_type,
         head,

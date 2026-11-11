@@ -16,6 +16,8 @@ pub enum ProtocolErrorKind {
     ResourceLimit(&'static str),
     #[error("invalid argument: {0}")]
     InvalidArgument(&'static str),
+    #[error("unsupported protocol capability")]
+    UnsupportedCapability,
     #[error("unsupported content")]
     UnsupportedContent,
     #[error("decode error: {0}")]

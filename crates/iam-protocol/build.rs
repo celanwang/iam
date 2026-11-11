@@ -4,6 +4,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     prost_build::Config::new()
         .bytes(["."])
-        .compile_protos(&["../../proto/iam/protocol/protocol.proto"], &["../../proto"])?;
+        .enable_type_names()
+        .file_descriptor_set_path(
+            std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("protocol.bin"),
+        )
+        .compile_protos(
+            &["../../proto/iam/protocol/protocol.proto"],
+            &["../../proto"],
+        )?;
     Ok(())
 }

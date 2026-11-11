@@ -261,9 +261,11 @@ name = "iam-protocol"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "getrandom 0.4.3",
  "hex",
  "prost",
  "prost-build",
+ "prost-types",
  "protoc-bin-vendored",
  "sha2",
  "thiserror",

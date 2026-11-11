@@ -72,19 +72,14 @@ fn recover_finds_message_after_push_drop() {
     let page = world.recover_conversation_latest("b", 1);
     // If upper was already covered by snapshot, page changes may be empty; message is in snapshot.
     // Call recover's internal path again by inspecting engine messages.
-    let stored = world
-        .engine
-        .store
-        .messages
-        .values()
-        .any(|m| {
-            m.view
-                .r#ref
-                .as_ref()
-                .and_then(|r| r.message_id.as_ref())
-                .map(|id| &id[..] == &mid[..])
-                .unwrap_or(false)
-        });
+    let stored = world.engine.store.messages.values().any(|m| {
+        m.view
+            .r#ref
+            .as_ref()
+            .and_then(|r| r.message_id.as_ref())
+            .map(|id| id[..] == mid[..])
+            .unwrap_or(false)
+    });
     assert!(stored);
     let _ = page;
 }
@@ -230,7 +225,7 @@ fn snapshot_includes_committed_message() {
             .r#ref
             .as_ref()
             .and_then(|r| r.message_id.as_ref())
-            .map(|id| &id[..] == &mid[..])
+            .map(|id| id[..] == mid[..])
             .unwrap_or(false),
         _ => false,
     });

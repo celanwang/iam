@@ -1,6 +1,6 @@
 use crate::error::{ProtocolErrorKind, Result};
 use crate::msg_type::MsgType;
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 
 pub const HEADER_LEN: usize = 12;
 pub const FRAME_HARD_MAX: u32 = 1024 * 1024;
@@ -97,6 +97,7 @@ pub struct Frame {
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buf: BytesMut,
+    failure: Option<ProtocolErrorKind>,
 }
 
 impl FrameDecoder {
@@ -105,14 +106,34 @@ impl FrameDecoder {
     }
 
     pub fn push(&mut self, data: &[u8]) {
+        if self.failure.is_some() {
+            return;
+        }
+        if data.len() > FRAME_HARD_MAX as usize - self.buf.len() {
+            self.buf.clear();
+            self.failure = Some(ProtocolErrorKind::ResourceLimit(
+                "receive buffer limit; drain frames before reading more",
+            ));
+            return;
+        }
         self.buf.extend_from_slice(data);
     }
 
     pub fn next_frame(&mut self) -> Result<Option<Frame>> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
         if self.buf.len() < HEADER_LEN {
             return Ok(None);
         }
-        let header = FixedHeader::decode(&self.buf[..HEADER_LEN])?;
+        let header = match FixedHeader::decode(&self.buf[..HEADER_LEN]) {
+            Ok(header) => header,
+            Err(error) => {
+                self.failure = Some(error.clone());
+                self.buf.clear();
+                return Err(error);
+            }
+        };
         let total = header.total_len();
         if self.buf.len() < total {
             return Ok(None);
@@ -124,10 +145,15 @@ impl FrameDecoder {
     }
 
     pub fn finish(self) -> Result<()> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
         if self.buf.is_empty() {
             Ok(())
         } else {
-            Err(ProtocolErrorKind::MalformedFrame("trailing incomplete frame"))
+            Err(ProtocolErrorKind::MalformedFrame(
+                "trailing incomplete frame",
+            ))
         }
     }
 }

@@ -18,7 +18,13 @@ pub fn encode_protocol_error(
             code: Some(code as i32),
             action: Some(action as i32),
             retry_after_ms: None,
-            detail: detail.map(|s| s.chars().take(256).collect()),
+            detail: detail.map(|s| {
+                let mut end = s.len().min(256);
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                s[..end].to_owned()
+            }),
         }),
         close_connection: Some(close_connection),
     };

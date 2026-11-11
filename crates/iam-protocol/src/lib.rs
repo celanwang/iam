@@ -7,10 +7,11 @@ mod id128;
 mod msg_type;
 mod validate;
 mod wire;
+mod wire_check;
 
 pub use error::{ProtocolErrorKind, Result};
 pub use error_wire::{encode_protocol_error, error_info};
-pub use frame::{FixedHeader, Frame, FrameDecoder, FRAME_HARD_MAX, HEAD_HARD_MAX, HEADER_LEN};
+pub use frame::{FixedHeader, Frame, FrameDecoder, FRAME_HARD_MAX, HEADER_LEN, HEAD_HARD_MAX};
 pub use id128::{
     generate_id128, id128_timestamp_ms, id128_to_string, parse_id128_bytes, validate_id128, Id128,
 };
