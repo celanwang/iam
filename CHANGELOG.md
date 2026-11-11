@@ -52,6 +52,9 @@ a dated version section when cutting a release.
 
 ### Changed
 
+- Document the tested in-memory implementation scope, verification commands,
+  and remaining transport, durability, authentication and client obligations.
+
 - Align protocol and design guidance on ordering, idempotency, synchronization,
   connection recovery, compatibility, and failover boundaries.
 - Expand the protocol design with explicit framing, send outcomes,
