@@ -7,7 +7,7 @@ A general IM engine built for 10B scale.
 - Design direction: [`docs/design.md`](docs/design.md)
 - Message protocol: [`docs/protocol.md`](docs/protocol.md)
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
-- Contributing (branches, commits, PRs): [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 
 ## Stack
 
@@ -16,36 +16,18 @@ A general IM engine built for 10B scale.
 
 ## 当前实现与验收范围
 
-当前代码部分满足协议设计，是可测试的内存协议内核，尚不是可部署的 IM 服务。`docs/protocol.md` 定义目标契约，测试通过不代表持久化、网络接入和客户端恢复已经完成。
+当前是可测试的**内存协议内核**，部分满足 [`docs/protocol.md`](docs/protocol.md)，不是可部署 IM 服务。
 
-`iam-protocol` 提供固定头、Protobuf 类型、受限收帧、递归线格式校验和响应约束校验。字段号来自仓库中的 `.proto`，校验使用同一次构建生成的描述信息。普通请求的业务校验由内核负责，以保留业务响应与连接错误的区别。
+- `iam-protocol`：FixedHeader、Protobuf、收帧与线格式校验
+- `iam-core`：AUTH / RECONNECT / SEND / SYNC / SNAPSHOT / HISTORY 等内存权威语义
+- `iam-loop`：进程内闭环测试驱动（非网关、非客户端 SDK）
 
-`iam-core` 提供认证和连接替换、发送三态、幂等窗口、发送查询、推送、同步、快照和历史读取。身份、会话、账户流和令牌绑定租户；终态查询与清理遵循接受截止和查询截止。快照与历史按事件日志重建固定上界视图，会话快照默认取最近 100 条，三类分页均限制完整成功响应体大小。
-
-不透明令牌采用认证加密和随机 nonce，支持保留旧验证密钥。`Engine::new` 为每个内存实例生成随机密钥；跨实例或重启继续使用令牌，需要接入稳定密钥配置并保留尚有有效令牌的旧密钥。当前事件日志、关闭水位、认证撤销信息和终态记录都只在内存中。
-
-`iam-loop` 是测试驱动器，通过真实帧编解码调用内核，不是网关或客户端 SDK。接入侧应先使用 `FrameDecoder` 取得完整帧，再调用 `Engine::handle_frame`；解码失败或连接关闭时释放连接状态。收帧缓冲最多 1 MiB，应及时取出完整帧，不能无限累计网络读取结果。
-
-本轮已补齐发送期限及拒绝保存、租户隔离、同账户其他设备推送、关闭错误的实际连接失效、令牌加密与轮换验证、固定分页视图和预算，以及递归字段和响应校验。回归测试覆盖到期前后与清理后的查询一致性、恢复未完成、跨租户同名身份、分页期间新增数据和权限变化、非法线格式和错误路由。
-
-仍需接入并验收的内容：
-
-- TCP/TLS 监听与握手、认证前接入控制、单调时钟心跳和超时、写队列背压、并发与重传预算。现有内核是串行调用，过载开关是测试入口。
-- 消息、事件和幂等终态的原子持久提交，权威关闭证明，备份恢复和故障切换。内存里的 `committed` 只模拟该契约；手动推进关闭水位不能作为生产环境的关闭证明。
-- 真实认证服务、授权有效期、按用户管理的访问范围、撤销和密钥生命周期。当前种子账户、会话成员和会话级访问代次只是测试模型，历史保留下界也尚未接入真实保留策略。
-- 客户端持久发送队列、同设备同会话串行恢复、请求与响应上下文匹配、能力子集检查、快照暂存切换，以及视图和游标的原子保存。通用解码校验不能替代这些有状态校验；不同用途 ID 的 Rust 类型隔离也尚未完成。
-- 多语言编解码互通、真实网络断连与进程崩溃测试、存储故障注入及规模压测。当前测试不证明 P99 延迟、五个九可靠性或目标吞吐。
-
-这些事项保留协议原有要求，没有通过放宽设计来适配内存实现。本轮不引入网关运行时、数据库或产品权限框架。
+后续阶段再做：TCP+TLS 网关、持久化与故障恢复、真实鉴权、客户端落盘与恢复。本阶段不引入网关运行时、数据库或产品权限框架。
 
 ## 验证
-
-在仓库根目录执行：
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
-
-测试分别位于 `iam-protocol` 的报文样例、`iam-core` 的发送窗口与令牌测试，以及 `iam-loop` 的闭环、错误路由和分页测试中。

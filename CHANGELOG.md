@@ -29,6 +29,11 @@ a dated version section when cutting a release.
   token key-id/purpose checks, SYNC `max_bytes` paging, entrance `RATE_LIMITED`,
   and ERROR matrix / account / HISTORY loop coverage.
 
+### Changed
+
+- Shorten README implementation-scope notes; keep a brief in-memory kernel
+  summary and deferred next-stage list.
+
 ### Fixed
 
 - Validate nested wire occurrences, scalar ranges, required response fields and
