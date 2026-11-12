@@ -6,6 +6,9 @@ use iam_core::Engine;
 use iam_protocol::pb::{AuthRequest, Head};
 use iam_protocol::{generate_id128, DecodedBody, DecodedFrame, MsgType};
 
+#[path = "../tests/support/mod.rs"]
+mod support;
+
 #[test]
 fn configuration_rejects_nonlocal_and_unspecified_databases() {
     assert!(local_options("mysql://root@127.0.0.1:4000/iam_local").is_ok());
@@ -15,35 +18,9 @@ fn configuration_rejects_nonlocal_and_unspecified_databases() {
 }
 
 async fn empty_database() -> (String, TidbStore) {
-    assert_eq!(
-        std::env::var("IAM_TIDB_ALLOW_TEST_WRITES").as_deref(),
-        Ok("1"),
-        "set IAM_TIDB_ALLOW_TEST_WRITES=1 for an isolated local test database"
-    );
-    let url = std::env::var("IAM_TIDB_TEST_URL").expect("IAM_TIDB_TEST_URL is required");
-    let options = local_options(&url).expect("local test endpoint required");
-    assert!(
-        options.get_database().unwrap().starts_with("iam_test"),
-        "test database name must start with iam_test"
-    );
-    let parent = TidbStore::connect(&url)
-        .await
-        .expect("real TiDB required (tidb_version must succeed)");
-    // Every case gets a new catalog; never DROP/TRUNCATE or reuse someone else's rows.
-    let database = format!("iam_test_{}", hex::encode(generate_id128()));
-    sqlx::query(&format!("CREATE DATABASE `{database}`"))
-        .execute(&parent.pool)
-        .await
-        .unwrap();
-    let (base, query) = url.split_once('?').unwrap_or((&url, ""));
-    let prefix = base.rsplit_once('/').unwrap().0;
-    let isolated = if query.is_empty() {
-        format!("{prefix}/{database}")
-    } else {
-        format!("{prefix}/{database}?{query}")
-    };
-    let store = TidbStore::connect(&isolated).await.unwrap();
-    (isolated, store)
+    let url = support::isolated_database().await.to_string();
+    let store = TidbStore::connect(&url).await.unwrap();
+    (url, store)
 }
 
 async fn fixture() -> (String, TidbStore) {
@@ -114,7 +91,7 @@ async fn auth(service: &mut TidbTextService, token: &[u8], device: Id128) -> Id1
 }
 
 #[tokio::test]
-#[ignore = "requires real local TiDB; see README validation instructions"]
+#[ignore = "requires real local TiDB; see docs/storage.md"]
 async fn tidb_initialization_is_idempotent_and_schema_has_only_two_tables() {
     let (_, store) = fixture().await;
     let scope = Identity {

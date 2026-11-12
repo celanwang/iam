@@ -12,3 +12,7 @@ iam-protocol = { path = "../iam-protocol" }
 sqlx = { version = "=0.8.6", default-features = false, features = ["mysql", "runtime-tokio-rustls"] }
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "process"] }
+url = "2"
