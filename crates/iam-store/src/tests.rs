@@ -1,9 +1,6 @@
 use super::*;
 use std::time::Duration;
 
-#[path = "../tests/support/mod.rs"]
-mod support;
-
 #[test]
 fn configuration_requires_a_local_tcp_database() {
     assert!(local_options("mysql://root@127.0.0.1:4000/iam_local").is_ok());

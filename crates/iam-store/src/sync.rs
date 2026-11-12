@@ -68,11 +68,15 @@ impl TidbStore {
         request: &SyncRequest,
     ) -> ReadResult<sync_response::Value> {
         let now = self.now().await.map_err(read_error)?;
+        #[cfg(test)]
+        let start = std::time::Instant::now();
         let mut tx = self.begin_read().await.map_err(read_error)?;
         let page = self.sync_page(&mut tx, identity, request, now).await;
         tx.commit()
             .await
             .map_err(|error| read_error(error.into()))?;
+        #[cfg(test)]
+        crate::store::perf::record("sync_read_tx", start);
         page
     }
 

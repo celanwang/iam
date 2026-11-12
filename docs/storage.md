@@ -88,3 +88,5 @@ cargo test -p iam-store tidb_ -- --ignored --nocapture
 在本机 TiDB、TiKV 和 PD v8.5.7 上完成工作区编译、格式检查、Clippy 和回归测试。验证使用仓库内的 `Cargo.lock`，真实数据库用例在专用 `iam_test` 库下运行。
 
 单独运行 `tidb_reliability_mixed_load` 比较连续发送与集中重连。两组各测 200 次发送和 200 次结果查询，混合组同时由四个实例发起共 400 次认证和 800 次空同步。本机一轮测得 `SEND` P99 从 10.59 ms 升至 25.53 ms，`SEND_STATUS` 从 5.46 ms 升至 29.58 ms，混合组空同步 P99 为 31.74 ms。发送、查询与同步仍会竞争控制行，这组结果用于定位本机并发影响，生产容量和延迟目标需在部署环境另行测量。
+
+[TiDB 性能专项](./tidb-perf.md) 将纯发送、并发认证、空同步和集中重连拆开测量，记录了控制行争用和客户端补齐时间。
