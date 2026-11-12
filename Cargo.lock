@@ -502,9 +502,11 @@ dependencies = [
 name = "iam-store"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "hex",
  "iam-core",
  "iam-protocol",
+ "prost",
  "sqlx",
  "thiserror",
  "tokio",

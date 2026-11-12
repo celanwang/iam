@@ -161,6 +161,19 @@ impl TokenSigner {
     }
 
     pub fn verify_cursor(&self, bytes: &[u8], now_ms: i64) -> Result<SyncCursor, TokenError> {
+        let (token, expired) = self.verify_cursor_with_expiry(bytes, now_ms)?;
+        if expired {
+            return Err(TokenError::Expired);
+        }
+        Ok(token)
+    }
+
+    /// Authenticates the token while retaining its scope even after expiration.
+    pub fn verify_cursor_with_expiry(
+        &self,
+        bytes: &[u8],
+        now_ms: i64,
+    ) -> Result<(SyncCursor, bool), TokenError> {
         let payload = self.verify_prefix(bytes, b"cur1")?;
         if payload.len() != 4 + 4 + 1 + 8 + 8 + 16 + 8 + 16 + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
@@ -183,24 +196,24 @@ impl TokenSigner {
         if issued_at_ms < 0 || issued_at_ms > now_ms {
             return Err(TokenError::Invalid);
         }
-        if now_ms
+        let expired = now_ms
             >= issued_at_ms
                 .checked_add(CURSOR_TTL_MS)
-                .ok_or(TokenError::Invalid)?
-        {
-            return Err(TokenError::Expired);
-        }
-        Ok(SyncCursor {
-            tenant_id,
-            user_id,
-            device_id,
-            conversation_id,
-            epoch,
-            access_version,
-            covered_through,
-            issued_at_ms,
-            is_account,
-        })
+                .ok_or(TokenError::Invalid)?;
+        Ok((
+            SyncCursor {
+                tenant_id,
+                user_id,
+                device_id,
+                conversation_id,
+                epoch,
+                access_version,
+                covered_through,
+                issued_at_ms,
+                is_account,
+            },
+            expired,
+        ))
     }
 
     pub fn sign_page(&self, p: &SyncPageToken) -> Vec<u8> {
@@ -216,6 +229,19 @@ impl TokenSigner {
     }
 
     pub fn verify_page(&self, bytes: &[u8], now_ms: i64) -> Result<SyncPageToken, TokenError> {
+        let (token, expired) = self.verify_page_with_expiry(bytes, now_ms)?;
+        if expired {
+            return Err(TokenError::Expired);
+        }
+        Ok(token)
+    }
+
+    /// Authenticates the token while retaining its scope even after expiration.
+    pub fn verify_page_with_expiry(
+        &self,
+        bytes: &[u8],
+        now_ms: i64,
+    ) -> Result<(SyncPageToken, bool), TokenError> {
         let payload = self.verify_prefix(bytes, b"pg01")?;
         if payload.len() < 12 {
             return Err(TokenError::Invalid);
@@ -224,7 +250,8 @@ impl TokenSigner {
         if payload.len() != 12 + cur_len + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
         }
-        let cursor = self.verify_cursor(&payload[12..12 + cur_len], now_ms)?;
+        let (cursor, cursor_expired) =
+            self.verify_cursor_with_expiry(&payload[12..12 + cur_len], now_ms)?;
         let mut o = 12 + cur_len;
         let upper_bound = read_u64(&payload, &mut o);
         let scanned_through = read_u64(&payload, &mut o);
@@ -232,19 +259,20 @@ impl TokenSigner {
         if round_started_ms < 0 || round_started_ms > now_ms {
             return Err(TokenError::Invalid);
         }
-        if now_ms
-            >= round_started_ms
-                .checked_add(PAGE_TTL_MS)
-                .ok_or(TokenError::Invalid)?
-        {
-            return Err(TokenError::Expired);
-        }
-        Ok(SyncPageToken {
-            cursor,
-            upper_bound,
-            scanned_through,
-            round_started_ms,
-        })
+        let expired = cursor_expired
+            || now_ms
+                >= round_started_ms
+                    .checked_add(PAGE_TTL_MS)
+                    .ok_or(TokenError::Invalid)?;
+        Ok((
+            SyncPageToken {
+                cursor,
+                upper_bound,
+                scanned_through,
+                round_started_ms,
+            },
+            expired,
+        ))
     }
 
     pub fn sign_resume(&self, r: &ResumeToken) -> Vec<u8> {
@@ -312,6 +340,19 @@ impl TokenSigner {
     }
 
     pub fn verify_snapshot(&self, bytes: &[u8], now_ms: i64) -> Result<SnapshotToken, TokenError> {
+        let (token, expired) = self.verify_snapshot_with_expiry(bytes, now_ms)?;
+        if expired {
+            return Err(TokenError::Expired);
+        }
+        Ok(token)
+    }
+
+    /// Authenticates the token while retaining its scope even after expiration.
+    pub fn verify_snapshot_with_expiry(
+        &self,
+        bytes: &[u8],
+        now_ms: i64,
+    ) -> Result<(SnapshotToken, bool), TokenError> {
         let payload = self.verify_prefix(bytes, b"sn01")?;
         if payload.len() != 4 + 4 + 1 + 8 + 8 + 16 + 8 + 16 + 16 + 8 + 8 + 8 + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
@@ -340,28 +381,28 @@ impl TokenSigner {
         if created_at_ms < 0 || created_at_ms > now_ms {
             return Err(TokenError::Invalid);
         }
-        if now_ms
+        let expired = now_ms
             >= created_at_ms
                 .checked_add(SNAPSHOT_TTL_MS)
-                .ok_or(TokenError::Invalid)?
-        {
-            return Err(TokenError::Expired);
-        }
-        Ok(SnapshotToken {
-            tenant_id,
-            user_id,
-            device_id,
-            is_account,
-            conversation_id,
-            snapshot_id,
-            epoch,
-            access_version,
-            upper_bound,
-            from_create_seq,
-            through_create_seq,
-            scanned_items,
-            created_at_ms,
-        })
+                .ok_or(TokenError::Invalid)?;
+        Ok((
+            SnapshotToken {
+                tenant_id,
+                user_id,
+                device_id,
+                is_account,
+                conversation_id,
+                snapshot_id,
+                epoch,
+                access_version,
+                upper_bound,
+                from_create_seq,
+                through_create_seq,
+                scanned_items,
+                created_at_ms,
+            },
+            expired,
+        ))
     }
 
     pub fn sign_history(&self, h: &HistoryToken) -> Vec<u8> {

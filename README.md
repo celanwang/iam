@@ -13,5 +13,5 @@ A general IM engine built for 10B scale.
 ## Stack
 
 - Language: Rust
-- Storage component: TiDB SQL with TiKV storage and PD coordination (local native text path)
+- Storage component: TiDB SQL with TiKV storage and PD coordination
 - Latency target: same-region server core path P99 &lt; 10 ms

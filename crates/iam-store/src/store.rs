@@ -7,7 +7,8 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow};
 use sqlx::{ConnectOptions, MySql, MySqlPool, Row, Transaction};
 use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
-const CLOCK_SQL: &str = "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)";
+pub(crate) const CLOCK_SQL: &str =
+    "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)";
 const MESSAGE_SELECT: &str = "SELECT m.conversation_id, m.message_id, m.user_id, \
     m.`sequence`, m.`text`, m.accepted_at, c.history_id \
     FROM messages m JOIN conversations c \
@@ -429,7 +430,7 @@ impl TidbStore {
     }
 }
 
-async fn finish<T>(transaction: Transaction<'_, MySql>, result: Result<T>) -> Result<T> {
+pub(crate) async fn finish<T>(transaction: Transaction<'_, MySql>, result: Result<T>) -> Result<T> {
     match result {
         Ok(value) => {
             transaction.commit().await.map_err(Error::CommitUnknown)?;
@@ -442,12 +443,12 @@ async fn finish<T>(transaction: Transaction<'_, MySql>, result: Result<T>) -> Re
     }
 }
 
-fn id_column(row: &MySqlRow, name: &str) -> Result<Id128> {
+pub(crate) fn id_column(row: &MySqlRow, name: &str) -> Result<Id128> {
     let bytes: Vec<u8> = row.try_get(name)?;
     validate_id128(&bytes).map_err(|_| Error::Integrity("invalid UUIDv7 in storage"))
 }
 
-fn conversation_info(row: &MySqlRow, created: bool) -> Result<ConversationInfo> {
+pub(crate) fn conversation_info(row: &MySqlRow, created: bool) -> Result<ConversationInfo> {
     let next_sequence = row.try_get("next_sequence")?;
     if next_sequence == 0 {
         return Err(Error::Integrity("zero next_sequence"));
@@ -459,7 +460,7 @@ fn conversation_info(row: &MySqlRow, created: bool) -> Result<ConversationInfo> 
     })
 }
 
-fn decode_message(row: &MySqlRow) -> Result<StoredText> {
+pub(crate) fn decode_message(row: &MySqlRow) -> Result<StoredText> {
     let sequence: u64 = row.try_get("sequence")?;
     let accepted_at: i64 = row.try_get("accepted_at")?;
     let conversation_id: u64 = row.try_get("conversation_id")?;

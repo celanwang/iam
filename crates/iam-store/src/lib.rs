@@ -1,9 +1,12 @@
-//! A native text-storage application path, not a durable implementation of wire SEND/SYNC.
-//! Only the service can issue writes; its identity comes from the existing Engine's sessions.
+//! TiDB storage for the wire protocol and the local text console.
 
+mod protocol;
+mod protocol_store;
+mod protocol_sync;
 mod service;
 mod store;
 
+pub use protocol::{ProtocolOpenMode, TidbProtocolService};
 pub use service::{OpenMode, TidbTextService};
 
 use iam_core::MemoryStore;

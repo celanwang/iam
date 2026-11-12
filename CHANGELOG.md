@@ -14,14 +14,15 @@ a dated version section when cutting a release.
 
 ### Added
 
+- TiDB-backed wire SEND, SEND_STATUS, SYNC, and SNAPSHOT for seeded direct
+  text conversations, with durable send outcomes, close watermarks, and
+  recovery tests for lost commit responses and discarded pushes.
 - Two-table TiDB text storage with tenant-scoped atomic writes, successful-send
   deduplication, receipt lookup, and ordered pages; authenticated native service
-  with read-only restart and unknown-outcome acceptance guards. Build, regression,
-  and real-TiDB validation remain pending in the restricted environment;
-  dependency downloads and Cargo.lock regeneration are blocked.
+  with read-only restart and unknown-outcome acceptance guards.
 - Opt-in real-TiDB tests for initialization, rollback, concurrent ordering and
   retries, content conflicts, tenant isolation, pagination, schema checks,
-  cancellation, and restart limits. These tests have not run on TiDB here.
+  cancellation, and restart limits.
 - Local text console using the authenticated service; read-only startup validates
   existing tables and uniqueness constraints without creating or repairing data.
 - Minimal multi-tenant, two-table storage design for conversations and successful
@@ -43,9 +44,7 @@ a dated version section when cutting a release.
 
 ### Changed
 
-- Keep TiDB SQL over TiKV with PD coordination; scope both core tables and
-  successful-send deduplication to authenticated tenants, deferring durable
-  rejection replay and full protocol recovery.
+- Use TiDB SQL over TiKV with PD coordination and tenant-scoped storage keys.
 - Shorten README implementation-scope notes; keep a brief in-memory kernel
   summary and deferred next-stage list.
 
