@@ -14,6 +14,8 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Message reliability design for durable sends, server forwarding, and
+  receiver recovery.
 - TiDB-backed wire SEND, SEND_STATUS, SYNC, and SNAPSHOT for seeded direct
   text conversations, with durable send outcomes, close watermarks, and
   recovery tests for lost commit responses and discarded pushes.
