@@ -659,7 +659,7 @@ async fn reject_legacy_names(pool: &MySqlPool) -> Result<()> {
     .await?;
     if old_table.is_some() {
         return Err(Error::Configuration(
-            "rename the existing authoritative tables before opening",
+            "database uses legacy protocol table names",
         ));
     }
     Ok(())

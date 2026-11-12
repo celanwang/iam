@@ -39,7 +39,7 @@ a dated version section when cutting a release.
 ### Changed
 
 - Consolidate TiDB storage into five tables, with `store_control` for recovery
-  state and an in-place rename migration for existing authoritative databases.
+  state.
 - Use TiDB SQL over TiKV with PD coordination and tenant-scoped storage keys.
 - Shorten README implementation-scope notes; keep a brief in-memory kernel
   summary and deferred next-stage list.
