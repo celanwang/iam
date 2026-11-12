@@ -30,14 +30,6 @@ pub enum Error {
     IdentityMismatch,
     #[error("server rejected the request: {0:?}")]
     Server(ErrorInfo),
-    #[error(
-        "stream {target} requires recovery: {reason:?} (data loss possible: {data_loss_possible})"
-    )]
-    ResetRequired {
-        target: u64,
-        reason: ResetReason,
-        data_loss_possible: bool,
-    },
     #[error("local file operation failed")]
     File(#[from] io::Error),
     #[error("transport operation failed")]
@@ -59,15 +51,25 @@ pub struct Identity {
     pub device_id: Id128,
 }
 
+/// The last server-requested reset for a local stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recovery {
+    pub reason: ResetReason,
+    pub data_loss_possible: bool,
+    pub pending: bool,
+}
+
 /// Exchanges complete wire frames for a single logical connection. Implementations route pushes
 /// separately from request responses. A timed-out exchange is followed by a fresh connection.
 pub trait Transport: Send {
     /// Open a new connection, discarding the old connection and its buffered frames.
     fn reconnect(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 
+    /// Return the matching response or a connection-level ERROR received before the response.
     fn exchange(&mut self, request: Vec<u8>) -> impl Future<Output = io::Result<Vec<u8>>> + Send;
 
-    /// Cancel-safe wait for an unsolicited PUSH or a disconnect. Pull-only transports may omit it.
+    /// Cancel-safe wait for a PUSH, a connection-level ERROR, or a disconnect.
+    /// Deliver a connection-level ERROR before reporting the subsequent disconnect.
     fn receive(&mut self) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
         std::future::pending()
     }
@@ -151,6 +153,11 @@ impl Client {
 
     pub async fn messages(&mut self, conversation_id: u64) -> Result<Vec<MessageView>> {
         self.storage.messages(conversation_id).await
+    }
+
+    /// Reads persisted recovery status. Target 0 represents the account stream.
+    pub async fn recovery(&mut self, target: u64) -> Result<Option<Recovery>> {
+        self.storage.recovery(target).await
     }
 
     /// Runs while the application is in the foreground. Closing the submission channel stops it.
@@ -248,9 +255,9 @@ impl Client {
                     let _ = submission.saved.send(saved);
                     Ok(())
                 }
-                push = wire.transport.receive(), if online => {
-                    match push {
-                        Ok(bytes) => self.apply_push(&bytes).await,
+                inbound = wire.transport.receive(), if online => {
+                    match inbound {
+                        Ok(bytes) => self.handle_inbound(&bytes).await,
                         Err(error) => Err(Error::Transport(error)),
                     }
                 }
@@ -369,7 +376,7 @@ fn transport_failed(error: &Error) -> bool {
 fn disconnected(error: &Error) -> bool {
     transport_failed(error)
         || matches!(error, Error::Server(info)
-            if matches!(info.code(), ErrorCode::Unauthenticated | ErrorCode::SessionReplaced))
+            if info.code() == ErrorCode::Unauthenticated)
 }
 
 fn retryable(error: &Error) -> bool {

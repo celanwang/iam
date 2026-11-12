@@ -1,5 +1,6 @@
 use crate::storage::Progress;
-use crate::{decode, Client, Error, Result, Transport, Wire};
+use crate::wire::{is_connection_error, server_error};
+use crate::{decode, retryable, Client, Error, Recovery, Result, Transport, Wire};
 use iam_protocol::pb::{
     change, snapshot_item, snapshot_response, sync_response, sync_target, Change, Empty, ErrorCode,
     ResetReason, SnapshotRequest, StreamContext, SyncRequest, SyncTarget,
@@ -9,15 +10,19 @@ use iam_protocol::{DecodedBody, MsgType};
 impl Client {
     pub(crate) async fn synchronize(&mut self, wire: &mut Wire<'_, impl Transport>) -> Result<()> {
         self.sync_target(wire, 0).await?;
+        let mut retry = None;
         for target in self.storage.conversations().await? {
             match self.sync_target(wire, target).await {
                 Err(Error::Server(error)) if error.code() == ErrorCode::PermissionDenied => {
                     self.storage.hide(target).await?;
                 }
+                Err(error) if retryable(&error) => {
+                    retry.get_or_insert(error);
+                }
                 result => result?,
             }
         }
-        Ok(())
+        retry.map_or(Ok(()), Err)
     }
 
     async fn sync_target(
@@ -82,11 +87,22 @@ impl Client {
                 sync_response::Value::Error(error)
                     if page_token.is_some()
                         && !resumed
-                        && error.code() == ErrorCode::PageTokenExpired =>
+                        && matches!(
+                            error.code(),
+                            ErrorCode::PageTokenExpired | ErrorCode::InvalidToken
+                        ) =>
                 {
                     // The last applied page already has a durable cursor. Start a fresh round there.
                     resumed = true;
                     page_token = None;
+                }
+                sync_response::Value::Error(error)
+                    if saved.is_some()
+                        && page_token.is_none()
+                        && error.code() == ErrorCode::InvalidCursor =>
+                {
+                    self.storage.reset(target, None).await?;
+                    saved = None;
                 }
                 sync_response::Value::Error(error) => return Err(Error::Server(error)),
                 sync_response::Value::Reset(reset)
@@ -97,17 +113,31 @@ impl Client {
                         .await;
                 }
                 sync_response::Value::Reset(reset) => {
-                    if matches!(
-                        reset.reason(),
-                        ResetReason::AccessChanged | ResetReason::HistoryReset
+                    let reason = reset.reason();
+                    if !matches!(
+                        reason,
+                        ResetReason::AccessChanged
+                            | ResetReason::HistoryReset
+                            | ResetReason::CursorExpired
                     ) {
-                        self.storage.hide(target).await?;
+                        return Err(Error::Invalid("unexpected sync reset"));
                     }
-                    return Err(Error::ResetRequired {
-                        target,
-                        reason: reset.reason(),
-                        data_loss_possible: reset.data_loss_possible.unwrap_or_default(),
-                    });
+                    self.storage
+                        .reset(
+                            target,
+                            Some(Recovery {
+                                reason,
+                                data_loss_possible: reset.data_loss_possible.unwrap_or_default(),
+                                pending: true,
+                            }),
+                        )
+                        .await?;
+                    if reason == ResetReason::CursorExpired {
+                        return Ok(());
+                    }
+                    return self
+                        .snapshot(wire, target, reset.snapshot_token.as_deref())
+                        .await;
                 }
             }
         }
@@ -176,9 +206,13 @@ impl Client {
         }
     }
 
-    pub(crate) async fn apply_push(&mut self, bytes: &[u8]) -> Result<()> {
-        let DecodedBody::Push(push) = decode(bytes)?.body else {
-            return Err(Error::Invalid("expected PUSH"));
+    pub(crate) async fn handle_inbound(&mut self, bytes: &[u8]) -> Result<()> {
+        let frame = decode(bytes)?;
+        let connection_error = is_connection_error(&frame);
+        let push = match frame.body {
+            DecodedBody::Push(push) => push,
+            DecodedBody::Error(error) if connection_error => return Err(server_error(error)),
+            _ => return Err(Error::Invalid("expected PUSH or connection error")),
         };
         let context = push.context.ok_or(Error::Invalid("missing push context"))?;
         let Some(sync_target::Value::Conversation(target)) = context

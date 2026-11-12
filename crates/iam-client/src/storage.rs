@@ -1,7 +1,7 @@
-use crate::{Error, Identity, Result};
+use crate::{Error, Identity, Recovery, Result};
 use iam_protocol::pb::{
-    change, Change, ConversationState, MessageKey, MessageView, SendOutcome, SendRequest,
-    StreamContext,
+    change, Change, ConversationState, MessageKey, MessageView, ResetReason, SendOutcome,
+    SendRequest, StreamContext,
 };
 use iam_protocol::{validate_id128, Id128};
 use prost::Message;
@@ -26,6 +26,10 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS conversations (id BLOB PRIMARY KEY, state BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS streams (
         target BLOB PRIMARY KEY, context BLOB NOT NULL, covered BLOB NOT NULL, cursor BLOB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS recoveries (
+        target BLOB PRIMARY KEY, reason INTEGER NOT NULL,
+        data_loss_possible INTEGER NOT NULL, pending INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS messages (
         conversation BLOB NOT NULL, id BLOB NOT NULL, sequence BLOB NOT NULL,
@@ -207,6 +211,58 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn recovery(&mut self, target: u64) -> Result<Option<Recovery>> {
+        let row: Option<(i32, bool, bool)> = sqlx::query_as(
+            "SELECT reason, data_loss_possible, pending FROM recoveries WHERE target = ?",
+        )
+        .bind(bytes(target).to_vec())
+        .fetch_optional(&mut self.db)
+        .await?;
+        row.map(|(reason, data_loss_possible, pending)| {
+            Ok(Recovery {
+                reason: ResetReason::try_from(reason)
+                    .map_err(|_| Error::Invalid("local reset reason"))?,
+                data_loss_possible,
+                pending,
+            })
+        })
+        .transpose()
+    }
+
+    /// Discard a view and its cursor together, keeping known conversation targets discoverable.
+    /// A cursor awaiting long-offline recovery stays intact for the future history pass.
+    pub async fn reset(&mut self, target: u64, recovery: Option<Recovery>) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        if let Some(recovery) = recovery {
+            sqlx::query(
+                "INSERT INTO recoveries VALUES (?, ?, ?, ?)
+                 ON CONFLICT (target) DO UPDATE SET reason = excluded.reason, pending = excluded.pending,
+                 data_loss_possible = recoveries.data_loss_possible OR excluded.data_loss_possible",
+            )
+            .bind(bytes(target).to_vec())
+            .bind(recovery.reason as i32)
+            .bind(recovery.data_loss_possible)
+            .bind(recovery.pending)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if !recovery.is_some_and(|recovery| recovery.reason == ResetReason::CursorExpired) {
+            if target == 0 {
+                for statement in [
+                    "DELETE FROM conversations",
+                    "DELETE FROM messages",
+                    "DELETE FROM streams",
+                ] {
+                    sqlx::query(statement).execute(&mut *tx).await?;
+                }
+            } else {
+                clear_view(&mut tx, target).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn stage_page(
         tx: &mut Transaction<'_, Sqlite>,
         target: u64,
@@ -239,26 +295,17 @@ impl Storage {
             .bind(progress.cursor.as_slice())
             .execute(&mut **tx)
             .await?;
+            sqlx::query("UPDATE recoveries SET pending = 0 WHERE target = ? AND pending = 1")
+                .bind(bytes(target).to_vec())
+                .execute(&mut **tx)
+                .await?;
         }
         Ok(())
     }
 
     pub async fn hide(&mut self, target: u64) -> Result<()> {
         let mut tx = self.db.begin().await?;
-        if target == 0 {
-            sqlx::query("DELETE FROM conversations")
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM messages")
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM streams WHERE target <> ?")
-                .bind(bytes(0).to_vec())
-                .execute(&mut *tx)
-                .await?;
-        } else {
-            clear_conversation(&mut tx, target).await?;
-        }
+        clear_conversation(&mut tx, target).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -296,8 +343,15 @@ async fn save_conversation(
 }
 
 async fn clear_conversation(tx: &mut Transaction<'_, Sqlite>, id: u64) -> Result<()> {
+    sqlx::query("DELETE FROM conversations WHERE id = ?")
+        .bind(bytes(id).to_vec())
+        .execute(&mut **tx)
+        .await?;
+    clear_view(tx, id).await
+}
+
+async fn clear_view(tx: &mut Transaction<'_, Sqlite>, id: u64) -> Result<()> {
     for statement in [
-        "DELETE FROM conversations WHERE id = ?",
         "DELETE FROM messages WHERE conversation = ?",
         "DELETE FROM streams WHERE target = ?",
     ] {

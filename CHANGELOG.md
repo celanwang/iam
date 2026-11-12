@@ -14,6 +14,8 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Real TiDB acceptance tests for reordered and duplicate pushes, expired
+  sync page tokens, and a service crash after commit but before push.
 - Durable text client with a local send queue, automatic sync on reconnect,
   and periodic recovery from lost pushes, verified against TiDB.
 - Message reliability design for durable sends, server forwarding, and

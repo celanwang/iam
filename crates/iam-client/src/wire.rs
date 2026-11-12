@@ -1,5 +1,5 @@
 use crate::{Error, Identity, Options, Result, Transport};
-use iam_protocol::pb::{auth_response, AuthRequest, Head, PageLimit};
+use iam_protocol::pb::{auth_response, AuthRequest, Head, PageLimit, ProtocolError};
 use iam_protocol::{decode_frame, encode_frame, DecodedBody, DecodedFrame, FrameDecoder, MsgType};
 use prost::Message;
 use std::time::Duration;
@@ -72,18 +72,25 @@ impl<'a, T: Transport> Wire<'a, T> {
             .map_err(|_| Error::Timeout)?
             .map_err(Error::Transport)?;
         let response = decode(&bytes)?;
-        if response.head != head {
+        if response.head != head && !is_connection_error(&response) {
             return Err(Error::Invalid("response request ID"));
         }
         match response.body {
-            DecodedBody::Error(error) => Err(Error::Server(
-                error
-                    .error
-                    .ok_or(Error::Invalid("missing protocol error"))?,
-            )),
+            DecodedBody::Error(error) => Err(server_error(error)),
             body => Ok(body),
         }
     }
+}
+
+pub(crate) fn is_connection_error(frame: &DecodedFrame) -> bool {
+    frame.head.req_id.unwrap_or(0) == 0
+        && matches!(&frame.body, DecodedBody::Error(error) if error.close_connection == Some(true))
+}
+
+pub(crate) fn server_error(error: ProtocolError) -> Error {
+    error
+        .error
+        .map_or(Error::Invalid("missing protocol error"), Error::Server)
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedFrame> {
