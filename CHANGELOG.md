@@ -33,8 +33,8 @@ a dated version section when cutting a release.
 
 ### Changed
 
-- Align `docs/storage.md` with `protocol.md` style: normative prose, logical
-  records, commit/window/read rules, and acceptance scenarios.
+- Define the storage transaction order, closure watermark units, send-result
+  precedence, and evidence required for fixed reads and recovery.
 - Shorten README implementation-scope notes; keep a brief in-memory kernel
   summary and deferred next-stage list.
 
