@@ -4,6 +4,7 @@ members = [
     "crates/iam-protocol",
     "crates/iam-core",
     "crates/iam-loop",
+    "crates/iam-store",
 ]
 
 [workspace.package]

@@ -35,6 +35,13 @@ pub struct EngineOutput {
     pub pushes: Vec<(Id128, Vec<u8>)>,
 }
 
+pub type EngineReply = (Option<Id128>, EngineOutput);
+
+pub enum StorageRequest {
+    Ready(Id128),
+    Respond(EngineReply),
+}
+
 struct SyncRound {
     after: u64,
     upper: u64,
@@ -202,58 +209,8 @@ impl Engine {
         connection_id: Option<Id128>,
         frame: &DecodedFrame,
     ) -> Result<(Option<Id128>, EngineOutput), CoreError> {
-        if !frame.msg_type.is_client_to_server()
-            || iam_protocol::validate_head(frame.msg_type, &frame.head).is_err()
-        {
-            return self.wire_error(
-                frame,
-                connection_id,
-                ErrorCode::InvalidArgument,
-                RetryAction::None,
-                true,
-                None,
-            );
-        }
-        if !matches!(frame.body, DecodedBody::Auth(_) | DecodedBody::Reconnect(_)) {
-            let cid = match self.require_auth(connection_id, frame)? {
-                AuthGate::Ok(cid) => cid,
-                AuthGate::Respond(out) => return Ok(out),
-            };
-            if frame.msg_type != MsgType::PushAck
-                && frame.head.req_id.unwrap_or(0) <= self.store.connections[&cid].last_req_id
-            {
-                return self.wire_error(
-                    frame,
-                    Some(cid),
-                    ErrorCode::InvalidArgument,
-                    RetryAction::None,
-                    true,
-                    None,
-                );
-            }
-        }
-        // Entrance overload applies before command processors (except AUTH/RECONNECT bootstrap).
-        if self.store.entrance_overloaded
-            && !matches!(
-                frame.body,
-                DecodedBody::Auth(_) | DecodedBody::Reconnect(_) | DecodedBody::Error(_)
-            )
-        {
-            if frame.msg_type != MsgType::PushAck {
-                if let Some(cid) = connection_id {
-                    if let Err(out) = self.check_req_id(cid, frame) {
-                        return Ok(out);
-                    }
-                }
-            }
-            return self.wire_error(
-                frame,
-                connection_id,
-                ErrorCode::RateLimited,
-                RetryAction::RetrySameRequest,
-                false,
-                Some("entrance overloaded"),
-            );
+        if let Some(reply) = self.preflight(connection_id, frame)? {
+            return Ok(reply);
         }
         match &frame.body {
             DecodedBody::Auth(req) => self.handle_auth(connection_id, req, frame),
@@ -282,6 +239,93 @@ impl Engine {
                 None,
             ),
         }
+    }
+
+    /// Validates the connection and consumes the request ID before an external
+    /// storage handler processes an already decoded command.
+    pub fn prepare_storage_request(
+        &mut self,
+        connection_id: Option<Id128>,
+        frame: &DecodedFrame,
+    ) -> Result<StorageRequest, CoreError> {
+        if let Some(reply) = self.preflight(connection_id, frame)? {
+            return Ok(StorageRequest::Respond(reply));
+        }
+        let cid = match self.require_auth(connection_id, frame)? {
+            AuthGate::Ok(cid) => cid,
+            AuthGate::Respond(reply) => return Ok(StorageRequest::Respond(reply)),
+        };
+        Ok(match self.check_req_id(cid, frame) {
+            Ok(()) => StorageRequest::Ready(cid),
+            Err(reply) => StorageRequest::Respond(reply),
+        })
+    }
+
+    fn preflight(
+        &mut self,
+        connection_id: Option<Id128>,
+        frame: &DecodedFrame,
+    ) -> Result<Option<EngineReply>, CoreError> {
+        if !frame.msg_type.is_client_to_server()
+            || iam_protocol::validate_head(frame.msg_type, &frame.head).is_err()
+        {
+            return self
+                .wire_error(
+                    frame,
+                    connection_id,
+                    ErrorCode::InvalidArgument,
+                    RetryAction::None,
+                    true,
+                    None,
+                )
+                .map(Some);
+        }
+        if !matches!(frame.body, DecodedBody::Auth(_) | DecodedBody::Reconnect(_)) {
+            let cid = match self.require_auth(connection_id, frame)? {
+                AuthGate::Ok(cid) => cid,
+                AuthGate::Respond(out) => return Ok(Some(out)),
+            };
+            if frame.msg_type != MsgType::PushAck
+                && frame.head.req_id.unwrap_or(0) <= self.store.connections[&cid].last_req_id
+            {
+                return self
+                    .wire_error(
+                        frame,
+                        Some(cid),
+                        ErrorCode::InvalidArgument,
+                        RetryAction::None,
+                        true,
+                        None,
+                    )
+                    .map(Some);
+            }
+        }
+        // Entrance overload applies before command processors (except AUTH/RECONNECT bootstrap).
+        if self.store.entrance_overloaded
+            && !matches!(
+                frame.body,
+                DecodedBody::Auth(_) | DecodedBody::Reconnect(_) | DecodedBody::Error(_)
+            )
+        {
+            if frame.msg_type != MsgType::PushAck {
+                if let Some(cid) = connection_id {
+                    if let Err(out) = self.check_req_id(cid, frame) {
+                        return Ok(Some(out));
+                    }
+                }
+            }
+            return self
+                .wire_error(
+                    frame,
+                    connection_id,
+                    ErrorCode::RateLimited,
+                    RetryAction::RetrySameRequest,
+                    false,
+                    Some("entrance overloaded"),
+                )
+                .map(Some);
+        }
+        Ok(None)
     }
 
     fn wire_error(
@@ -1021,33 +1065,40 @@ impl Engine {
                 .get(&(conn.tenant_id, conversation_id))
                 .unwrap(),
         );
-        for uid in members {
-            let targets: Vec<Id128> = self
-                .store
-                .connections
-                .values()
-                .filter(|c| {
-                    c.tenant_id == conn.tenant_id && c.user_id == uid && c.connection_id != cid
-                })
-                .map(|c| c.connection_id)
-                .collect();
-            for peer_cid in targets {
-                let push_id = {
-                    let peer = self.store.connections.get_mut(&peer_cid).unwrap();
-                    let id = peer.next_push_id;
-                    peer.next_push_id += 1;
-                    id
-                };
-                let push = Push {
-                    push_id: Some(push_id),
-                    context: Some(ctx.clone()),
-                    changes: vec![change.clone()],
-                };
-                let bytes = encode_frame(MsgType::Push, &Head { req_id: None }, &push)?;
-                output.pushes.push((peer_cid, bytes));
-            }
-        }
+        self.push_change(&mut output, cid, conn.tenant_id, &members, &ctx, &change)?;
         Ok((cid_out, output))
+    }
+
+    /// Queues a committed change for this instance's authenticated connections.
+    pub fn push_change(
+        &mut self,
+        output: &mut EngineOutput,
+        sender: Id128,
+        tenant_id: u64,
+        members: &[u64],
+        context: &iam_protocol::pb::StreamContext,
+        change: &Change,
+    ) -> Result<(), CoreError> {
+        for peer in self.store.connections.values_mut().filter(|peer| {
+            peer.tenant_id == tenant_id
+                && peer.connection_id != sender
+                && members.contains(&peer.user_id)
+                && !self.store.revoked_auth_epochs.contains(&peer.auth_epoch)
+        }) {
+            let push_id = peer.next_push_id;
+            let Some(next) = push_id.checked_add(1) else {
+                continue;
+            };
+            peer.next_push_id = next;
+            let push = Push {
+                push_id: Some(push_id),
+                context: Some(context.clone()),
+                changes: vec![change.clone()],
+            };
+            let bytes = encode_frame(MsgType::Push, &Head { req_id: None }, &push)?;
+            output.pushes.push((peer.connection_id, bytes));
+        }
+        Ok(())
     }
 
     fn replay_idem(
@@ -1278,8 +1329,7 @@ impl Engine {
         }
     }
 
-    fn require_page_limit(
-        &self,
+    pub fn require_page_limit(
         limit: &Option<PageLimit>,
     ) -> Result<(usize, usize), (ErrorCode, RetryAction)> {
         let Some(limit) = limit.as_ref() else {
@@ -1319,7 +1369,7 @@ impl Engine {
         if req.cursor.is_some() && req.page_token.is_some() {
             return self.sync_err(cid, frame, ErrorCode::InvalidArgument, RetryAction::None);
         }
-        let (max_items, max_bytes) = match self.require_page_limit(&req.limit) {
+        let (max_items, max_bytes) = match Self::require_page_limit(&req.limit) {
             Ok(v) => v,
             Err((code, action)) => return self.sync_err(cid, frame, code, action),
         };
@@ -1891,7 +1941,7 @@ impl Engine {
             .get(&cid)
             .cloned()
             .ok_or(CoreError::Msg("no conn"))?;
-        if let Err((code, action)) = self.require_page_limit(&req.limit) {
+        if let Err((code, action)) = Self::require_page_limit(&req.limit) {
             return self.snapshot_err(cid, frame, code, action);
         }
         let max_items = req.limit.as_ref().unwrap().max_items.unwrap() as usize;
@@ -2116,7 +2166,7 @@ impl Engine {
             .get(&cid)
             .cloned()
             .ok_or(CoreError::Msg("no conn"))?;
-        if let Err((code, action)) = self.require_page_limit(&req.limit) {
+        if let Err((code, action)) = Self::require_page_limit(&req.limit) {
             return self.history_err(cid, frame, code, action);
         }
         let max_items = req.limit.as_ref().unwrap().max_items.unwrap() as usize;

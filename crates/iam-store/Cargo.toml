@@ -1,0 +1,20 @@
+[package]
+name = "iam-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TiDB storage for the IAM protocol and local console"
+
+[dependencies]
+getrandom = "0.4"
+hex = { workspace = true }
+iam-core = { path = "../iam-core" }
+iam-protocol = { path = "../iam-protocol" }
+prost = { workspace = true }
+sqlx = { version = "=0.8.6", default-features = false, features = ["mysql", "runtime-tokio-rustls"] }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "process"] }
+url = "2"

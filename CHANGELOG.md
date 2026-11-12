@@ -14,8 +14,13 @@ a dated version section when cutting a release.
 
 ### Added
 
-- Minimal multi-tenant, two-table storage design for conversations and successful
-  text messages (`docs/storage.md`).
+- TiDB-backed wire SEND, SEND_STATUS, SYNC, and SNAPSHOT for seeded direct
+  text conversations, with durable send outcomes, close watermarks, and
+  recovery tests for lost commit responses and discarded pushes.
+- Local text console using the same authenticated TiDB service as the wire
+  protocol.
+- Opt-in real-TiDB tests for initialization, rollback, commit faults, concurrent
+  retries, tenant isolation, pagination, schema checks, and restarts.
 - Project design direction for a Rust-based general IM engine (`docs/design.md`).
 - Basic message protocol design with typed structures, command contracts,
   state transitions, recovery flows, and acceptance scenarios (`docs/protocol.md`).
@@ -33,9 +38,9 @@ a dated version section when cutting a release.
 
 ### Changed
 
-- Keep TiDB SQL over TiKV with PD coordination; scope both core tables and
-  successful-send deduplication to authenticated tenants, deferring durable
-  rejection replay and full protocol recovery.
+- Consolidate TiDB storage into five tables, with `store_control` for recovery
+  state.
+- Use TiDB SQL over TiKV with PD coordination and tenant-scoped storage keys.
 - Shorten README implementation-scope notes; keep a brief in-memory kernel
   summary and deferred next-stage list.
 
