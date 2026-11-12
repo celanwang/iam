@@ -14,8 +14,8 @@ a dated version section when cutting a release.
 
 ### Added
 
-- Authoritative persistence-path design for durable send, idempotency, watermarks,
-  and recovery acceptance (`docs/storage.md`).
+- Minimal multi-tenant, two-table storage design for conversations and successful
+  text messages (`docs/storage.md`).
 - Project design direction for a Rust-based general IM engine (`docs/design.md`).
 - Basic message protocol design with typed structures, command contracts,
   state transitions, recovery flows, and acceptance scenarios (`docs/protocol.md`).
@@ -33,8 +33,9 @@ a dated version section when cutting a release.
 
 ### Changed
 
-- Define the storage transaction order, closure watermark units, send-result
-  precedence, and evidence required for fixed reads and recovery.
+- Keep TiDB SQL over TiKV with PD coordination; scope both core tables and
+  successful-send deduplication to authenticated tenants, deferring durable
+  rejection replay and full protocol recovery.
 - Shorten README implementation-scope notes; keep a brief in-memory kernel
   summary and deferred next-stage list.
 
