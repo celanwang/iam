@@ -109,7 +109,11 @@ impl TidbStore {
             indexes.entry((table, index)).or_default().push(column);
         }
         let required: [(&str, &str, &[&str]); 4] = [
-            ("conversations", "PRIMARY", &["tenant_id", "conversation_id"]),
+            (
+                "conversations",
+                "PRIMARY",
+                &["tenant_id", "conversation_id"],
+            ),
             (
                 "messages",
                 "PRIMARY",
@@ -123,7 +127,13 @@ impl TidbStore {
             (
                 "messages",
                 "successful_send",
-                &["tenant_id", "user_id", "device_id", "conversation_id", "client_msg_id"],
+                &[
+                    "tenant_id",
+                    "user_id",
+                    "device_id",
+                    "conversation_id",
+                    "client_msg_id",
+                ],
             ),
         ];
         if indexes.len() != required.len()
@@ -131,7 +141,10 @@ impl TidbStore {
                 indexes
                     .get(&(table.to_string(), index.to_string()))
                     .is_none_or(|actual| {
-                        !actual.iter().map(String::as_str).eq(columns.iter().copied())
+                        !actual
+                            .iter()
+                            .map(String::as_str)
+                            .eq(columns.iter().copied())
                     })
             })
         {

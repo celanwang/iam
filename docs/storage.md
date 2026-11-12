@@ -1,6 +1,6 @@
 # 存储设计
 
-本阶段明确支持多租户，仅使用 `conversations` 与 `messages` 两表，保存各租户的会话位置、成功文本消息及其去重依据。[`iam-store-tidb`](../crates/iam-store-tidb/src/lib.rs) 提供 SQL 组件和本机原生文本入口；默认协议路径仍使用 `MemoryStore`，不等于完整协议已持久化。[`protocol.md`](./protocol.md) 的约定保持不变。
+本阶段明确支持多租户，仅使用 `conversations` 与 `messages` 两表，保存各租户的会话位置、成功文本消息及其去重依据。[`iam-store`](../crates/iam-store/src/lib.rs) 提供 SQL 组件和本机原生文本入口；默认协议路径仍使用 `MemoryStore`，不等于完整协议已持久化。[`protocol.md`](./protocol.md) 的约定保持不变。
 
 存储入口保持 `应用 → TiDB SQL → TiKV`，PD 提供集群协调。应用统一走 SQL，不直连 TiKV 或双写，组件关系见 [TiDB 官方架构](https://docs.pingcap.com/tidb/stable/tidb-architecture/)。
 
@@ -63,7 +63,7 @@
 
 ## 实现入口与验证
 
-[`TidbTextService`](../crates/iam-store-tidb/src/service.rs) 持有原 Engine，复用 AUTH / RECONNECT 及种子会话成员校验；业务调用只传连接句柄、会话和消息输入，不能传入租户或发送用户。会话初始化、发送、结果查询和分页实际调用 SQL，不走 MemoryStore 的消息集合。会话认证入口拒绝 SEND / SYNC / SNAPSHOT / HISTORY，避免偷偷回退内存路径。
+[`TidbTextService`](../crates/iam-store/src/service.rs) 持有原 Engine，复用 AUTH / RECONNECT 及种子会话成员校验；业务调用只传连接句柄、会话和消息输入，不能传入租户或发送用户。会话初始化、发送、结果查询和分页实际调用 SQL，不走 MemoryStore 的消息集合。会话认证入口拒绝 SEND / SYNC / SNAPSHOT / HISTORY，避免偷偷回退内存路径。
 
 原生 `SavedSend` / 控制台 `STORED` 只说明 SQL 写入成功，不是协议 `SendOutcome.committed`；`Unknown` 或查询到期错误都不提供关闭证明。原生分页是仅追加消息的排他序号分页，不签发协议令牌或建立同步基线。
 
@@ -71,7 +71,7 @@
 
 写事务使用 TiDB 悲观事务和提交后可见的读取语义，会话锁后重新取数据库时间，保证等待期间越过接受截止的请求不会被新接受。提交或回滚结果未知、写入等待被取消时，当前服务实例停止所有新接受；已知成功结果仍可按原键读取。这里只关闭当前实例的新接受能力，不宣称完成持久拒绝或故障恢复。TiDB 的当前读与快照读差异见 [官方事务说明](https://docs.pingcap.com/tidb/stable/pessimistic-transaction/)。
 
-SQL 位于 [`schema.sql`](../crates/iam-store-tidb/schema.sql)，仅全新库模式执行两条 `CREATE TABLE IF NOT EXISTS`；只读启动不建表，不修补缺失状态。两种模式都检查必要字段及四个主键/唯一索引，结构不符即失败，不自动改写。不建迁移记录表，不 DROP / TRUNCATE / 清理数据。ID 用无符号整数与原始 UUID 字节，正文按 UTF-8 字节保存，支持协议的 64 KiB 文本边界。
+SQL 位于 [`schema.sql`](../crates/iam-store/schema.sql)，仅全新库模式执行两条 `CREATE TABLE IF NOT EXISTS`；只读启动不建表，不修补缺失状态。两种模式都检查必要字段及四个主键/唯一索引，结构不符即失败，不自动改写。不建迁移记录表，不 DROP / TRUNCATE / 清理数据。ID 用无符号整数与原始 UUID 字节，正文按 UTF-8 字节保存，支持协议的 64 KiB 文本边界。
 
 组件只接受 loopback TCP URL，逐连接要求 `tidb_version()` 成功，不把 MySQL 兼容性当作 TiDB 验证。以下仅供全新本机试验库使用：
 
@@ -84,7 +84,7 @@ mysql -h 127.0.0.1 -P 4000 -u root -e 'CREATE DATABASE iam_local; CREATE DATABAS
 export IAM_TIDB_URL='mysql://root@127.0.0.1:4000/iam_local'
 export IAM_ACCESS_TOKEN='local-demo'
 export IAM_TENANT_ID=1 IAM_USER_ID=100 IAM_CONVERSATION_ID=1
-IAM_TIDB_MODE=fresh cargo run -p iam-store-tidb --bin iam-tidb-text
+IAM_TIDB_MODE=fresh cargo run -p iam-store --bin iam-tidb-text
 ```
 
 TiUP 要求见 [官方本机快速开始](https://docs.pingcap.com/tidb/stable/quick-start-with-tidb/)。控制台输入 `auth local-demo 018bcfe5680070008000000000000001`、`init`、`id`，再用生成的 ID 输入 `send ID 文本`、`status ID`、`page`。文本不使用引号包装，空格原样保留；多行内容可用 Rust 服务 API。`stop` 永久关闭本实例新接受，`quit` 退出。重启使用 `IAM_TIDB_MODE=read-only`，同一设备和原消息 ID 可查成功结果；不能继续新发。种子 token 仅用于本机验证，不是真实鉴权系统。
@@ -97,7 +97,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # 显式运行真实 TiDB 套件；缺少配置或连到 MySQL 会失败，不会悄悄跳过。
 IAM_TIDB_TEST_URL='mysql://root@127.0.0.1:4000/iam_test' \
 IAM_TIDB_ALLOW_TEST_WRITES=1 \
-cargo test -p iam-store-tidb tidb_ -- --ignored --nocapture
+cargo test -p iam-store tidb_ -- --ignored --nocapture
 ```
 
 真实测试默认 ignored，普通 `cargo test` 不代表它们通过；每个用例在 `iam_test` 前缀的本机数据库下创建新的隔离数据库，只写测试数据并保留，不自动删除。覆盖初始化保留、插入失败回滚、并发序号与同键重试、内容冲突、无符号 ID、租户/用户/设备隔离、分页、结构检查和重启只读。取消用例先通过 TiDB `PROCESSLIST` 确认真实写入已进入锁等待，再取消服务调用并核对后续新接受关闭；未知提交分类另有单测，真实提交断连与进程崩溃仍需另外演练。未执行真实 TiDB 套件时不得宣称 TiDB 已验证。

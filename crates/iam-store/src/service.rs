@@ -140,7 +140,9 @@ impl TidbTextService {
         if self.engine.store.recovery_incomplete
             || self.engine.store.clock_unreliable()
             || self.blocked.load(Ordering::SeqCst)
-            || !self.writable.contains(&(identity.tenant_id, conversation_id))
+            || !self
+                .writable
+                .contains(&(identity.tenant_id, conversation_id))
         {
             return Err(Error::ResultUnavailable);
         }
@@ -182,14 +184,16 @@ impl TidbTextService {
         }
         let now = self.observe_now().await?;
         windows(&client_msg_id, now)?;
-        Ok(match self
-            .store
-            .lookup(identity, conversation_id, client_msg_id)
-            .await?
-        {
-            Some(message) => SendLookup::Found(message.receipt),
-            None => SendLookup::Unknown,
-        })
+        Ok(
+            match self
+                .store
+                .lookup(identity, conversation_id, client_msg_id)
+                .await?
+            {
+                Some(message) => SendLookup::Found(message.receipt),
+                None => SendLookup::Unknown,
+            },
+        )
     }
 
     /// Append-only descending message pages. Not a replacement for protocol HISTORY,

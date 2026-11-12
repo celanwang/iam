@@ -2,7 +2,7 @@
 use iam_core::Engine;
 use iam_protocol::pb::{AuthRequest, Head};
 use iam_protocol::{generate_id128, validate_id128, DecodedBody, DecodedFrame, Id128, MsgType};
-use iam_store_tidb::{OpenMode, SendLookup, TidbTextService};
+use iam_store::{OpenMode, SendLookup, TidbTextService};
 use std::error::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -70,9 +70,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     let request = DecodedFrame {
                         msg_type: MsgType::Auth,
-                        head: Head {
-                            req_id: Some(1),
-                        },
+                        head: Head { req_id: Some(1) },
                         body: DecodedBody::Auth(AuthRequest {
                             access_token: Some(token.as_bytes().to_vec().into()),
                             device_id: Some(device.to_vec().into()),
@@ -86,7 +84,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 "init" => {
                     let initialized = service
-                        .initialize_conversation(connection.ok_or("authenticate first")?, conversation)
+                        .initialize_conversation(
+                            connection.ok_or("authenticate first")?,
+                            conversation,
+                        )
                         .await?;
                     println!(
                         "history={} next={} created={}",

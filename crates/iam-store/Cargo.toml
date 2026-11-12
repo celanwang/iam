@@ -1,5 +1,5 @@
 [package]
-name = "iam-store-tidb"
+name = "iam-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
