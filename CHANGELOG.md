@@ -14,6 +14,16 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Two-table TiDB text storage with tenant-scoped atomic writes, successful-send
+  deduplication, receipt lookup, and ordered pages; authenticated native service
+  with read-only restart and unknown-outcome acceptance guards. Build, regression,
+  and real-TiDB validation remain pending in the restricted environment;
+  dependency downloads and Cargo.lock regeneration are blocked.
+- Opt-in real-TiDB tests for initialization, rollback, concurrent ordering and
+  retries, content conflicts, tenant isolation, pagination, schema checks,
+  cancellation, and restart limits. These tests have not run on TiDB here.
+- Local text console using the authenticated service; read-only startup validates
+  existing tables and uniqueness constraints without creating or repairing data.
 - Minimal multi-tenant, two-table storage design for conversations and successful
   text messages (`docs/storage.md`).
 - Project design direction for a Rust-based general IM engine (`docs/design.md`).
