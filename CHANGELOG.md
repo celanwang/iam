@@ -14,6 +14,8 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Durable text client with a local send queue, automatic sync on reconnect,
+  and periodic recovery from lost pushes, verified against TiDB.
 - Message reliability design for durable sends, server forwarding, and
   receiver recovery.
 - TiDB-backed wire SEND, SEND_STATUS, SYNC, and SNAPSHOT for seeded direct

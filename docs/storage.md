@@ -75,6 +75,8 @@ cargo test -p iam-store tidb_ -- --ignored --nocapture
 
 提交故障用例启动实际的 `iam-tidb-text` 子进程，通过本机 TCP 代理在转发 `COMMIT` 前或收到 TiDB 成功响应后暂停。两个位置分别验证断连和进程被强制终止。提交前故障后同键查询为未知，恢复后重试可提交一次。提交后响应丢失时，同键查询与重试返回原回执。协议验收还验证丢推后的同步补齐和重启后的票据续读。
 
+`client_reliability` 验收用真实 TiDB 验证客户端重开本地库后的发送恢复、末条推送丢失后的定时补齐，以及断线重连后的自动分页同步。`cargo test --workspace` 还会运行 SQLite 事务的进程中断用例。
+
 ### 验证记录
 
 在本机 TiDB、TiKV 和 PD v8.5.7 上完成工作区编译、格式检查、Clippy 和回归测试。验证使用仓库内的 `Cargo.lock`，真实数据库用例在专用 `iam_test` 库下运行。
