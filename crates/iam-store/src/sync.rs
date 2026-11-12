@@ -1,4 +1,4 @@
-use crate::protocol_store::{ProtocolStore, Scope, Stream};
+use crate::store::{Scope, Stream, TidbStore};
 use crate::{Error, Identity};
 use iam_core::{Engine, SnapshotToken, SyncCursor, SyncPageToken};
 use iam_protocol::pb::{
@@ -54,7 +54,7 @@ struct Round {
     started: i64,
 }
 
-impl ProtocolStore {
+impl TidbStore {
     pub async fn sync(&self, identity: Identity, request: &SyncRequest) -> sync_response::Value {
         self.sync_page(identity, request)
             .await

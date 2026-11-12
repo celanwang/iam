@@ -3,7 +3,7 @@ name = "iam-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Two-table TiDB text storage and authenticated local application path"
+description = "TiDB storage for the IAM protocol and local console"
 
 [dependencies]
 getrandom = "0.4"

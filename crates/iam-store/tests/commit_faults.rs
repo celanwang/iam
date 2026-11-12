@@ -60,15 +60,13 @@ async fn exercise_fault(phase: CommitPhase, fault: Fault) {
     let database = support::isolated_database().await;
     let observer = MySqlPool::connect(database.as_str()).await.unwrap();
     let proxy = CommitProxy::start(&database).await;
+    let store_id = hex::encode(generate_id128());
     let device = hex::encode(generate_id128());
     let key = generate_id128();
     let send = format!("send {} {TEXT}", hex::encode(key));
     let status = format!("status {}", hex::encode(key));
-    let mut writer = Console::start(&proxy.url, "fresh", &device).await;
-    assert!(writer
-        .command("init")
-        .await
-        .ends_with("next=1 created=true"));
+    let mut writer = Console::start(&proxy.url, &store_id, "fresh", &device).await;
+    assert!(writer.command("init").await.ends_with("next=1"));
 
     let (reached, disconnect) = proxy.arm(phase);
     writer.write(&send).await;
@@ -109,22 +107,18 @@ async fn exercise_fault(phase: CommitPhase, fault: Fault) {
     };
     let expected_status = match &receipt {
         Some(receipt) => format!("FOUND {receipt:?}"),
-        None => "UNKNOWN (not a final rejection or permission to resend)".to_owned(),
+        None => "UNKNOWN".to_owned(),
     };
 
     match fault {
         Fault::Disconnect => {
             disconnect.send(()).unwrap();
-            assert_eq!(
-                writer.response().await,
-                "attempt error: transaction outcome is unknown; query the original key"
-            );
+            assert_eq!(writer.response().await, "UNRESOLVED ResultUnavailable");
             assert_eq!(writer.command(&status).await, expected_status);
-            let new_send = format!("send {} blocked", hex::encode(generate_id128()));
-            assert_eq!(
-                writer.command(&new_send).await,
-                "attempt error: new acceptance is disabled; missing results remain unknown"
-            );
+            if matches!(phase, CommitPhase::Before) {
+                let new_send = format!("send {} blocked", hex::encode(generate_id128()));
+                assert_eq!(writer.command(&new_send).await, "UNRESOLVED InProgress");
+            }
             writer.quit().await;
         }
         Fault::KillProcess => {
@@ -139,24 +133,37 @@ async fn exercise_fault(phase: CommitPhase, fault: Fault) {
     // Wait for TiDB to release the original writer's row lock before checking
     // that the transaction left either all of its changes or none.
     let mut probe = observer.begin_with("BEGIN PESSIMISTIC").await.unwrap();
-    let sequence: u64 =
-        sqlx::query_scalar(&format!("SELECT next_sequence {CONVERSATION} FOR UPDATE"))
-            .fetch_one(&mut *probe)
-            .await
-            .unwrap();
-    assert_eq!(sequence, checkpoint.next_sequence);
+    sqlx::query("SELECT singleton FROM store_control WHERE singleton = 1 FOR UPDATE")
+        .fetch_one(&mut *probe)
+        .await
+        .unwrap();
     probe.rollback().await.unwrap();
     assert_eq!(DatabaseState::read(&observer).await, checkpoint);
 
-    let mut restarted = Console::start(&database, "read-only", &device).await;
+    let mut restarted = Console::start(&database, &store_id, "resume", &device).await;
     assert_eq!(restarted.command(&status).await, expected_status);
-    let expected_retry = match &receipt {
-        Some(receipt) => format!("REPLAYED {receipt:?}"),
-        None => "attempt error: new acceptance is disabled; missing results remain unknown".into(),
-    };
-    assert_eq!(restarted.command(&send).await, expected_retry);
+    let retried = restarted.command(&send).await;
+    let settled = DatabaseState::read(&observer).await;
+    if let Some(receipt) = receipt {
+        assert_eq!(retried, format!("STORED {receipt:?}"));
+        assert_eq!(settled, checkpoint);
+    } else {
+        assert!(retried.starts_with("STORED "), "{retried}");
+        assert_eq!(settled.next_sequence, 2);
+        let [(client_id, _, sequence, _, _)] = settled.messages.as_slice() else {
+            panic!("expected exactly one message after retry: {settled:?}");
+        };
+        assert_eq!(client_id, &key);
+        assert_eq!(*sequence, 1);
+    }
+    assert_eq!(restarted.command("stop").await, "new acceptance disabled");
+    let new_send = format!("send {} blocked", hex::encode(generate_id128()));
+    assert_eq!(
+        restarted.command(&new_send).await,
+        "UNRESOLVED ResultUnavailable"
+    );
     restarted.quit().await;
-    assert_eq!(DatabaseState::read(&observer).await, checkpoint);
+    assert_eq!(DatabaseState::read(&observer).await, settled);
 }
 
 type MessageRow = (Vec<u8>, Vec<u8>, u64, i64, Vec<u8>);
@@ -198,9 +205,10 @@ struct Console {
 }
 
 impl Console {
-    async fn start(url: &Url, mode: &str, device: &str) -> Self {
+    async fn start(url: &Url, store_id: &str, mode: &str, device: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_iam-tidb-text"))
             .env("IAM_TIDB_URL", url.as_str())
+            .env("IAM_STORE_ID", store_id)
             .env("IAM_TIDB_MODE", mode)
             .env("IAM_ACCESS_TOKEN", "fault-test")
             .env("IAM_TENANT_ID", "1")
@@ -222,7 +230,7 @@ impl Console {
             errors,
         };
         let banner = console.response().await;
-        assert!(banner.starts_with("native text storage"), "{banner}");
+        assert!(banner.starts_with("TiDB text console"), "{banner}");
         assert!(console.response().await.starts_with("commands:"));
         assert_eq!(
             console.command(&format!("auth fault-test {device}")).await,

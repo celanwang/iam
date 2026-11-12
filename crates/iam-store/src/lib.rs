@@ -1,20 +1,16 @@
 //! TiDB storage for the wire protocol and the local text console.
 
-mod protocol;
-mod protocol_store;
-mod protocol_sync;
 mod service;
 mod store;
+mod sync;
 
-pub use protocol::{ProtocolOpenMode, TidbProtocolService};
-pub use service::{OpenMode, TidbTextService};
+pub use service::{OpenMode, TidbService};
 
-use iam_core::MemoryStore;
 use iam_protocol::pb::{
     message_content, MessageContent, MessagePosition, MessageRef, MessageState, MessageView,
     SendReceipt, TextContent,
 };
-use iam_protocol::{validate_id128, Id128};
+use iam_protocol::Id128;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -28,18 +24,6 @@ pub enum Error {
     PermissionDenied,
     #[error("invalid request: {0}")]
     InvalidRequest(&'static str),
-    #[error("original send has different content")]
-    ContentConflict,
-    #[error("new acceptance is disabled; missing results remain unknown")]
-    ResultUnavailable,
-    #[error("client message time is too far ahead")]
-    ClockSkew,
-    #[error("acceptance deadline reached; this is not a final rejection")]
-    AcceptanceExpired,
-    #[error("result query deadline reached; no closure proof is implied")]
-    QueryExpired,
-    #[error("conversation does not exist in storage")]
-    MissingConversation,
     #[error("conversation sequence exhausted")]
     SequenceExhausted,
     #[error("stored data is inconsistent: {0}")]
@@ -56,21 +40,6 @@ pub enum Error {
 pub struct ConversationInfo {
     pub history_id: Id128,
     pub next_sequence: u64,
-    /// Only the process that created a conversation can write it in fresh mode.
-    pub created: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct SavedSend {
-    pub receipt: SendReceipt,
-    pub replayed: bool,
-}
-
-#[derive(Debug, Clone)]
-pub enum SendLookup {
-    Found(SendReceipt),
-    /// Neither a final rejection nor permission to retry as a new acceptance.
-    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -118,22 +87,6 @@ fn text_content(text: &str) -> MessageContent {
     }
 }
 
-fn same_content(a: &str, b: &str) -> bool {
-    MemoryStore::content_digest(&text_content(a)) == MemoryStore::content_digest(&text_content(b))
-}
-
-fn windows(id: &Id128, now: i64) -> Result<(i64, i64)> {
-    validate_id128(id).map_err(|_| Error::InvalidRequest("client_msg_id must be UUIDv7"))?;
-    let (time, accept_until, query_until) = MemoryStore::windows_for_client_msg(id);
-    if now < 0 {
-        return Err(Error::ResultUnavailable);
-    }
-    if now >= query_until {
-        return Err(Error::QueryExpired);
-    }
-    Ok((time, accept_until))
-}
-
 fn receipt(
     conversation_id: u64,
     message_id: Id128,
@@ -153,6 +106,3 @@ fn receipt(
         accepted_at_ms: Some(accepted_at),
     }
 }
-
-#[cfg(test)]
-mod tests;

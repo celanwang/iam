@@ -15,24 +15,144 @@ use iam_protocol::{
     decode_frame, encode_frame, generate_id128, id128_timestamp_ms, DecodedBody, DecodedFrame,
     Frame, FrameDecoder, Id128, MsgType,
 };
-use iam_store::{ProtocolOpenMode, TidbProtocolService};
+use iam_store::{OpenMode, TidbService};
 use prost::Message;
 
 type Pushes = Vec<(Id128, Vec<u8>)>;
 
 #[tokio::test]
 #[ignore = "requires real local TiDB"]
+async fn tidb_rename_preserves_receipts_rejections_and_cursors() {
+    let database = support::isolated_database().await;
+    let archive = support::isolated_database().await;
+    let store_id = generate_id128();
+    let mut service =
+        TidbService::connect_local(database.as_str(), store_id, seeded(), OpenMode::Initialize)
+            .await
+            .unwrap();
+    let mut alice = Peer::new();
+    let mut bob = Peer::new();
+    alice.auth(&mut service, b"alice").await;
+    bob.auth(&mut service, b"bob").await;
+    let conversation = sync_target::Value::Conversation(1);
+    let cursor = bob
+        .snapshot(&mut service, conversation)
+        .await
+        .resume_cursor
+        .unwrap();
+    let key = message_key(1, generate_id128());
+    let (value, _) = alice.send(&mut service, &key, "before rename").await;
+    let original = committed(value);
+    let bad_key = message_key(1, generate_id128());
+    let (rejection, _) = alice.send(&mut service, &bad_key, "").await;
+    assert!(matches!(rejection, send_outcome::Value::RejectedFinal(_)));
+    drop(service);
+
+    let pool = sqlx::MySqlPool::connect(database.as_str()).await.unwrap();
+    sqlx::query("RENAME TABLE store_control TO protocol_store, conversations TO protocol_conversations, messages TO protocol_messages, rejections TO protocol_rejections, members TO protocol_members")
+        .execute(&pool).await.unwrap();
+    for mode in [OpenMode::Initialize, OpenMode::Resume] {
+        assert!(
+            TidbService::connect_local(database.as_str(), store_id, identities(), mode)
+                .await
+                .is_err()
+        );
+    }
+
+    // Simulate both old schemas having lived in the same database.
+    sqlx::query("CREATE TABLE conversations LIKE protocol_conversations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE messages LIKE protocol_messages")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO conversations SELECT * FROM protocol_conversations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO messages SELECT * FROM protocol_messages")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE messages SET `text` = 'legacy text' WHERE tenant_id = 1 AND conversation_id = 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let migration = include_str!("../migrations/rename_protocol_tables.sql");
+    assert!(sqlx::query(migration).execute(&pool).await.is_err());
+    let existing: u64 = sqlx::query_scalar("SELECT CAST(COUNT(*) AS UNSIGNED) FROM protocol_store")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(existing, 1);
+    let archive_name = archive.path().trim_start_matches('/');
+    sqlx::query(&format!(
+        "RENAME TABLE conversations TO `{archive_name}`.conversations, messages TO `{archive_name}`.messages"
+    )).execute(&pool).await.unwrap();
+    sqlx::query(migration).execute(&pool).await.unwrap();
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name",
+    ).fetch_all(&pool).await.unwrap();
+    assert_eq!(
+        tables,
+        [
+            "conversations",
+            "members",
+            "messages",
+            "rejections",
+            "store_control"
+        ]
+    );
+    let archived: u64 = sqlx::query_scalar(&format!(
+        "SELECT CAST(COUNT(*) AS UNSIGNED) FROM `{archive_name}`.conversations"
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(archived, 2);
+    let text: Vec<u8> = sqlx::query_scalar(&format!(
+        "SELECT `text` FROM `{archive_name}`.messages WHERE tenant_id = 1 AND conversation_id = 1"
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(text, b"legacy text");
+
+    let mut resumed =
+        TidbService::connect_local(database.as_str(), store_id, identities(), OpenMode::Resume)
+            .await
+            .unwrap();
+    alice.auth(&mut resumed, b"alice").await;
+    bob.auth(&mut resumed, b"bob").await;
+    assert_eq!(committed(alice.status(&mut resumed, &key).await), original);
+    assert_eq!(alice.status(&mut resumed, &bad_key).await, rejection);
+    let page = sync_page(
+        bob.sync(
+            &mut resumed,
+            conversation,
+            Some(cursor.to_vec()),
+            None,
+            1,
+            256 * 1024,
+        )
+        .await,
+    );
+    assert_change(&page, &original);
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
 async fn tidb_protocol_restarts_and_syncs_discarded_pushes() {
     let database = support::isolated_database().await;
     let store_id = generate_id128();
-    let mut service = TidbProtocolService::connect_local(
-        database.as_str(),
-        store_id,
-        seeded(),
-        ProtocolOpenMode::Initialize,
-    )
-    .await
-    .unwrap();
+    let mut service =
+        TidbService::connect_local(database.as_str(), store_id, seeded(), OpenMode::Initialize)
+            .await
+            .unwrap();
     let mut alice = Peer::new();
     let mut bob = Peer::new();
     alice.auth(&mut service, b"alice").await;
@@ -82,14 +202,10 @@ async fn tidb_protocol_restarts_and_syncs_discarded_pushes() {
     drop(service);
 
     // Recreate the engine with identity seeds only. Conversation data and tokens come from TiDB.
-    let mut service = TidbProtocolService::connect_local(
-        database.as_str(),
-        store_id,
-        identities(),
-        ProtocolOpenMode::Resume,
-    )
-    .await
-    .unwrap();
+    let mut service =
+        TidbService::connect_local(database.as_str(), store_id, identities(), OpenMode::Resume)
+            .await
+            .unwrap();
     alice.auth(&mut service, b"alice").await;
     bob.auth(&mut service, b"bob").await;
     assert_eq!(
@@ -167,14 +283,10 @@ async fn check_commit_disconnect(phase: CommitPhase) {
     let database = support::isolated_database().await;
     let store_id = generate_id128();
     let proxy = CommitProxy::start(&database).await;
-    let mut service = TidbProtocolService::connect_local(
-        proxy.url.as_str(),
-        store_id,
-        seeded(),
-        ProtocolOpenMode::Initialize,
-    )
-    .await
-    .unwrap();
+    let mut service =
+        TidbService::connect_local(proxy.url.as_str(), store_id, seeded(), OpenMode::Initialize)
+            .await
+            .unwrap();
     let mut alice = Peer::new();
     alice.auth(&mut service, b"alice").await;
     let key = message_key(1, generate_id128());
@@ -194,14 +306,10 @@ async fn check_commit_disconnect(phase: CommitPhase) {
     assert!(pushes.is_empty());
     drop(service);
 
-    let mut service = TidbProtocolService::connect_local(
-        database.as_str(),
-        store_id,
-        identities(),
-        ProtocolOpenMode::Resume,
-    )
-    .await
-    .unwrap();
+    let mut service =
+        TidbService::connect_local(database.as_str(), store_id, identities(), OpenMode::Resume)
+            .await
+            .unwrap();
     alice.auth(&mut service, b"alice").await;
     let status = alice.status(&mut service, &key).await;
     let original = match phase {
@@ -229,14 +337,10 @@ async fn check_commit_disconnect(phase: CommitPhase) {
 async fn tidb_protocol_replays_rejections_and_enforces_scopes_and_windows() {
     let database = support::isolated_database().await;
     let store_id = generate_id128();
-    let mut service = TidbProtocolService::connect_local(
-        database.as_str(),
-        store_id,
-        seeded(),
-        ProtocolOpenMode::Initialize,
-    )
-    .await
-    .unwrap();
+    let mut service =
+        TidbService::connect_local(database.as_str(), store_id, seeded(), OpenMode::Initialize)
+            .await
+            .unwrap();
     let mut alice = Peer::new();
     let mut other = Peer::new();
     alice.auth(&mut service, b"alice").await;
@@ -261,22 +365,18 @@ async fn tidb_protocol_replays_rejections_and_enforces_scopes_and_windows() {
     assert!(snapshot.items.is_empty());
     drop(service);
 
-    assert!(TidbProtocolService::connect_local(
+    assert!(TidbService::connect_local(
         database.as_str(),
         generate_id128(),
         identities(),
-        ProtocolOpenMode::Resume,
+        OpenMode::Resume,
     )
     .await
     .is_err());
-    let mut service = TidbProtocolService::connect_local(
-        database.as_str(),
-        store_id,
-        identities(),
-        ProtocolOpenMode::Resume,
-    )
-    .await
-    .unwrap();
+    let mut service =
+        TidbService::connect_local(database.as_str(), store_id, identities(), OpenMode::Resume)
+            .await
+            .unwrap();
     alice.auth(&mut service, b"alice").await;
     other.auth(&mut service, b"other").await;
     assert!(
@@ -326,22 +426,14 @@ async fn tidb_protocol_replays_rejections_and_enforces_scopes_and_windows() {
 async fn tidb_protocol_serializes_same_key_across_instances() {
     let database = support::isolated_database().await;
     let store_id = generate_id128();
-    let mut first = TidbProtocolService::connect_local(
-        database.as_str(),
-        store_id,
-        seeded(),
-        ProtocolOpenMode::Initialize,
-    )
-    .await
-    .unwrap();
-    let mut second = TidbProtocolService::connect_local(
-        database.as_str(),
-        store_id,
-        identities(),
-        ProtocolOpenMode::Resume,
-    )
-    .await
-    .unwrap();
+    let mut first =
+        TidbService::connect_local(database.as_str(), store_id, seeded(), OpenMode::Initialize)
+            .await
+            .unwrap();
+    let mut second =
+        TidbService::connect_local(database.as_str(), store_id, identities(), OpenMode::Resume)
+            .await
+            .unwrap();
     let mut peer = Peer::new();
     let mut retry = Peer::new();
     retry.device = peer.device;
@@ -367,14 +459,10 @@ async fn tidb_protocol_serializes_same_key_across_instances() {
 async fn tidb_protocol_preserves_the_close_watermark_during_clock_rollback() {
     let database = support::isolated_database().await;
     let store_id = generate_id128();
-    let mut service = TidbProtocolService::connect_local(
-        database.as_str(),
-        store_id,
-        seeded(),
-        ProtocolOpenMode::Initialize,
-    )
-    .await
-    .unwrap();
+    let mut service =
+        TidbService::connect_local(database.as_str(), store_id, seeded(), OpenMode::Initialize)
+            .await
+            .unwrap();
     let mut alice = Peer::new();
     alice.auth(&mut service, b"alice").await;
     let key = message_key(1, generate_id128());
@@ -386,21 +474,17 @@ async fn tidb_protocol_preserves_the_close_watermark_during_clock_rollback() {
     let day = 86_400_000;
     let observed = id128_timestamp_ms(&generate_id128()) as i64 + 60_000;
     let watermark = observed - day;
-    sqlx::query("UPDATE protocol_store SET max_observed_now_ms = ?, closed_through_client_ms = ? WHERE singleton = 1")
+    sqlx::query("UPDATE store_control SET max_observed_now_ms = ?, closed_through_client_ms = ? WHERE singleton = 1")
         .bind(observed)
         .bind(watermark)
         .execute(&pool)
         .await
         .unwrap();
 
-    let mut service = TidbProtocolService::connect_local(
-        database.as_str(),
-        store_id,
-        identities(),
-        ProtocolOpenMode::Resume,
-    )
-    .await
-    .unwrap();
+    let mut service =
+        TidbService::connect_local(database.as_str(), store_id, identities(), OpenMode::Resume)
+            .await
+            .unwrap();
     alice.auth(&mut service, b"alice").await;
     assert_eq!(committed(alice.status(&mut service, &key).await), original);
     let expired = message_key(1, client_id_days_ago(2 * day as u64));
@@ -413,7 +497,7 @@ async fn tidb_protocol_preserves_the_close_watermark_during_clock_rollback() {
     let (outcome, _) = alice.send(&mut service, &new_key, "blocked").await;
     assert_unresolved(outcome, ErrorCode::ResultUnavailable, false);
     let persisted: (i64, i64) = sqlx::query_as(
-        "SELECT max_observed_now_ms, closed_through_client_ms FROM protocol_store WHERE singleton = 1",
+        "SELECT max_observed_now_ms, closed_through_client_ms FROM store_control WHERE singleton = 1",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(persisted, (observed, watermark));
     let snapshot = alice
@@ -437,7 +521,7 @@ impl Peer {
         }
     }
 
-    async fn auth(&mut self, service: &mut TidbProtocolService, token: &[u8]) {
+    async fn auth(&mut self, service: &mut TidbService, token: &[u8]) {
         service.disconnect(self.cid.take());
         self.request = 0;
         let (body, _) = self
@@ -458,7 +542,7 @@ impl Peer {
 
     async fn send(
         &mut self,
-        service: &mut TidbProtocolService,
+        service: &mut TidbService,
         key: &MessageKey,
         text: &str,
     ) -> (send_outcome::Value, Pushes) {
@@ -483,11 +567,7 @@ impl Peer {
         (response.outcome.unwrap().value.unwrap(), pushes)
     }
 
-    async fn status(
-        &mut self,
-        service: &mut TidbProtocolService,
-        key: &MessageKey,
-    ) -> send_outcome::Value {
+    async fn status(&mut self, service: &mut TidbService, key: &MessageKey) -> send_outcome::Value {
         let (body, _) = self
             .call(
                 service,
@@ -506,7 +586,7 @@ impl Peer {
 
     async fn sync(
         &mut self,
-        service: &mut TidbProtocolService,
+        service: &mut TidbService,
         target: sync_target::Value,
         cursor: Option<Vec<u8>>,
         page: Option<Vec<u8>>,
@@ -538,7 +618,7 @@ impl Peer {
 
     async fn snapshot(
         &mut self,
-        service: &mut TidbProtocolService,
+        service: &mut TidbService,
         target: sync_target::Value,
     ) -> SnapshotPage {
         let reset = self
@@ -571,7 +651,7 @@ impl Peer {
 
     async fn call(
         &mut self,
-        service: &mut TidbProtocolService,
+        service: &mut TidbService,
         kind: MsgType,
         body: &impl Message,
     ) -> (DecodedBody, Pushes) {

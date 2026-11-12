@@ -1,363 +1,318 @@
-use crate::store::{Append, TidbStore};
-use crate::{
-    same_content, windows, ConversationInfo, Error, Identity, Result, SavedSend, SendLookup,
-    TextPage,
+use crate::store::{unresolved, Decision, Scope, SendKey, TidbStore};
+use crate::{ConversationInfo, Error, Identity, Result, TextPage};
+use iam_core::{CoreError, Engine, EngineOutput, EngineReply, StorageRequest};
+use iam_protocol::pb::{
+    change, message_content, send_outcome, Change, ErrorCode, MessageContent, MessageKey,
+    RetryAction, SendOutcome, SendResponse, SendStatusResponse, SnapshotResponse, SyncResponse,
 };
-use iam_core::{Engine, EngineOutput};
-use iam_protocol::{generate_id128, validate_id128, DecodedBody, DecodedFrame, Id128};
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use iam_protocol::{
+    decode_frame, encode_frame, encode_protocol_error, validate_id128, DecodedBody, DecodedFrame,
+    Frame, Id128, MsgType,
+};
+use prost::Message;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug)]
 pub enum OpenMode {
-    /// Default after a restart: known results and authorized pages remain readable.
-    #[default]
-    ReadOnly,
-    /// Explicit assertion that this is a new disposable local database, not a restored one.
-    /// Both tables must be empty. Existing conversations never gain write permission.
-    FreshDatabase,
+    /// Creates a fresh authority using the Engine's seeded conversations.
+    Initialize,
+    /// The caller has verified this is the same continuously authoritative database.
+    Resume,
 }
 
-/// Reuses Engine authentication and seeded conversation permissions, but never calls its
-/// memory SEND/SYNC implementation. Native results are not wire SendOutcome::Committed.
-pub struct TidbTextService {
+/// Wire handler for authenticated sessions backed by TiDB.
+pub struct TidbService {
     engine: Engine,
-    store: TidbStore,
-    writable: HashSet<(u64, u64)>,
-    blocked: AtomicBool,
+    database: TidbStore,
+    accepting: bool,
 }
 
-impl TidbTextService {
-    /// Only loopback endpoints are accepted. Fresh mode creates the two tables;
-    /// read-only mode only validates them. Neither mode rewrites existing records.
-    pub async fn connect_local(url: &str, mut engine: Engine, mode: OpenMode) -> Result<Self> {
-        if matches!(mode, OpenMode::FreshDatabase) && engine.store.recovery_incomplete {
-            return Err(Error::ResultUnavailable);
-        }
-        let store = TidbStore::connect(url).await?;
-        match mode {
-            OpenMode::ReadOnly => {
-                store.check_schema().await?;
-                engine.store.recovery_incomplete = true;
-            }
-            OpenMode::FreshDatabase => {
-                store.install_schema().await?;
-                if !store.is_empty().await? {
-                    return Err(Error::Configuration(
-                        "fresh mode requires both tables to be empty",
-                    ));
-                }
-            }
-        }
-        engine.store.set_now(store.now().await?);
-        Ok(Self {
-            engine,
-            store,
-            writable: HashSet::new(),
-            blocked: AtomicBool::new(false),
-        })
-    }
-
-    /// Only session commands enter the old Engine. SEND/SYNC/SNAPSHOT/HISTORY must not
-    /// silently fall back to its unrelated in-memory messages or manufacture durability.
-    pub async fn handle_session(
-        &mut self,
-        connection_id: Option<Id128>,
-        frame: &DecodedFrame,
-    ) -> Result<(Option<Id128>, EngineOutput)> {
-        if !matches!(
-            (frame.msg_type, &frame.body),
-            (iam_protocol::MsgType::Auth, DecodedBody::Auth(_))
-                | (iam_protocol::MsgType::Reconnect, DecodedBody::Reconnect(_))
-                | (iam_protocol::MsgType::Heartbeat, DecodedBody::Heartbeat(_))
-        ) {
-            return Err(Error::InvalidRequest(
-                "this entry point accepts only session commands",
+impl TidbService {
+    pub async fn connect_local(
+        url: &str,
+        store_id: Id128,
+        engine: Engine,
+        mode: OpenMode,
+    ) -> Result<Self> {
+        if !engine.store.connections.is_empty() || engine.store.recovery_incomplete {
+            return Err(Error::Configuration(
+                "expected a fresh engine for the TiDB protocol",
             ));
         }
-        self.observe_now().await?;
-        Ok(self.engine.handle(connection_id, frame)?)
+        let seeds = matches!(mode, OpenMode::Initialize).then_some(&engine.store);
+        let database = TidbStore::open(url, store_id, seeds).await?;
+        Ok(Self {
+            engine,
+            database,
+            accepting: true,
+        })
     }
 
     pub fn disconnect(&mut self, connection_id: Option<Id128>) {
         self.engine.disconnect(connection_id);
     }
 
-    /// Irreversible for this service instance. Known results can still be read.
     pub fn stop_accepting(&mut self) {
-        self.engine.store.recovery_incomplete = true;
+        self.accepting = false;
     }
 
-    pub async fn initialize_conversation(
-        &mut self,
-        connection_id: Id128,
-        conversation_id: u64,
-    ) -> Result<ConversationInfo> {
-        let identity = self.identity(connection_id)?;
-        self.authorize_conversation(identity, conversation_id)?;
-        if self.engine.store.recovery_incomplete || self.blocked.load(Ordering::SeqCst) {
-            return self.store.conversation(identity, conversation_id).await;
-        }
-        let guard = AcceptanceGuard {
-            blocked: &self.blocked,
-            completed: false,
-        };
-        let result = self.store.initialize(identity, conversation_id).await;
-        let initialized = guard.finish(result)?;
-        if initialized.created && !self.engine.store.recovery_incomplete {
-            self.writable.insert((identity.tenant_id, conversation_id));
-        }
-        Ok(initialized)
-    }
-
-    pub async fn send_text(
-        &mut self,
-        connection_id: Id128,
-        conversation_id: u64,
-        client_msg_id: Id128,
-        text: &str,
-    ) -> Result<SavedSend> {
-        let identity = self.identity(connection_id)?;
-        if conversation_id == 0 {
-            return Err(Error::InvalidRequest("conversation_id must be nonzero"));
-        }
-        let now = self.observe_now().await?;
-        windows(&client_msg_id, now)?;
-        // Replay precedes current membership, new-content rules, and recovery gates.
-        if let Some(message) = self
-            .store
-            .lookup(identity, conversation_id, client_msg_id)
-            .await?
-        {
-            if !same_content(&message.text, text) {
-                return Err(Error::ContentConflict);
-            }
-            return Ok(SavedSend {
-                receipt: message.receipt,
-                replayed: true,
-            });
-        }
-        if self.engine.store.recovery_incomplete
-            || self.engine.store.clock_unreliable()
-            || self.blocked.load(Ordering::SeqCst)
-            || !self
-                .writable
-                .contains(&(identity.tenant_id, conversation_id))
-        {
-            return Err(Error::ResultUnavailable);
-        }
-        self.authorize_conversation(identity, conversation_id)?;
-        // Cancellation is not rollback. Drop poisons new acceptance even if no response
-        // can be delivered; a later operation may only replay a proven stored result.
-        let guard = AcceptanceGuard {
-            blocked: &self.blocked,
-            completed: false,
-        };
-        let result = self
-            .store
-            .append(Append {
-                identity,
-                conversation_id,
-                client_msg_id,
-                text,
-                message_id: generate_id128(),
-                max_observed_now: &mut self.engine.store.max_observed_now_ms,
-            })
-            .await;
-        let appended = guard.finish(result)?;
-        self.engine.store.set_now(appended.observed_now);
-        Ok(SavedSend {
-            receipt: appended.message.receipt,
-            replayed: appended.replayed,
+    /// Reads the current position of an authenticated member's conversation.
+    pub async fn conversation(&self, cid: Id128, id: u64) -> Result<ConversationInfo> {
+        let stream = self
+            .database
+            .stream(self.identity(cid)?, Scope::Conversation(id))
+            .await?;
+        Ok(ConversationInfo {
+            history_id: stream.epoch,
+            next_sequence: stream.upper + 1,
         })
     }
 
-    pub async fn query_send(
-        &mut self,
-        connection_id: Id128,
-        conversation_id: u64,
-        client_msg_id: Id128,
-    ) -> Result<SendLookup> {
-        let identity = self.identity(connection_id)?;
-        if conversation_id == 0 {
-            return Err(Error::InvalidRequest("conversation_id must be nonzero"));
-        }
-        let now = self.observe_now().await?;
-        windows(&client_msg_id, now)?;
-        Ok(
-            match self
-                .store
-                .lookup(identity, conversation_id, client_msg_id)
-                .await?
-            {
-                Some(message) => SendLookup::Found(message.receipt),
-                None => SendLookup::Unknown,
-            },
-        )
-    }
-
-    /// Append-only descending message pages. Not a replacement for protocol HISTORY,
-    /// opaque tokens, fixed historical views, or account/conversation SYNC.
+    /// Local console read ordered by creation position, with an exclusive bound.
     pub async fn read_messages(
         &self,
-        connection_id: Id128,
-        conversation_id: u64,
+        cid: Id128,
+        id: u64,
         before: Option<u64>,
         limit: u32,
     ) -> Result<TextPage> {
-        let identity = self.identity(connection_id)?;
-        self.authorize_conversation(identity, conversation_id)?;
         if limit == 0 || limit > 100 || before == Some(0) {
             return Err(Error::InvalidRequest(
                 "page limit must be 1..100 and before must be nonzero",
             ));
         }
-        self.store
-            .page(identity, conversation_id, before, limit)
+        self.database
+            .page(self.identity(cid)?, id, before, limit)
             .await
     }
 
-    async fn observe_now(&mut self) -> Result<i64> {
-        let now = self.store.now().await?;
-        self.engine.store.set_now(now);
-        Ok(now)
-    }
-
-    fn identity(&self, connection_id: Id128) -> Result<Identity> {
-        let connection = self
+    fn identity(&self, cid: Id128) -> Result<Identity> {
+        let session = self
             .engine
             .store
             .connections
-            .get(&connection_id)
+            .get(&cid)
             .ok_or(Error::Unauthenticated)?;
         if self
             .engine
             .store
             .revoked_auth_epochs
-            .contains(&connection.auth_epoch)
-            || connection.tenant_id == 0
-            || connection.user_id == 0
-            || validate_id128(&connection.device_id).is_err()
+            .contains(&session.auth_epoch)
         {
             return Err(Error::Unauthenticated);
         }
         Ok(Identity {
-            tenant_id: connection.tenant_id,
-            user_id: connection.user_id,
-            device_id: connection.device_id,
+            tenant_id: session.tenant_id,
+            user_id: session.user_id,
+            device_id: session.device_id,
         })
     }
 
-    fn authorize_conversation(&self, identity: Identity, conversation_id: u64) -> Result<()> {
-        match self
-            .engine
-            .store
-            .conversations
-            .get(&(identity.tenant_id, conversation_id))
-        {
-            Some(conversation) if conversation.members.contains(&identity.user_id) => Ok(()),
-            _ => Err(Error::PermissionDenied),
-        }
-    }
-}
-
-struct AcceptanceGuard<'a> {
-    blocked: &'a AtomicBool,
-    completed: bool,
-}
-
-impl AcceptanceGuard<'_> {
-    fn finish<T>(mut self, result: Result<T>) -> Result<T> {
-        self.completed = !matches!(
-            &result,
-            Err(Error::CommitUnknown(_) | Error::Integrity(_) | Error::MissingConversation)
-        );
-        result
-    }
-}
-
-impl Drop for AcceptanceGuard<'_> {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.blocked.store(true, Ordering::SeqCst);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn known_completion_does_not_block_or_reopen_acceptance() {
-        let blocked = AtomicBool::new(false);
-        AcceptanceGuard {
-            blocked: &blocked,
-            completed: false,
-        }
-        .finish(Ok(()))
-        .unwrap();
-        assert!(!blocked.load(Ordering::SeqCst));
-        let rollback: Result<()> = Err(Error::Database(sqlx::Error::RowNotFound));
-        assert!(AcceptanceGuard {
-            blocked: &blocked,
-            completed: false,
-        }
-        .finish(rollback)
-        .is_err());
-        assert!(!blocked.load(Ordering::SeqCst));
-        drop(AcceptanceGuard {
-            blocked: &blocked,
-            completed: false,
-        });
-        assert!(blocked.load(Ordering::SeqCst));
-        AcceptanceGuard {
-            blocked: &blocked,
-            completed: false,
-        }
-        .finish(Ok(()))
-        .unwrap();
-        assert!(blocked.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn unknown_or_inconsistent_outcomes_block_new_acceptance() {
-        for error in [
-            Error::CommitUnknown(sqlx::Error::PoolClosed),
-            Error::Integrity("invalid history"),
-            Error::MissingConversation,
-        ] {
-            let blocked = AtomicBool::new(false);
-            let result: Result<()> = Err(error);
-            assert!(AcceptanceGuard {
-                blocked: &blocked,
-                completed: false,
+    pub async fn handle_frame(
+        &mut self,
+        connection_id: Option<Id128>,
+        frame: &Frame,
+    ) -> Result<EngineReply> {
+        let Ok(decoded) = decode_frame(frame) else {
+            // The Engine owns malformed-frame and command-specific error routing.
+            return Ok(self.engine.handle_frame(connection_id, frame)?);
+        };
+        match &decoded.body {
+            DecodedBody::Auth(_) | DecodedBody::Reconnect(_) | DecodedBody::Heartbeat(_) => {
+                self.engine.store.set_now(self.database.now().await?);
+                return Ok(self.engine.handle(connection_id, &decoded)?);
             }
-            .finish(result)
-            .is_err());
-            assert!(blocked.load(Ordering::SeqCst));
+            DecodedBody::PushAck(_) => return Ok(self.engine.handle(connection_id, &decoded)?),
+            _ if !decoded.msg_type.is_client_to_server() => {
+                return Ok(self.engine.handle(connection_id, &decoded)?);
+            }
+            _ => {}
+        }
+        let cid = match self
+            .engine
+            .prepare_storage_request(connection_id, &decoded)?
+        {
+            StorageRequest::Ready(cid) => cid,
+            StorageRequest::Respond(reply) => return Ok(reply),
+        };
+        let identity = self.identity(cid)?;
+        match &decoded.body {
+            DecodedBody::Send(req) => {
+                let content = req.content.as_ref().filter(|content| {
+                    matches!(
+                        content.value.as_ref(),
+                        Some(message_content::Value::Text(text)) if text.text.is_some()
+                    )
+                });
+                let Some(content) = content else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                self.send(cid, identity, &decoded, req.key.as_ref(), Some(content))
+                    .await
+            }
+            DecodedBody::SendStatus(req) => {
+                self.send(cid, identity, &decoded, req.key.as_ref(), None)
+                    .await
+            }
+            DecodedBody::Sync(req) => {
+                let value = self.database.sync(identity, req).await;
+                reply(
+                    cid,
+                    &decoded,
+                    MsgType::SyncAck,
+                    &SyncResponse { value: Some(value) },
+                )
+            }
+            DecodedBody::Snapshot(req) => {
+                let value = self.database.snapshot(identity, req).await;
+                reply(
+                    cid,
+                    &decoded,
+                    MsgType::SnapshotAck,
+                    &SnapshotResponse { value: Some(value) },
+                )
+            }
+            _ => wire_error(cid, &decoded, ErrorCode::UnsupportedCommand),
         }
     }
 
-    #[test]
-    fn dropping_a_suspended_write_future_blocks_acceptance() {
-        use std::future::Future;
-        use std::task::{Context, Waker};
+    async fn send(
+        &mut self,
+        cid: Id128,
+        identity: Identity,
+        frame: &DecodedFrame,
+        key: Option<&MessageKey>,
+        content: Option<&MessageContent>,
+    ) -> Result<EngineReply> {
+        let Some(key) = key else {
+            return wire_error(cid, frame, ErrorCode::InvalidArgument);
+        };
+        let Some((conversation, client_id)) = key.conversation_id.filter(|id| *id != 0).zip(
+            key.client_msg_id
+                .as_deref()
+                .and_then(|bytes| validate_id128(bytes).ok()),
+        ) else {
+            return wire_error(cid, frame, ErrorCode::InvalidArgument);
+        };
+        let session = self.engine.store.connections.get_mut(&cid).unwrap();
+        if content.is_some() {
+            if session
+                .inflight_send
+                .get(&conversation)
+                .is_some_and(|id| *id != client_id)
+            {
+                let value = unresolved(ErrorCode::InProgress, RetryAction::QuerySend, false);
+                return send_reply(cid, frame, key, SendOutcome { value: Some(value) });
+            }
+            session.inflight_send.insert(conversation, client_id);
+        }
 
-        let blocked = AtomicBool::new(false);
-        let mut operation = Box::pin(async {
-            let guard = AcceptanceGuard {
-                blocked: &blocked,
-                completed: false,
+        let scope = SendKey {
+            owner: identity,
+            conversation,
+            client_id,
+        };
+        let Decision { outcome, delivery } = self
+            .database
+            .decide(&scope, content, self.accepting)
+            .await
+            .unwrap_or_else(|_| Decision {
+                outcome: SendOutcome {
+                    value: Some(unresolved(
+                        ErrorCode::ResultUnavailable,
+                        RetryAction::QuerySend,
+                        false,
+                    )),
+                },
+                delivery: None,
+            });
+        let release = match outcome.value.as_ref() {
+            Some(send_outcome::Value::Committed(_) | send_outcome::Value::RejectedFinal(_)) => true,
+            Some(send_outcome::Value::Unresolved(result)) => result.acceptance_closed == Some(true),
+            None => false,
+        };
+        if release && session.inflight_send.get(&conversation) == Some(&client_id) {
+            session.inflight_send.remove(&conversation);
+        }
+        let (cid_out, mut output) = send_reply(cid, frame, key, outcome)?;
+        if let Some(delivery) = delivery {
+            let change = Change {
+                event_seq: Some(delivery.stream.upper),
+                payload: Some(change::Payload::MessageUpsert(delivery.message)),
             };
-            std::future::pending::<()>().await;
-            guard.finish(Ok(()))
-        });
-        assert!(operation
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
-        drop(operation);
-        assert!(blocked.load(Ordering::SeqCst));
+            // The response and the durable change are available even if push encoding fails.
+            let _ = self.engine.push_change(
+                &mut output,
+                cid,
+                identity.tenant_id,
+                &delivery.members,
+                &delivery.stream.context(),
+                &change,
+            );
+        }
+        Ok((cid_out, output))
     }
+}
+
+fn send_reply(
+    cid: Id128,
+    frame: &DecodedFrame,
+    key: &MessageKey,
+    outcome: SendOutcome,
+) -> Result<EngineReply> {
+    if frame.msg_type == MsgType::SendStatus {
+        reply(
+            cid,
+            frame,
+            MsgType::SendStatusAck,
+            &SendStatusResponse {
+                key: Some(key.clone()),
+                outcome: Some(outcome),
+            },
+        )
+    } else {
+        reply(
+            cid,
+            frame,
+            MsgType::SendAck,
+            &SendResponse {
+                key: Some(key.clone()),
+                outcome: Some(outcome),
+            },
+        )
+    }
+}
+
+fn reply(
+    cid: Id128,
+    frame: &DecodedFrame,
+    kind: MsgType,
+    body: &impl Message,
+) -> Result<EngineReply> {
+    let bytes = encode_frame(kind, &frame.head, body).map_err(CoreError::from)?;
+    Ok((
+        Some(cid),
+        EngineOutput {
+            responses: vec![bytes],
+            pushes: vec![],
+        },
+    ))
+}
+
+fn wire_error(cid: Id128, frame: &DecodedFrame, code: ErrorCode) -> Result<EngineReply> {
+    let bytes = encode_protocol_error(
+        frame.head.req_id,
+        Some(frame.msg_type as u32),
+        code,
+        RetryAction::None,
+        false,
+        None,
+    )
+    .map_err(CoreError::from)?;
+    Ok((
+        Some(cid),
+        EngineOutput {
+            responses: vec![bytes],
+            pushes: vec![],
+        },
+    ))
 }
