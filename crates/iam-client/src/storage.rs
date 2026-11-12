@@ -1,4 +1,4 @@
-use crate::{Error, Identity, Recovery, Result};
+use crate::{Error, HistoryRange, Identity, Recovery, Result};
 use iam_protocol::pb::{
     change, Change, ConversationState, MessageKey, MessageView, ResetReason, SendOutcome,
     SendRequest, StreamContext,
@@ -7,6 +7,7 @@ use iam_protocol::{validate_id128, Id128};
 use prost::Message;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
@@ -30,6 +31,10 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS recoveries (
         target BLOB PRIMARY KEY, reason INTEGER NOT NULL,
         data_loss_possible INTEGER NOT NULL, pending INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS history_ranges (
+        target BLOB NOT NULL, first BLOB NOT NULL, last BLOB NOT NULL,
+        unavailable INTEGER NOT NULL, PRIMARY KEY (target, unavailable, first)
     );
     CREATE TABLE IF NOT EXISTS messages (
         conversation BLOB NOT NULL, id BLOB NOT NULL, sequence BLOB NOT NULL,
@@ -211,6 +216,136 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn apply_snapshot(
+        &mut self,
+        target: u64,
+        changes: Vec<Change>,
+        progress: &Progress,
+        gap: Option<(u64, u64)>,
+    ) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        if target == 0 {
+            let current: HashSet<u64> = changes
+                .iter()
+                .filter_map(|change| match &change.payload {
+                    Some(change::Payload::ConversationUpsert(state)) => state.conversation_id,
+                    _ => None,
+                })
+                .collect();
+            let old: Vec<Vec<u8>> = sqlx::query_scalar("SELECT id FROM conversations")
+                .fetch_all(&mut *tx)
+                .await?;
+            for id in old {
+                let id = number(&id)?;
+                if !current.contains(&id) {
+                    clear_conversation(&mut tx, id).await?;
+                }
+            }
+        } else {
+            sqlx::query("DELETE FROM messages WHERE conversation = ?")
+                .bind(bytes(target).to_vec())
+                .execute(&mut *tx)
+                .await?;
+            let state = ConversationState {
+                conversation_id: Some(target),
+                kind: Some(iam_protocol::pb::ConversationKind::Direct as i32),
+                history_id: progress.context.epoch.clone(),
+                access_version: progress.context.access_version,
+            };
+            sqlx::query("UPDATE conversations SET state = ? WHERE id = ?")
+                .bind(state.encode_to_vec())
+                .bind(bytes(target).to_vec())
+                .execute(&mut *tx)
+                .await?;
+        }
+        Self::stage_page(&mut tx, target, changes, Some(progress)).await?;
+        if let Some((first, last)) = gap {
+            merge_range(&mut tx, target, first, last, false).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn accepts_push(&mut self, target: u64, context: &StreamContext) -> Result<bool> {
+        let Some(progress) = self.progress(target).await? else {
+            return Ok(false);
+        };
+        if &progress.context != context {
+            return Ok(false);
+        }
+        let state: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?")
+                .bind(bytes(target).to_vec())
+                .fetch_optional(&mut self.db)
+                .await?;
+        let Some(state) = state else {
+            return Ok(false);
+        };
+        let state = ConversationState::decode(state.as_slice())?;
+        Ok(state.history_id == context.epoch && state.access_version == context.access_version)
+    }
+
+    pub async fn queue_history(&mut self, target: u64, first: u64, last: u64) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        merge_range(&mut tx, target, first, last, false).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn history_ranges(&mut self, target: u64) -> Result<Vec<HistoryRange>> {
+        let rows: Vec<(Vec<u8>, Vec<u8>, bool)> = sqlx::query_as(
+            "SELECT first, last, unavailable FROM history_ranges WHERE target = ? ORDER BY first",
+        )
+        .bind(bytes(target).to_vec())
+        .fetch_all(&mut self.db)
+        .await?;
+        rows.into_iter()
+            .map(|(first, last, unavailable)| {
+                Ok(HistoryRange {
+                    from: number(&first)?,
+                    through: number(&last)?,
+                    unavailable,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn history_page(
+        &mut self,
+        target: u64,
+        range: HistoryRange,
+        messages: Vec<MessageView>,
+        floor: u64,
+        remaining: Option<u64>,
+    ) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        for view in messages {
+            save_message(&mut tx, target, view).await?;
+        }
+        sqlx::query(
+            "DELETE FROM history_ranges WHERE target = ? AND first = ? AND unavailable = 0",
+        )
+        .bind(bytes(target).to_vec())
+        .bind(bytes(range.from).to_vec())
+        .execute(&mut *tx)
+        .await?;
+        if floor > range.from {
+            merge_range(
+                &mut tx,
+                target,
+                range.from,
+                range.through.min(floor - 1),
+                true,
+            )
+            .await?;
+        }
+        if let Some(last) = remaining {
+            merge_range(&mut tx, target, range.from.max(floor), last, false).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn recovery(&mut self, target: u64) -> Result<Option<Recovery>> {
         let row: Option<(i32, bool, bool)> = sqlx::query_as(
             "SELECT reason, data_loss_possible, pending FROM recoveries WHERE target = ?",
@@ -252,6 +387,7 @@ impl Storage {
                     "DELETE FROM conversations",
                     "DELETE FROM messages",
                     "DELETE FROM streams",
+                    "DELETE FROM history_ranges",
                 ] {
                     sqlx::query(statement).execute(&mut *tx).await?;
                 }
@@ -329,7 +465,8 @@ async fn save_conversation(
         if previous.history_id != state.history_id
             || previous.access_version != state.access_version
         {
-            clear_conversation(tx, id).await?;
+            // Keep the cursor until conversation SYNC can report why it is no longer valid.
+            clear_cached_history(tx, id).await?;
         }
     }
     sqlx::query(
@@ -351,15 +488,61 @@ async fn clear_conversation(tx: &mut Transaction<'_, Sqlite>, id: u64) -> Result
 }
 
 async fn clear_view(tx: &mut Transaction<'_, Sqlite>, id: u64) -> Result<()> {
+    sqlx::query("DELETE FROM streams WHERE target = ?")
+        .bind(bytes(id).to_vec())
+        .execute(&mut **tx)
+        .await?;
+    clear_cached_history(tx, id).await
+}
+
+async fn clear_cached_history(tx: &mut Transaction<'_, Sqlite>, id: u64) -> Result<()> {
     for statement in [
         "DELETE FROM messages WHERE conversation = ?",
-        "DELETE FROM streams WHERE target = ?",
+        "DELETE FROM history_ranges WHERE target = ?",
     ] {
         sqlx::query(statement)
             .bind(bytes(id).to_vec())
             .execute(&mut **tx)
             .await?;
     }
+    Ok(())
+}
+
+async fn merge_range(
+    tx: &mut Transaction<'_, Sqlite>,
+    target: u64,
+    first: u64,
+    last: u64,
+    unavailable: bool,
+) -> Result<()> {
+    let target = bytes(target).to_vec();
+    let adjacent_first = bytes(first.saturating_sub(1)).to_vec();
+    let adjacent_last = bytes(last.saturating_add(1)).to_vec();
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT first, last FROM history_ranges WHERE target = ? AND unavailable = ?
+         AND first <= ? AND last >= ?",
+    )
+    .bind(&target)
+    .bind(unavailable)
+    .bind(&adjacent_last)
+    .bind(&adjacent_first)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut merged = (first, last);
+    for (first, last) in rows {
+        merged.0 = merged.0.min(number(&first)?);
+        merged.1 = merged.1.max(number(&last)?);
+    }
+    sqlx::query("DELETE FROM history_ranges WHERE target = ? AND unavailable = ? AND first <= ? AND last >= ?")
+        .bind(&target).bind(unavailable).bind(adjacent_last).bind(adjacent_first)
+        .execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO history_ranges VALUES (?, ?, ?, ?)")
+        .bind(target)
+        .bind(bytes(merged.0).to_vec())
+        .bind(bytes(merged.1).to_vec())
+        .bind(unavailable)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 

@@ -8,9 +8,9 @@ use commit_proxy::{CommitPhase, CommitProxy};
 use iam_client::{Client, Identity, Options, Submission, Transport};
 use iam_core::{Engine, TokenSigner};
 use iam_protocol::pb::{
-    change, message_content, send_outcome, snapshot_response, sync_response, sync_target,
-    AuthRequest, ErrorCode, Head, MessageContent, MessageKey, ResetReason, SendRequest,
-    SendStatusRequest, TextContent,
+    change, history_response, message_content, send_outcome, snapshot_response, sync_response,
+    sync_target, AuthRequest, ErrorCode, Head, HistoryRequest, MessageContent, MessageKey,
+    PageLimit, ResetReason, SendRequest, SendStatusRequest, TextContent,
 };
 use iam_protocol::{
     decode_frame, encode_frame, generate_id128, DecodedBody, Frame, FrameDecoder, Id128, MsgType,
@@ -307,6 +307,8 @@ enum Fault {
     BeforeSend,
     AfterSend,
     ExpirePage(MySqlPool),
+    LoseHistoryRequest,
+    ExpireHistoryPage(MySqlPool),
 }
 
 #[derive(Debug, PartialEq)]
@@ -327,6 +329,7 @@ enum Event {
     Reply(Box<DecodedBody>),
     Idle,
     Inbound,
+    LostHistoryRequest,
 }
 
 struct LocalTransport {
@@ -336,6 +339,7 @@ struct LocalTransport {
     devices: Vec<Id128>,
     sends: Vec<SendCall>,
     syncs: Vec<SyncCall>,
+    history: Vec<HistoryRequest>,
     fault: Option<Fault>,
     events: mpsc::UnboundedSender<Event>,
     inbound: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
@@ -375,11 +379,7 @@ impl Transport for LocalTransport {
                     let Some(Fault::ExpirePage(db)) = self.fault.take() else {
                         unreachable!()
                     };
-                    // Advance the real TiDB clock watermark past the page token's lifetime.
-                    // The saved incremental cursor remains valid.
-                    sqlx::query("UPDATE store_control SET max_observed_now_ms = max_observed_now_ms + 960000,
-                        closed_through_client_ms = closed_through_client_ms + 960000 WHERE singleton = 1")
-                        .execute(&db).await.unwrap();
+                    advance_page_clock(&db).await;
                 }
                 self.syncs.push(SyncCall {
                     target: match sync.target.unwrap().value.unwrap() {
@@ -391,9 +391,32 @@ impl Transport for LocalTransport {
                 });
                 None
             }
+            DecodedBody::History(history) => {
+                self.history.push(history.clone());
+                if matches!(self.fault, Some(Fault::LoseHistoryRequest)) {
+                    self.fault.take();
+                    self.events.send(Event::LostHistoryRequest).unwrap();
+                    return Err(io::ErrorKind::ConnectionReset.into());
+                }
+                if history.page_token.is_some()
+                    && matches!(self.fault, Some(Fault::ExpireHistoryPage(_)))
+                {
+                    let Some(Fault::ExpireHistoryPage(db)) = self.fault.take() else {
+                        unreachable!()
+                    };
+                    advance_page_clock(&db).await;
+                }
+                None
+            }
             _ => None,
         };
-        let fault = send_key.as_ref().and_then(|_| self.fault.take());
+        let fault = if send_key.is_some()
+            && matches!(self.fault, Some(Fault::BeforeSend | Fault::AfterSend))
+        {
+            self.fault.take()
+        } else {
+            None
+        };
         if matches!(fault, Some(Fault::BeforeSend)) {
             self.events
                 .send(Event::DroppedSend(send_key.unwrap()))
@@ -455,6 +478,7 @@ impl Running {
             devices: Vec::new(),
             sends: Vec::new(),
             syncs: Vec::new(),
+            history: Vec::new(),
             fault,
             events: event_tx,
             inbound: incoming,
@@ -520,24 +544,7 @@ impl Running {
         let Some(iam_protocol::pb::auth_response::Value::Session(session)) = auth.value else {
             panic!("expected session");
         };
-        let Event::Reply(snapshot) = self
-            .wait_for(|event| {
-                matches!(event,
-            Event::Reply(body) if matches!(body.as_ref(), DecodedBody::SnapshotAck(ack)
-                if matches!(&ack.value, Some(snapshot_response::Value::Page(page))
-                    if matches!(&page.context.as_ref().unwrap().target.as_ref().unwrap().value,
-                        Some(sync_target::Value::Conversation(1))))))
-            })
-            .await
-        else {
-            unreachable!()
-        };
-        let DecodedBody::SnapshotAck(snapshot) = *snapshot else {
-            unreachable!()
-        };
-        let Some(snapshot_response::Value::Page(page)) = snapshot.value else {
-            unreachable!()
-        };
+        let page = wait_conversation_snapshot(self, 1).await;
         (
             session.connection_id.unwrap().as_ref().try_into().unwrap(),
             page.resume_cursor.unwrap().to_vec(),
@@ -592,11 +599,18 @@ impl Sender {
     }
 
     async fn send_with_id(&mut self, id: Id128, text: &str) -> Pushes {
+        self.send_in(1, id, text).await
+    }
+
+    async fn send_in(&mut self, conversation: u64, id: Id128, text: &str) -> Pushes {
         let (response, pushes) = self
             .call(
                 MsgType::Send,
                 &SendRequest {
-                    key: Some(message_key(id)),
+                    key: Some(MessageKey {
+                        conversation_id: Some(conversation),
+                        ..message_key(id)
+                    }),
                     content: Some(MessageContent {
                         value: Some(message_content::Value::Text(TextContent {
                             text: Some(text.into()),
@@ -826,7 +840,7 @@ async fn tidb_client_recovers_conversations_while_the_account_cursor_is_expired(
         Some(iam_client::Recovery {
             reason: ResetReason::CursorExpired,
             data_loss_possible: false,
-            pending: true,
+            pending: false,
         })
     );
     assert_eq!(
@@ -999,4 +1013,495 @@ async fn tidb_client_recovers_after_service_crashes_between_commit_and_push() {
     assert_eq!(received.position, receipt.position);
     assert_eq!(received.accepted_at_ms, receipt.accepted_at_ms);
     assert_eq!(text(&received), CRASH_TEXT);
+}
+
+async fn advance_page_clock(db: &MySqlPool) {
+    // Move past the 15-minute page token lifetime while leaving incremental cursors valid.
+    sqlx::query(
+        "UPDATE store_control SET max_observed_now_ms = max_observed_now_ms + 960000,
+                 closed_through_client_ms = closed_through_client_ms + 960000 WHERE singleton = 1",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+async fn expire_local_cursor(path: &std::path::Path, pool: &MySqlPool, target: u64) {
+    let (token_key, now): (Vec<u8>, i64) = sqlx::query_as(
+        "SELECT token_key, max_observed_now_ms FROM store_control WHERE singleton = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let mut local =
+        SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new().filename(path))
+            .await
+            .unwrap();
+    let target = target.to_be_bytes().to_vec();
+    let cursor: Vec<u8> = sqlx::query_scalar("SELECT cursor FROM streams WHERE target = ?")
+        .bind(&target)
+        .fetch_one(&mut local)
+        .await
+        .unwrap();
+    let signer = TokenSigner::new(token_key.try_into().unwrap());
+    let mut cursor = signer.verify_cursor(&cursor, now).unwrap();
+    cursor.issued_at_ms = now - 31 * 86_400_000;
+    sqlx::query("UPDATE streams SET cursor = ? WHERE target = ?")
+        .bind(signer.sign_cursor(&cursor))
+        .bind(&target)
+        .execute(&mut local)
+        .await
+        .unwrap();
+    local.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_client_recovers_long_offline_history_after_restart_and_token_expiry() {
+    let database = support::isolated_database().await;
+    let service = open_server(
+        database.as_str(),
+        generate_id128(),
+        seeded(),
+        OpenMode::Initialize,
+    )
+    .await;
+    let pool = MySqlPool::connect(database.as_str()).await.unwrap();
+    let mut alice = sender(&service).await;
+    alice.send_text("1").await;
+    alice.send_text("2").await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bob.db");
+    let device = identity(200);
+    let client = Client::open(&path, device).await.unwrap();
+    let mut bob = Running::start(client, &service, b"bob", options(LONG_INTERVAL), None);
+    bob.initial_conversation_cursor().await;
+    bob.wait_for_idle().await;
+    let (mut client, _) = bob.stop().await;
+    assert_eq!(message_texts(&mut client, 1).await, ["1", "2"]);
+    drop(client);
+
+    for sequence in 3..=107 {
+        alice.send_text(&sequence.to_string()).await;
+    }
+    service
+        .lock()
+        .await
+        .set_retention_floor(1, 1, 5)
+        .await
+        .unwrap();
+    expire_local_cursor(&path, &pool, 1).await;
+
+    let client = Client::open(&path, device).await.unwrap();
+    let mut opts = options(LONG_INTERVAL);
+    opts.retry_min = Duration::from_secs(1);
+    opts.retry_max = opts.retry_min;
+    let mut bob = Running::start(
+        client,
+        &service,
+        b"bob",
+        opts,
+        Some(Fault::LoseHistoryRequest),
+    );
+    bob.wait_for(|event| matches!(event, Event::LostHistoryRequest))
+        .await;
+    let (mut client, _) = bob.stop().await;
+    let messages = message_texts(&mut client, 1).await;
+    assert_eq!(messages.len(), 100);
+    assert_eq!(messages.first().unwrap(), "8");
+    assert_eq!(messages.last().unwrap(), "107");
+    assert_eq!(
+        client.history_ranges(1).await.unwrap(),
+        [iam_client::HistoryRange {
+            from: 3,
+            through: 7,
+            unavailable: false,
+        }]
+    );
+    drop(client);
+
+    // New incremental messages remain available while the older range is still pending.
+    alice.send_text("108").await;
+    let client = Client::open(&path, device).await.unwrap();
+    let mut bob = Running::start(
+        client,
+        &service,
+        b"bob",
+        opts,
+        Some(Fault::LoseHistoryRequest),
+    );
+    bob.wait_for_sync_through(108).await;
+    bob.wait_for(|event| matches!(event, Event::LostHistoryRequest))
+        .await;
+    let (mut client, _) = bob.stop().await;
+    assert_eq!(message_texts(&mut client, 1).await.last().unwrap(), "108");
+    assert_eq!(
+        client.history_ranges(1).await.unwrap(),
+        [iam_client::HistoryRange {
+            from: 3,
+            through: 7,
+            unavailable: false,
+        }]
+    );
+    drop(client);
+
+    // The second snapshot starts at 9. Preserve the unfinished range and retrieve
+    // the previous window's first message on demand.
+    expire_local_cursor(&path, &pool, 1).await;
+    let mut client = Client::open(&path, device).await.unwrap();
+    client.request_history(1, 8, 8).await.unwrap();
+    let mut bob = Running::start(
+        client,
+        &service,
+        b"bob",
+        options(Duration::from_millis(200)),
+        Some(Fault::ExpireHistoryPage(pool)),
+    );
+    bob.wait_for(|event| {
+        matches!(event, Event::Reply(body)
+        if matches!(body.as_ref(), DecodedBody::HistoryAck(ack)
+            if matches!(&ack.value, Some(history_response::Value::Error(error))
+                if error.code() == ErrorCode::PageTokenExpired)))
+    })
+    .await;
+    bob.wait_for(|event| {
+        matches!(event, Event::Reply(body)
+        if matches!(body.as_ref(), DecodedBody::HistoryAck(ack)
+            if matches!(&ack.value, Some(history_response::Value::Page(page))
+                if page.messages.iter().any(|m| text(m) == "5"))))
+    })
+    .await;
+    bob.wait_for_idle().await;
+    let (mut client, wire) = bob.stop().await;
+    let calls: Vec<_> = wire
+        .history
+        .iter()
+        .map(|req| (req.before_create_seq, req.page_token.is_some()))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            (Some(9), false),
+            (None, true),
+            (Some(8), false),
+            (None, true),
+            (None, true)
+        ]
+    );
+    assert_eq!(
+        message_texts(&mut client, 1).await,
+        (5..=108).map(|n| n.to_string()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        client.history_ranges(1).await.unwrap(),
+        [iam_client::HistoryRange {
+            from: 3,
+            through: 4,
+            unavailable: true,
+        }]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_client_discovers_a_new_conversation_and_applies_membership_changes() {
+    let service = server().await;
+    let mut alice = sender(&service).await;
+    let dir = tempfile::tempdir().unwrap();
+    let device = identity(200);
+    let client = Client::open(dir.path().join("bob.db"), device)
+        .await
+        .unwrap();
+    let mut bob = Running::start(
+        client,
+        &service,
+        b"bob",
+        options(Duration::from_millis(150)),
+        None,
+    );
+    let (cid, _) = bob.initial_conversation_cursor().await;
+    bob.wait_for_idle().await;
+
+    service
+        .lock()
+        .await
+        .create_direct(1, 2, 100, 200)
+        .await
+        .unwrap();
+    let [(recipient, old_push)] = alice
+        .send_in(2, generate_id128(), "first")
+        .await
+        .try_into()
+        .expect("a push for the first message");
+    assert_eq!(recipient, cid);
+    let old_context = match decode_frame(&frame(&old_push)).unwrap().body {
+        DecodedBody::Push(push) => push.context.unwrap(),
+        _ => panic!("expected PUSH"),
+    };
+    // The first PUSH is dropped. The same online client discovers the conversation by account SYNC.
+    wait_conversation_snapshot(&mut bob, 2).await;
+    bob.wait_for_idle().await;
+    let (mut client, wire) = bob.stop().await;
+    assert_eq!(wire.connections, 1);
+    assert_eq!(message_texts(&mut client, 2).await, ["first"]);
+
+    alice.send_in(2, generate_id128(), "second").await;
+    let (mut reader, _) = authenticate(&service, b"bob", generate_id128()).await;
+    let mut request = HistoryRequest {
+        context: Some(old_context.clone()),
+        before_create_seq: None,
+        page_token: None,
+        limit: Some(PageLimit {
+            max_items: Some(1),
+            max_bytes: Some(256 * 1024),
+        }),
+    };
+    let (response, _) = reader.call(MsgType::History, &request).await;
+    let DecodedBody::HistoryAck(ack) = response else {
+        panic!("expected HISTORY_ACK");
+    };
+    let Some(history_response::Value::Page(page)) = ack.value else {
+        panic!("expected history page");
+    };
+    assert_eq!(text(&page.messages[0]), "second");
+    request.page_token = Some(page.next_page_token.unwrap());
+
+    service
+        .lock()
+        .await
+        .set_member_access(1, 2, 200, false)
+        .await
+        .unwrap();
+    assert!(alice
+        .send_in(2, generate_id128(), "while revoked")
+        .await
+        .is_empty());
+    let (response, _) = reader.call(MsgType::History, &request).await;
+    assert!(matches!(response, DecodedBody::HistoryAck(ack)
+        if matches!(&ack.value, Some(history_response::Value::Error(error))
+            if error.code() == ErrorCode::PermissionDenied)));
+
+    let mut bob = Running::start(client, &service, b"bob", options(LONG_INTERVAL), None);
+    bob.wait_for(|event| {
+        matches!(event, Event::Reply(body)
+        if matches!(body.as_ref(), DecodedBody::SyncAck(ack)
+            if matches!(&ack.value, Some(sync_response::Value::Page(page))
+                if page.changes.iter().any(|change|
+                    matches!(change.payload, Some(change::Payload::ConversationRemove(2)))))))
+    })
+    .await;
+    bob.wait_for_idle().await;
+    let (mut client, _) = bob.stop().await;
+    assert!(message_texts(&mut client, 2).await.is_empty());
+
+    service
+        .lock()
+        .await
+        .set_retention_floor(1, 2, 2)
+        .await
+        .unwrap();
+    service
+        .lock()
+        .await
+        .set_member_access(1, 2, 200, true)
+        .await
+        .unwrap();
+    let (response, _) = reader.call(MsgType::History, &request).await;
+    assert!(matches!(response, DecodedBody::HistoryAck(ack)
+        if matches!(&ack.value, Some(history_response::Value::Error(error))
+            if error.code() == ErrorCode::ContextChanged)));
+
+    let mut bob = Running::start(client, &service, b"bob", options(LONG_INTERVAL), None);
+    let restored = wait_conversation_snapshot(&mut bob, 2).await;
+    let restored_context = restored.context.unwrap();
+    assert_ne!(restored_context.access_version, old_context.access_version);
+    // Leave the old frame in flight. It is rejected by the restored access version.
+    bob.inbound.send(Ok(old_push)).unwrap();
+    bob.wait_for(|event| matches!(event, Event::Inbound)).await;
+    bob.wait_for_idle().await;
+    let (mut client, _) = bob.stop().await;
+    assert_eq!(
+        message_texts(&mut client, 2).await,
+        ["second", "while revoked"]
+    );
+}
+
+async fn wait_conversation_snapshot(
+    bob: &mut Running,
+    target: u64,
+) -> iam_protocol::pb::SnapshotPage {
+    let Event::Reply(body) = bob
+        .wait_for(|event| {
+            let Event::Reply(body) = event else {
+                return false;
+            };
+            let DecodedBody::SnapshotAck(ack) = body.as_ref() else {
+                return false;
+            };
+            let Some(snapshot_response::Value::Page(page)) = &ack.value else {
+                return false;
+            };
+            page.resume_cursor.is_some()
+                && matches!(page.context.as_ref().and_then(|ctx| ctx.target.as_ref())
+                .and_then(|target| target.value.as_ref()),
+                Some(sync_target::Value::Conversation(id)) if *id == target)
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    let DecodedBody::SnapshotAck(ack) = *body else {
+        unreachable!()
+    };
+    let Some(snapshot_response::Value::Page(page)) = ack.value else {
+        unreachable!()
+    };
+    page
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_reliability_mixed_load() {
+    use std::time::Instant;
+
+    const READERS: usize = 4;
+    const ROUNDS: usize = 100;
+    let database = support::isolated_database().await;
+    let store_id = generate_id128();
+    let mut engine = seeded();
+    engine.store.seed_direct(1, 2, 100, 200);
+    let authority = open_server(database.as_str(), store_id, engine, OpenMode::Initialize).await;
+    let mut writer = sender(&authority).await;
+    let baseline = measure_sends(&mut writer, 2 * ROUNDS).await;
+
+    let start = Arc::new(tokio::sync::Barrier::new(READERS + 1));
+    let mut readers = Vec::new();
+    for _ in 0..READERS {
+        // Independent pools exercise the shared TiDB control row rather than a harness mutex.
+        let service = open_server(database.as_str(), store_id, seeded(), OpenMode::Resume).await;
+        let device = generate_id128();
+        let (mut peer, _) = authenticate(&service, b"bob", device).await;
+        let account = initial_sync_request(
+            &mut peer,
+            sync_target::Value::Account(iam_protocol::pb::Empty {}),
+        )
+        .await;
+        let conversation =
+            initial_sync_request(&mut peer, sync_target::Value::Conversation(2)).await;
+        let start = start.clone();
+        readers.push(tokio::spawn(async move {
+            let mut auth_times = Vec::new();
+            let mut sync_times = Vec::new();
+            start.wait().await;
+            for _ in 0..ROUNDS {
+                let started = Instant::now();
+                let (mut peer, _) = authenticate(&service, b"bob", device).await;
+                auth_times.push(started.elapsed());
+                for request in [&account, &conversation] {
+                    let started = Instant::now();
+                    let (response, _) = peer.call(MsgType::Sync, request).await;
+                    sync_times.push(started.elapsed());
+                    assert!(matches!(response, DecodedBody::SyncAck(ack)
+                        if matches!(&ack.value, Some(sync_response::Value::Page(page)) if page.changes.is_empty())));
+                }
+            }
+            (auth_times, sync_times)
+        }));
+    }
+    start.wait().await;
+    let mixed = measure_sends(&mut writer, 2 * ROUNDS).await;
+    let mut auth_times = Vec::new();
+    let mut sync_times = Vec::new();
+    for reader in readers {
+        let (auth, sync) = reader.await.unwrap();
+        auth_times.extend(auth);
+        sync_times.extend(sync);
+    }
+    report_latency("baseline SEND", baseline.0);
+    report_latency("baseline SEND_STATUS", baseline.1);
+    report_latency("mixed SEND", mixed.0);
+    report_latency("mixed SEND_STATUS", mixed.1);
+    report_latency("mixed AUTH", auth_times);
+    report_latency("mixed empty SYNC", sync_times);
+}
+
+async fn initial_sync_request(
+    peer: &mut Sender,
+    target: sync_target::Value,
+) -> iam_protocol::pb::SyncRequest {
+    use iam_protocol::pb::{SnapshotRequest, SyncRequest, SyncTarget};
+
+    let mut request = SyncRequest {
+        target: Some(SyncTarget {
+            value: Some(target),
+        }),
+        limit: Some(PageLimit {
+            max_items: Some(100),
+            max_bytes: Some(256 * 1024),
+        }),
+        ..SyncRequest::default()
+    };
+    let (response, _) = peer.call(MsgType::Sync, &request).await;
+    let DecodedBody::SyncAck(ack) = response else {
+        panic!("expected SYNC_ACK");
+    };
+    let Some(sync_response::Value::Reset(reset)) = ack.value else {
+        panic!("expected initial reset");
+    };
+    let (response, _) = peer
+        .call(
+            MsgType::Snapshot,
+            &SnapshotRequest {
+                page_token: reset.snapshot_token,
+                limit: request.limit,
+            },
+        )
+        .await;
+    let DecodedBody::SnapshotAck(ack) = response else {
+        panic!("expected SNAPSHOT_ACK");
+    };
+    let Some(snapshot_response::Value::Page(page)) = ack.value else {
+        panic!("expected snapshot");
+    };
+    request.cursor = Some(page.resume_cursor.unwrap());
+    request
+}
+
+async fn measure_sends(peer: &mut Sender, count: usize) -> (Vec<Duration>, Vec<Duration>) {
+    use std::time::Instant;
+
+    let mut send_times = Vec::with_capacity(count);
+    let mut status_times = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = generate_id128();
+        let started = Instant::now();
+        peer.send_with_id(id, "load sample").await;
+        send_times.push(started.elapsed());
+        let started = Instant::now();
+        let (response, _) = peer
+            .call(
+                MsgType::SendStatus,
+                &SendStatusRequest {
+                    key: Some(message_key(id)),
+                },
+            )
+            .await;
+        status_times.push(started.elapsed());
+        assert!(matches!(response, DecodedBody::SendStatusAck(ack)
+            if matches!(ack.outcome.as_ref().unwrap().value, Some(send_outcome::Value::Committed(_)))));
+    }
+    (send_times, status_times)
+}
+
+fn report_latency(label: &str, mut durations: Vec<Duration>) {
+    durations.sort_unstable();
+    let millis = |percent: usize| {
+        durations[(durations.len() * percent).div_ceil(100) - 1].as_secs_f64() * 1_000.0
+    };
+    println!(
+        "{label}: n={} p50={:.2} ms p99={:.2} ms",
+        durations.len(),
+        millis(50),
+        millis(99)
+    );
 }

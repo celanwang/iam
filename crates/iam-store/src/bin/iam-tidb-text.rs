@@ -38,6 +38,12 @@ fn id(value: &str) -> Result<Id128, Box<dyn Error>> {
 async fn main() -> Result<(), Box<dyn Error>> {
     let url = required_env("IAM_TIDB_URL")?;
     let store_id = id(&required_env("IAM_STORE_ID")?)?;
+    let mode = required_env("IAM_TIDB_MODE")?;
+    if mode == "upgrade" {
+        TidbService::upgrade_local(&url, store_id).await?;
+        println!("TiDB storage upgraded");
+        return Ok(());
+    }
     let token = required_env("IAM_ACCESS_TOKEN")?;
     if token.is_empty() {
         return Err("IAM_ACCESS_TOKEN must be nonempty".into());
@@ -51,10 +57,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     engine
         .store
         .seed_direct(tenant, conversation, user, if user == 1 { 2 } else { 1 });
-    let mode = match std::env::var("IAM_TIDB_MODE").as_deref() {
-        Ok("fresh") => OpenMode::Initialize,
-        Ok("resume") => OpenMode::Resume,
-        _ => return Err("IAM_TIDB_MODE must be fresh or resume".into()),
+    let mode = match mode.as_str() {
+        "fresh" => OpenMode::Initialize,
+        "resume" => OpenMode::Resume,
+        _ => return Err("IAM_TIDB_MODE must be fresh, upgrade or resume".into()),
     };
     let mut service = TidbService::connect_local(&url, store_id, engine, mode).await?;
     println!("TiDB text console; mode={mode:?}");

@@ -25,7 +25,7 @@ impl Client {
         retry.map_or(Ok(()), Err)
     }
 
-    async fn sync_target(
+    pub(crate) async fn sync_target(
         &mut self,
         wire: &mut Wire<'_, impl Transport>,
         target: u64,
@@ -109,7 +109,7 @@ impl Client {
                     if saved.is_none() && reset.reason() == ResetReason::InitialSync =>
                 {
                     return self
-                        .snapshot(wire, target, reset.snapshot_token.as_deref())
+                        .snapshot(wire, target, reset.snapshot_token.as_deref(), None)
                         .await;
                 }
                 sync_response::Value::Reset(reset) => {
@@ -132,11 +132,11 @@ impl Client {
                             }),
                         )
                         .await?;
-                    if reason == ResetReason::CursorExpired {
-                        return Ok(());
-                    }
+                    let previous = saved
+                        .as_ref()
+                        .filter(|_| reason == ResetReason::CursorExpired);
                     return self
-                        .snapshot(wire, target, reset.snapshot_token.as_deref())
+                        .snapshot(wire, target, reset.snapshot_token.as_deref(), previous)
                         .await;
                 }
             }
@@ -148,6 +148,7 @@ impl Client {
         wire: &mut Wire<'_, impl Transport>,
         target: u64,
         token: Option<&[u8]>,
+        previous: Option<&Progress>,
     ) -> Result<()> {
         let mut request = SnapshotRequest {
             page_token: Some(nonempty(token)?.into()),
@@ -165,7 +166,12 @@ impl Client {
                 Some(snapshot_response::Value::Error(error)) => return Err(Error::Server(error)),
                 None => return Err(Error::Invalid("missing snapshot result")),
             };
-            let scope = (page.snapshot_id, page.context, page.upper_bound);
+            let scope = (
+                page.snapshot_id,
+                page.context,
+                page.upper_bound,
+                page.history_window,
+            );
             if snapshot.as_ref().is_some_and(|previous| *previous != scope) {
                 return Err(Error::Invalid("snapshot scope changed between pages"));
             }
@@ -200,7 +206,19 @@ impl Client {
                 None => {
                     let progress =
                         progress(target, scope.1, scope.2, page.resume_cursor.as_deref())?;
-                    return self.storage.apply(target, changes, Some(&progress)).await;
+                    let gap = previous.zip(scope.3).and_then(|(previous, window)| {
+                        let through = match window.from_create_seq {
+                            Some(0) => progress.covered,
+                            Some(start) => start - 1,
+                            None => return None,
+                        };
+                        (previous.context == progress.context && previous.covered < through)
+                            .then(|| (previous.covered + 1, through))
+                    });
+                    return self
+                        .storage
+                        .apply_snapshot(target, changes, &progress, gap)
+                        .await;
                 }
             }
         }
@@ -223,12 +241,7 @@ impl Client {
             // The next account SYNC applies membership changes in sequence.
             return Ok(());
         };
-        if self
-            .storage
-            .progress(*target)
-            .await?
-            .is_some_and(|saved| saved.context == context)
-        {
+        if self.storage.accepts_push(*target, &context).await? {
             self.storage.apply(*target, push.changes, None).await?;
         }
         Ok(())

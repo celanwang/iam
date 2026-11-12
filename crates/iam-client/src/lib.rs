@@ -1,9 +1,11 @@
 //! A durable, single-device text client. The caller supplies transport and credentials.
 
+mod history;
 mod storage;
 mod sync;
 mod wire;
 
+use history::HistoryRounds;
 use iam_protocol::pb::{
     message_content, send_outcome, ErrorCode, ErrorInfo, MessageContent, MessageKey, MessageView,
     ResetReason, RetryAction, SendOutcome, SendRequest, SendStatusRequest, TextContent,
@@ -57,6 +59,14 @@ pub struct Recovery {
     pub reason: ResetReason,
     pub data_loss_possible: bool,
     pub pending: bool,
+}
+
+/// An inclusive range awaiting history retrieval or confirmed below the retention floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryRange {
+    pub from: u64,
+    pub through: u64,
+    pub unavailable: bool,
 }
 
 /// Exchanges complete wire frames for a single logical connection. Implementations route pushes
@@ -160,6 +170,35 @@ impl Client {
         self.storage.recovery(target).await
     }
 
+    /// Queues an already synchronized range for on-demand retrieval on the next run.
+    pub async fn request_history(
+        &mut self,
+        conversation: u64,
+        from: u64,
+        through: u64,
+    ) -> Result<()> {
+        if conversation == 0
+            || from == 0
+            || through < from
+            || self
+                .storage
+                .progress(conversation)
+                .await?
+                .is_none_or(|p| through > p.covered)
+        {
+            return Err(Error::Invalid(
+                "history range outside the synchronized stream",
+            ));
+        }
+        self.storage
+            .queue_history(conversation, from, through)
+            .await
+    }
+
+    pub async fn history_ranges(&mut self, conversation: u64) -> Result<Vec<HistoryRange>> {
+        self.storage.history_ranges(conversation).await
+    }
+
     /// Runs while the application is in the foreground. Closing the submission channel stops it.
     /// Each new connection authenticates as the same device and starts an account-first sync.
     pub async fn run(
@@ -182,15 +221,18 @@ impl Client {
         let mut connect_at = Instant::now();
         let mut sync_at = connect_at;
         let mut send_at = connect_at;
+        let mut history_at = None;
+        let mut history_rounds = HistoryRounds::default();
         let mut reconnect_delay = options.retry_min;
         let mut sync_delay = options.retry_min;
         let mut send_delay = options.retry_min;
+        let mut history_delay = options.retry_min;
         loop {
             if submissions.is_closed() && submissions.is_empty() {
                 return Ok(());
             }
             let due = if online {
-                sync_at.min(send_at)
+                sync_at.min(send_at).min(history_at.unwrap_or(sync_at))
             } else {
                 connect_at
             };
@@ -206,18 +248,36 @@ impl Client {
                             send_at = sync_at;
                             sync_delay = options.retry_min;
                             send_delay = options.retry_min;
+                            history_at = None;
+                            history_delay = options.retry_min;
+                            history_rounds.clear();
                         }
                         result
-                    } else if sync_at <= send_at {
+                    } else if sync_at == due {
                         match self.synchronize(&mut wire).await {
                             Ok(()) => {
                                 sync_at = Instant::now() + options.sync_interval;
                                 sync_delay = options.retry_min;
                                 reconnect_delay = options.retry_min;
+                                history_at.get_or_insert_with(Instant::now);
                                 Ok(())
                             }
                             Err(error) if retryable(&error) => {
                                 sync_at = backoff(&mut sync_delay, options.retry_max, Some(&error));
+                                history_at.get_or_insert_with(Instant::now);
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else if history_at == Some(due) {
+                        match self.backfill(&mut wire, &mut history_rounds).await {
+                            Ok(more) => {
+                                history_at = more.then(|| Instant::now() + options.retry_min);
+                                history_delay = options.retry_min;
+                                Ok(())
+                            }
+                            Err(error) if retryable(&error) => {
+                                history_at = Some(backoff(&mut history_delay, options.retry_max, Some(&error)));
                                 Ok(())
                             }
                             Err(error) => Err(error),
@@ -382,7 +442,7 @@ fn disconnected(error: &Error) -> bool {
 fn retryable(error: &Error) -> bool {
     matches!(error, Error::Server(info)
         if matches!(info.code(), ErrorCode::RateLimited | ErrorCode::Overloaded | ErrorCode::ResultUnavailable | ErrorCode::InternalError)
-            || matches!(info.action(), RetryAction::RestartSync | RetryAction::ResumeSync))
+            || matches!(info.action(), RetryAction::RestartSync | RetryAction::ResumeSync | RetryAction::RestartHistory))
 }
 
 fn backoff(delay: &mut Duration, max: Duration, error: Option<&Error>) -> Instant {
@@ -390,7 +450,9 @@ fn backoff(delay: &mut Duration, max: Duration, error: Option<&Error>) -> Instan
         Some(Error::Server(info)) => Duration::from_millis(info.retry_after_ms.unwrap_or(0).into()),
         _ => Duration::ZERO,
     };
-    let due = Instant::now() + (*delay).max(suggested).min(max);
+    let jitter = (*delay / 4).saturating_mul(u32::from(generate_id128()[15])) / 255;
+    let local = delay.saturating_add(jitter).min(max);
+    let due = Instant::now() + local.max(suggested.saturating_add(jitter));
     *delay = delay.saturating_mul(2).min(max);
     due
 }

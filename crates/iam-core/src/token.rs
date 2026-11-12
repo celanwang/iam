@@ -423,6 +423,18 @@ impl TokenSigner {
     }
 
     pub fn verify_history(&self, bytes: &[u8], now_ms: i64) -> Result<HistoryToken, TokenError> {
+        let (token, expired) = self.verify_history_with_expiry(bytes, now_ms)?;
+        if expired {
+            return Err(TokenError::Expired);
+        }
+        Ok(token)
+    }
+
+    pub fn verify_history_with_expiry(
+        &self,
+        bytes: &[u8],
+        now_ms: i64,
+    ) -> Result<(HistoryToken, bool), TokenError> {
         let payload = self.verify_prefix(bytes, b"hi01")?;
         if payload.len() != 4 + 4 + 8 + 8 + 16 + 8 + 16 + 8 + 8 + 8 + 8 + 8 + 8 {
             return Err(TokenError::Invalid);
@@ -446,26 +458,26 @@ impl TokenSigner {
         if round_started_ms < 0 || round_started_ms > now_ms {
             return Err(TokenError::Invalid);
         }
-        if now_ms
+        let expired = now_ms
             >= round_started_ms
                 .checked_add(PAGE_TTL_MS)
-                .ok_or(TokenError::Invalid)?
-        {
-            return Err(TokenError::Expired);
-        }
-        Ok(HistoryToken {
-            tenant_id,
-            user_id,
-            device_id,
-            conversation_id,
-            epoch,
-            access_version,
-            before_create_seq,
-            upper_bound,
-            retention_floor_seq,
-            scanned_through_seq,
-            round_started_ms,
-        })
+                .ok_or(TokenError::Invalid)?;
+        Ok((
+            HistoryToken {
+                tenant_id,
+                user_id,
+                device_id,
+                conversation_id,
+                epoch,
+                access_version,
+                before_create_seq,
+                upper_bound,
+                retention_floor_seq,
+                scanned_through_seq,
+                round_started_ms,
+            },
+            expired,
+        ))
     }
 }
 

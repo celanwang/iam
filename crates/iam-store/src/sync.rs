@@ -1,13 +1,14 @@
 use crate::store::{Scope, Stream, TidbStore};
 use crate::{Error, Identity};
-use iam_core::{Engine, SnapshotToken, SyncCursor, SyncPageToken};
+use iam_core::{Engine, HistoryToken, SnapshotToken, SyncCursor, SyncPageToken};
 use iam_protocol::pb::{
-    change, snapshot_item, snapshot_response, sync_response, sync_target, Change, ErrorCode,
-    HistoryWindow, ResetReason, ResetRequired, RetryAction, SnapshotItem, SnapshotPage,
-    SnapshotRequest, SyncPage, SyncRequest,
+    change, history_response, snapshot_item, snapshot_response, sync_response, sync_target,
+    ErrorCode, HistoryPage, HistoryRequest, HistoryWindow, ResetReason, ResetRequired, RetryAction,
+    SnapshotItem, SnapshotPage, SnapshotRequest, SyncPage, SyncRequest,
 };
-use iam_protocol::{error_info, generate_id128};
+use iam_protocol::{error_info, generate_id128, validate_id128};
 use prost::Message;
+use sqlx::MySqlConnection;
 
 type ReadError = (ErrorCode, RetryAction);
 type ReadResult<T> = Result<T, ReadError>;
@@ -32,7 +33,7 @@ impl ReadContext {
             device_id: self.identity.device_id,
             conversation_id: self.stream.scope.conversation_id(),
             epoch: self.stream.epoch,
-            access_version: self.stream.scope.access_version(),
+            access_version: self.stream.access_version,
             covered_through: covered,
             issued_at_ms: self.now,
             is_account: self.stream.scope == Scope::Account,
@@ -56,15 +57,31 @@ struct Round {
 
 impl TidbStore {
     pub async fn sync(&self, identity: Identity, request: &SyncRequest) -> sync_response::Value {
-        self.sync_page(identity, request)
+        self.read_sync(identity, request)
             .await
             .unwrap_or_else(|(code, action)| sync_response::Value::Error(error_info(code, action)))
     }
 
-    async fn sync_page(
+    async fn read_sync(
         &self,
         identity: Identity,
         request: &SyncRequest,
+    ) -> ReadResult<sync_response::Value> {
+        let now = self.now().await.map_err(read_error)?;
+        let mut tx = self.begin_read().await.map_err(read_error)?;
+        let page = self.sync_page(&mut tx, identity, request, now).await;
+        tx.commit()
+            .await
+            .map_err(|error| read_error(error.into()))?;
+        page
+    }
+
+    async fn sync_page(
+        &self,
+        db: &mut MySqlConnection,
+        identity: Identity,
+        request: &SyncRequest,
+        now: i64,
     ) -> ReadResult<sync_response::Value> {
         if request.cursor.is_some() && request.page_token.is_some() {
             return Err(INVALID_ARGUMENT);
@@ -79,7 +96,7 @@ impl TidbStore {
             Some(sync_target::Value::Conversation(id)) if *id != 0 => Scope::Conversation(*id),
             _ => return Err(INVALID_ARGUMENT),
         };
-        let read = self.read_context(identity, scope).await?;
+        let read = self.read_context(db, identity, scope, now).await?;
         let (cursor, expired, round) = if let Some(token) = &request.page_token {
             let (page, expired) = self
                 .tokens
@@ -120,37 +137,19 @@ impl TidbStore {
         if cursor.epoch != read.stream.epoch || beyond_end {
             return Ok(self.reset(&read, ResetReason::HistoryReset, beyond_end));
         }
-        if cursor.access_version != scope.access_version() {
+        if cursor.access_version != read.stream.access_version {
             return Ok(self.reset(&read, ResetReason::AccessChanged, false));
         }
-        if expired {
+        if expired || round.after < read.stream.floor - 1 {
             return if is_page {
                 Err((ErrorCode::PageTokenExpired, RetryAction::ResumeSync))
             } else {
                 Ok(self.reset(&read, ResetReason::CursorExpired, false))
             };
         }
-        let entries = self
-            .entries(identity, scope, round.after, round.upper, items)
+        let changes = Self::changes(db, identity, scope, round.after, round.upper, items)
             .await
             .map_err(read_error)?;
-        let changes = entries
-            .into_iter()
-            .map(|entry| {
-                let payload = match entry.item {
-                    snapshot_item::Value::Conversation(state) => {
-                        change::Payload::ConversationUpsert(state)
-                    }
-                    snapshot_item::Value::Message(message) => {
-                        change::Payload::MessageUpsert(message)
-                    }
-                };
-                Change {
-                    event_seq: Some(entry.sequence),
-                    payload: Some(payload),
-                }
-            })
-            .collect();
         let mut page = SyncPage {
             context: Some(read.stream.context()),
             upper_bound: Some(round.upper),
@@ -189,7 +188,7 @@ impl TidbStore {
         loss_possible: bool,
     ) -> sync_response::Value {
         let cursor = read.cursor(0);
-        let (from, through) = snapshot_window(read.stream.scope, read.stream.upper);
+        let (from, through) = snapshot_window(&read.stream, read.stream.upper);
         let token = SnapshotToken {
             tenant_id: cursor.tenant_id,
             user_id: cursor.user_id,
@@ -217,21 +216,36 @@ impl TidbStore {
         identity: Identity,
         request: &SnapshotRequest,
     ) -> snapshot_response::Value {
-        self.snapshot_page(identity, request)
+        self.read_snapshot(identity, request)
             .await
             .unwrap_or_else(|(code, action)| {
                 snapshot_response::Value::Error(error_info(code, action))
             })
     }
 
-    async fn snapshot_page(
+    async fn read_snapshot(
         &self,
         identity: Identity,
         request: &SnapshotRequest,
     ) -> ReadResult<snapshot_response::Value> {
+        let now = self.now().await.map_err(read_error)?;
+        let mut tx = self.begin_read().await.map_err(read_error)?;
+        let page = self.snapshot_page(&mut tx, identity, request, now).await;
+        tx.commit()
+            .await
+            .map_err(|error| read_error(error.into()))?;
+        page
+    }
+
+    async fn snapshot_page(
+        &self,
+        db: &mut MySqlConnection,
+        identity: Identity,
+        request: &SnapshotRequest,
+        now: i64,
+    ) -> ReadResult<snapshot_response::Value> {
         let (items, bytes) = Engine::require_page_limit(&request.limit)?;
         let token = request.page_token.as_ref().ok_or(INVALID_ARGUMENT)?;
-        let now = self.now().await.map_err(read_error)?;
         let (mut snap, expired) = self
             .tokens
             .verify_snapshot_with_expiry(token, now)
@@ -248,31 +262,56 @@ impl TidbStore {
         } else {
             Scope::Conversation(snap.conversation_id)
         };
-        let read = ReadContext {
-            identity,
-            stream: self.stream(identity, scope).await.map_err(read_error)?,
-            now,
-        };
-        if snap.epoch != read.stream.epoch || snap.access_version != scope.access_version() {
+        let read = self.read_context(db, identity, scope, now).await?;
+        if snap.epoch != read.stream.epoch
+            || snap.access_version != read.stream.access_version
+            || (scope == Scope::Account && snap.upper_bound != read.stream.upper)
+        {
             return Err((ErrorCode::ContextChanged, RetryAction::RestartSync));
         }
         if expired || snap.upper_bound > read.stream.upper {
             return Err((ErrorCode::PageTokenExpired, RetryAction::RestartSync));
         }
-        let (from, through) = snapshot_window(scope, snap.upper_bound);
+        let (from, through) = snapshot_window(&read.stream, snap.upper_bound);
         if (snap.from_create_seq, snap.through_create_seq) != (from, through) {
-            return Err(INVALID_SNAPSHOT);
+            return Err((ErrorCode::ContextChanged, RetryAction::RestartSync));
         }
         let start = snap.scanned_items;
-        let after = from
-            .saturating_sub(1)
-            .checked_add(start)
-            .filter(|position| *position <= snap.upper_bound)
-            .ok_or(INVALID_SNAPSHOT)?;
-        let entries = self
-            .entries(identity, scope, after, snap.upper_bound, items)
-            .await
-            .map_err(read_error)?;
+        let (mut entries, has_more) = if scope == Scope::Account {
+            let states = Self::account_snapshot(db, identity, start, items + 1)
+                .await
+                .map_err(read_error)?;
+            let more = states.len() > items;
+            (
+                states
+                    .into_iter()
+                    .take(items)
+                    .map(snapshot_item::Value::Conversation)
+                    .collect::<Vec<_>>(),
+                more,
+            )
+        } else {
+            let after = from
+                .saturating_sub(1)
+                .checked_add(start)
+                .filter(|position| *position <= through)
+                .ok_or(INVALID_SNAPSHOT)?;
+            let changes = Self::changes(db, identity, scope, after, through, items)
+                .await
+                .map_err(read_error)?;
+            let more = after + (changes.len() as u64) < through;
+            let entries = changes
+                .into_iter()
+                .map(|change| match change.payload {
+                    Some(change::Payload::MessageUpsert(view)) => {
+                        Ok(snapshot_item::Value::Message(view))
+                    }
+                    _ => Err(INVALID_SNAPSHOT),
+                })
+                .collect::<ReadResult<Vec<_>>>()?;
+            (entries, more)
+        };
+        let initial_items = entries.len();
         let mut page = SnapshotPage {
             snapshot_id: Some(snap.snapshot_id.to_vec().into()),
             context: Some(read.stream.context()),
@@ -282,16 +321,14 @@ impl TidbStore {
                 through_create_seq: Some(through),
             }),
             items: entries
-                .into_iter()
-                .map(|entry| SnapshotItem {
-                    value: Some(entry.item),
-                })
+                .drain(..)
+                .map(|entry| SnapshotItem { value: Some(entry) })
                 .collect(),
             ..Default::default()
         };
         loop {
             let size = page.items.len() as u64;
-            let done = after + size == snap.upper_bound;
+            let done = !has_more && page.items.len() == initial_items;
             snap.scanned_items = start + size;
             page.next_page_token = (!done).then(|| self.tokens.sign_snapshot(&snap).into());
             page.resume_cursor = done.then(|| {
@@ -309,9 +346,145 @@ impl TidbStore {
         }
     }
 
-    async fn read_context(&self, identity: Identity, scope: Scope) -> ReadResult<ReadContext> {
+    pub async fn history(
+        &self,
+        identity: Identity,
+        request: &HistoryRequest,
+    ) -> history_response::Value {
+        self.read_history(identity, request)
+            .await
+            .map(history_response::Value::Page)
+            .unwrap_or_else(|(code, action)| {
+                history_response::Value::Error(error_info(code, action))
+            })
+    }
+
+    async fn read_history(
+        &self,
+        identity: Identity,
+        request: &HistoryRequest,
+    ) -> ReadResult<HistoryPage> {
+        let (items, bytes) = Engine::require_page_limit(&request.limit)?;
+        let context = request.context.as_ref().ok_or(INVALID_ARGUMENT)?;
+        let Some(sync_target::Value::Conversation(conversation)) = context
+            .target
+            .as_ref()
+            .and_then(|target| target.value.as_ref())
+        else {
+            return Err(INVALID_ARGUMENT);
+        };
+        if *conversation == 0
+            || context.access_version.unwrap_or(0) == 0
+            || validate_id128(context.epoch.as_deref().unwrap_or_default()).is_err()
+            || request.before_create_seq == Some(0)
+            || (request.before_create_seq.is_some() && request.page_token.is_some())
+        {
+            return Err(INVALID_ARGUMENT);
+        }
         let now = self.now().await.map_err(read_error)?;
-        let stream = self.stream(identity, scope).await.map_err(read_error)?;
+        let mut tx = self.begin_read().await.map_err(read_error)?;
+        let read = self
+            .read_context(&mut tx, identity, Scope::Conversation(*conversation), now)
+            .await?;
+        if *context != read.stream.context() {
+            return Err((ErrorCode::ContextChanged, RetryAction::RestartSync));
+        }
+        let invalid = (ErrorCode::InvalidToken, RetryAction::RestartHistory);
+        let expired = (ErrorCode::PageTokenExpired, RetryAction::RestartHistory);
+        let mut token = if let Some(bytes) = &request.page_token {
+            let (token, token_expired) = self
+                .tokens
+                .verify_history_with_expiry(bytes, now)
+                .map_err(|_| invalid)?;
+            if token.tenant_id != identity.tenant_id
+                || token.user_id != identity.user_id
+                || token.device_id != identity.device_id
+                || token.conversation_id != *conversation
+            {
+                return Err(invalid);
+            }
+            if token.epoch != read.stream.epoch
+                || token.access_version != read.stream.access_version
+            {
+                return Err((ErrorCode::ContextChanged, RetryAction::RestartSync));
+            }
+            if token_expired
+                || token.upper_bound > read.stream.upper
+                || token.retention_floor_seq != read.stream.floor
+            {
+                return Err(expired);
+            }
+            token
+        } else {
+            let before = request.before_create_seq.unwrap_or(u64::MAX);
+            HistoryToken {
+                tenant_id: identity.tenant_id,
+                user_id: identity.user_id,
+                device_id: identity.device_id,
+                conversation_id: *conversation,
+                epoch: read.stream.epoch,
+                access_version: read.stream.access_version,
+                before_create_seq: before,
+                upper_bound: read.stream.upper,
+                retention_floor_seq: read.stream.floor,
+                scanned_through_seq: before,
+                round_started_ms: now,
+            }
+        };
+        let mut messages = Self::history_messages(
+            &mut tx,
+            identity,
+            &read.stream,
+            token.scanned_through_seq,
+            token.upper_bound,
+            items + 1,
+        )
+        .await
+        .map_err(read_error)?;
+        tx.commit()
+            .await
+            .map_err(|error| read_error(error.into()))?;
+        let available = messages.len();
+        messages.truncate(items);
+        let mut page = HistoryPage {
+            context: Some(read.stream.context()),
+            upper_bound: Some(token.upper_bound),
+            retention_floor_seq: Some(token.retention_floor_seq),
+            messages,
+            next_page_token: None,
+        };
+        loop {
+            page.next_page_token = if page.messages.len() < available {
+                token.scanned_through_seq = page
+                    .messages
+                    .last()
+                    .and_then(|message| message.position.as_ref())
+                    .and_then(|position| position.create_seq)
+                    .ok_or(BUDGET_TOO_SMALL)?;
+                Some(self.tokens.sign_history(&token).into())
+            } else {
+                None
+            };
+            if fits(&page, bytes) {
+                return Ok(page);
+            }
+            if page.messages.pop().is_none() {
+                return Err(BUDGET_TOO_SMALL);
+            }
+        }
+    }
+
+    async fn read_context(
+        &self,
+        db: &mut MySqlConnection,
+        identity: Identity,
+        scope: Scope,
+        now: i64,
+    ) -> ReadResult<ReadContext> {
+        let stream = self
+            .read_stream(db, identity, scope)
+            .await
+            .map_err(read_error)?;
         Ok(ReadContext {
             identity,
             stream,
@@ -320,11 +493,11 @@ impl TidbStore {
     }
 }
 
-fn snapshot_window(scope: Scope, upper: u64) -> (u64, u64) {
-    if scope == Scope::Account || upper == 0 {
+fn snapshot_window(stream: &Stream, upper: u64) -> (u64, u64) {
+    if stream.scope == Scope::Account || upper < stream.floor {
         (0, 0)
     } else {
-        (upper.saturating_sub(99).max(1), upper)
+        (upper.saturating_sub(99).max(stream.floor), upper)
     }
 }
 

@@ -2,8 +2,9 @@ use crate::store::{unresolved, Decision, Scope, SendKey, TidbStore};
 use crate::{ConversationInfo, Error, Identity, Result, TextPage};
 use iam_core::{CoreError, Engine, EngineOutput, EngineReply, StorageRequest};
 use iam_protocol::pb::{
-    change, message_content, send_outcome, Change, ErrorCode, MessageContent, MessageKey,
-    RetryAction, SendOutcome, SendResponse, SendStatusResponse, SnapshotResponse, SyncResponse,
+    change, message_content, send_outcome, Change, ErrorCode, HistoryResponse, MessageContent,
+    MessageKey, RetryAction, SendOutcome, SendResponse, SendStatusResponse, SnapshotResponse,
+    SyncResponse,
 };
 use iam_protocol::{
     decode_frame, encode_frame, encode_protocol_error, validate_id128, DecodedBody, DecodedFrame,
@@ -27,6 +28,49 @@ pub struct TidbService {
 }
 
 impl TidbService {
+    /// Upgrade a stopped local store from the initial schema, keeping its identity and cursors.
+    pub async fn upgrade_local(url: &str, store_id: Id128) -> Result<()> {
+        TidbStore::upgrade(url, store_id).await
+    }
+
+    /// Trusted application operation. Wire clients cannot create conversations through this API.
+    pub async fn create_direct(
+        &self,
+        tenant: u64,
+        conversation: u64,
+        a: u64,
+        b: u64,
+    ) -> Result<()> {
+        self.database
+            .create_direct(tenant, conversation, a, b)
+            .await
+    }
+
+    /// Trusted application operation for the original participants of a direct conversation.
+    pub async fn set_member_access(
+        &self,
+        tenant: u64,
+        conversation: u64,
+        user: u64,
+        allow: bool,
+    ) -> Result<()> {
+        self.database
+            .set_member_access(tenant, conversation, user, allow)
+            .await
+    }
+
+    /// Advance the oldest readable message position while retaining records for send deduplication.
+    pub async fn set_retention_floor(
+        &self,
+        tenant: u64,
+        conversation: u64,
+        floor: u64,
+    ) -> Result<()> {
+        self.database
+            .set_retention_floor(tenant, conversation, floor)
+            .await
+    }
+
     pub async fn connect_local(
         url: &str,
         store_id: Id128,
@@ -171,6 +215,15 @@ impl TidbService {
                     &SnapshotResponse { value: Some(value) },
                 )
             }
+            DecodedBody::History(req) => {
+                let value = self.database.history(identity, req).await;
+                reply(
+                    cid,
+                    &decoded,
+                    MsgType::HistoryAck,
+                    &HistoryResponse { value: Some(value) },
+                )
+            }
             _ => wire_error(cid, &decoded, ErrorCode::UnsupportedCommand),
         }
     }
@@ -240,14 +293,18 @@ impl TidbService {
                 payload: Some(change::Payload::MessageUpsert(delivery.message)),
             };
             // The response and the durable change are available even if push encoding fails.
-            let _ = self.engine.push_change(
-                &mut output,
-                cid,
-                identity.tenant_id,
-                &delivery.members,
-                &delivery.stream.context(),
-                &change,
-            );
+            let mut stream = delivery.stream;
+            for (user, version) in delivery.members {
+                stream.access_version = version;
+                let _ = self.engine.push_change(
+                    &mut output,
+                    cid,
+                    identity.tenant_id,
+                    &[user],
+                    &stream.context(),
+                    &change,
+                );
+            }
         }
         Ok((cid_out, output))
     }
