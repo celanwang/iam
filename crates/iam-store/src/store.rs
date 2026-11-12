@@ -3,15 +3,15 @@ use crate::{
 };
 use iam_core::{MemoryStore, TokenSigner, ACCEPT_WINDOW_MS, ALLOW_SKEW_MS};
 use iam_protocol::pb::{
-    message_content, send_outcome, snapshot_item, sync_target, ConversationKind, ConversationState,
-    Empty, ErrorCode, MessageContent, MessageView, RetryAction, SendOutcome, SendUnresolved,
+    change, message_content, send_outcome, sync_target, ConversationKind, ConversationState, Empty,
+    ErrorCode, MessageContent, MessageView, RetryAction, SendOutcome, SendUnresolved,
     StreamContext, SyncTarget,
 };
 use iam_protocol::{
     error_info, generate_id128, validate_id128, validate_message_content, Id128, ProtocolErrorKind,
 };
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow};
-use sqlx::{ConnectOptions, MySql, MySqlPool, Row, Transaction};
+use sqlx::{ConnectOptions, MySql, MySqlConnection, MySqlPool, Row, Transaction};
 use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
@@ -21,6 +21,10 @@ use std::{
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[path = "membership.rs"]
+mod membership;
+use membership::write_account_event;
 
 const CLOCK_SQL: &str = "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)";
 
@@ -32,13 +36,15 @@ const MESSAGES: &str = "SELECT m.conversation_id, m.message_id, m.user_id, m.`se
 const CONTROL: &str = "SELECT store_id, token_key, max_observed_now_ms, closed_through_client_ms \
                        FROM store_control WHERE singleton = 1 FOR UPDATE";
 
-const ACCESS_VERSION: u64 = 1;
-const TABLES: [&str; 5] = [
+const INITIAL_ACCESS: u64 = 1;
+const TABLES: [&str; 7] = [
     "store_control",
     "conversations",
     "messages",
     "rejections",
     "members",
+    "account_events",
+    "conversation_retention",
 ];
 
 struct DecisionClock {
@@ -76,19 +82,14 @@ impl Scope {
             Self::Conversation(id) => id,
         }
     }
-
-    pub fn access_version(self) -> u64 {
-        match self {
-            Self::Account => 0,
-            Self::Conversation(_) => ACCESS_VERSION,
-        }
-    }
 }
 
 pub(crate) struct Stream {
     pub scope: Scope,
     pub epoch: Id128,
     pub upper: u64,
+    pub access_version: u64,
+    pub floor: u64,
 }
 
 impl Stream {
@@ -102,14 +103,9 @@ impl Stream {
                 value: Some(target),
             }),
             epoch: Some(self.epoch.to_vec().into()),
-            access_version: (self.scope != Scope::Account).then_some(self.scope.access_version()),
+            access_version: (self.scope != Scope::Account).then_some(self.access_version),
         }
     }
-}
-
-pub(crate) struct Entry {
-    pub sequence: u64,
-    pub item: snapshot_item::Value,
 }
 
 pub(crate) struct SendKey {
@@ -119,7 +115,7 @@ pub(crate) struct SendKey {
 }
 
 pub(crate) struct Delivery {
-    pub members: Vec<u64>,
+    pub members: Vec<(u64, u64)>,
     pub message: MessageView,
     pub stream: Stream,
 }
@@ -166,7 +162,7 @@ impl TidbStore {
                 }
             }
         }
-        check_schema(&pool).await?;
+        check_schema(&pool, false).await?;
         if let Some(seeds) = seeds {
             let mut transaction = pool.begin().await?;
             let result = initialize(&mut transaction, &id, seeds).await;
@@ -181,6 +177,18 @@ impl TidbStore {
             .try_into()
             .map_err(|_| Error::Integrity("invalid token key"))?;
         control_clock(&row)?;
+        let missing_event: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM members m LEFT JOIN account_events e
+             USING (tenant_id, user_id, account_sequence)
+             WHERE e.access_version IS NULL OR e.conversation_id <> m.conversation_id LIMIT 1",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if missing_event.is_some() {
+            return Err(Error::Integrity(
+                "active membership is missing its account event",
+            ));
+        }
         finish(transaction, Ok(())).await?;
         Ok(Self {
             pool,
@@ -265,14 +273,16 @@ impl TidbStore {
             };
             return Self::record_rejection(tx, key, digest, code).await;
         }
-        let members: Vec<u64> = sqlx::query_scalar(
-            "SELECT user_id FROM members WHERE tenant_id = ? AND conversation_id = ?",
+        let members: Vec<(u64, u64)> = sqlx::query_as(
+            "SELECT m.user_id, e.access_version FROM members m JOIN account_events e
+             USING (tenant_id, user_id, account_sequence)
+             WHERE m.tenant_id = ? AND m.conversation_id = ?",
         )
         .bind(key.owner.tenant_id)
         .bind(key.conversation)
         .fetch_all(&mut **tx)
         .await?;
-        if !members.contains(&key.owner.user_id) {
+        if !members.iter().any(|(user, _)| *user == key.owner.user_id) {
             return Self::record_rejection(tx, key, digest, ErrorCode::PermissionDenied).await;
         }
         let Some(message_content::Value::Text(text)) = content.value.as_ref() else {
@@ -373,7 +383,7 @@ impl TidbStore {
         key: &SendKey,
         text: &str,
         now: i64,
-        members: Vec<u64>,
+        members: Vec<(u64, u64)>,
     ) -> Result<Decision> {
         let row = sqlx::query(
             "SELECT history_id, next_sequence FROM conversations \
@@ -436,6 +446,8 @@ impl TidbStore {
                     scope: Scope::Conversation(key.conversation),
                     epoch: conversation.history_id,
                     upper: sequence,
+                    access_version: 0,
+                    floor: 1,
                 },
             }),
             outcome: SendOutcome {
@@ -444,49 +456,73 @@ impl TidbStore {
         })
     }
 
+    pub async fn begin_read(&self) -> Result<Transaction<'_, MySql>> {
+        Ok(self.pool.begin_with("BEGIN OPTIMISTIC").await?)
+    }
+
     pub async fn stream(&self, identity: Identity, scope: Scope) -> Result<Stream> {
+        let mut tx = self.begin_read().await?;
+        let result = self.read_stream(&mut tx, identity, scope).await;
+        finish(tx, result).await
+    }
+
+    pub async fn read_stream(
+        &self,
+        db: &mut MySqlConnection,
+        identity: Identity,
+        scope: Scope,
+    ) -> Result<Stream> {
         match scope {
             Scope::Account => {
-                let upper: u64 = sqlx::query_scalar("SELECT CAST(COALESCE(MAX(account_sequence), 0) AS UNSIGNED) \
-                                                     FROM members WHERE tenant_id = ? AND user_id = ?")
-                    .bind(identity.tenant_id)
-                    .bind(identity.user_id)
-                    .fetch_one(&self.pool)
-                    .await?;
+                let upper = account_upper(db, identity.tenant_id, identity.user_id).await?;
                 Ok(Stream {
                     scope,
                     epoch: self.id,
                     upper,
+                    access_version: 0,
+                    floor: 1,
                 })
             }
             Scope::Conversation(id) => {
-                let row = sqlx::query("SELECT c.history_id, c.next_sequence FROM conversations c \
-                                       JOIN members m ON m.tenant_id = c.tenant_id AND m.conversation_id = c.conversation_id \
-                                       WHERE m.tenant_id = ? AND m.user_id = ? AND m.conversation_id = ?")
-                    .bind(identity.tenant_id)
-                    .bind(identity.user_id)
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await?
-                    .ok_or(Error::PermissionDenied)?;
+                let row = sqlx::query(
+                    "SELECT c.history_id, c.next_sequence, e.access_version,
+                            CAST(COALESCE(r.floor_sequence, 1) AS UNSIGNED) AS floor
+                     FROM members m
+                     JOIN account_events e USING (tenant_id, user_id, account_sequence)
+                     JOIN conversations c ON c.tenant_id = m.tenant_id AND c.conversation_id = m.conversation_id
+                     LEFT JOIN conversation_retention r ON r.tenant_id = c.tenant_id AND r.conversation_id = c.conversation_id
+                     WHERE m.tenant_id = ? AND m.user_id = ? AND m.conversation_id = ?",
+                )
+                .bind(identity.tenant_id)
+                .bind(identity.user_id)
+                .bind(id)
+                .fetch_optional(db)
+                .await?
+                .ok_or(Error::PermissionDenied)?;
                 let conv = conversation_info(&row)?;
+                let floor: u64 = row.try_get("floor")?;
+                if floor == 0 || floor > conv.next_sequence {
+                    return Err(Error::Integrity("invalid retention floor"));
+                }
                 Ok(Stream {
                     scope,
                     epoch: conv.history_id,
                     upper: conv.next_sequence - 1,
+                    access_version: row.try_get("access_version")?,
+                    floor,
                 })
             }
         }
     }
 
-    pub async fn entries(
-        &self,
+    pub async fn changes(
+        db: &mut MySqlConnection,
         identity: Identity,
         scope: Scope,
         after: u64,
         through: u64,
         limit: usize,
-    ) -> Result<Vec<Entry>> {
+    ) -> Result<Vec<iam_protocol::pb::Change>> {
         let expected = through
             .checked_sub(after)
             .ok_or(Error::Integrity("invalid stream range"))?
@@ -494,37 +530,32 @@ impl TidbStore {
         if expected == 0 {
             return Ok(Vec::new());
         }
-        let entries = match scope {
+        let changes = match scope {
             Scope::Account => {
                 let rows = sqlx::query(
-                    "SELECT m.account_sequence, c.conversation_id, c.history_id FROM members m \
-                     JOIN conversations c ON c.tenant_id = m.tenant_id AND c.conversation_id = m.conversation_id \
-                     WHERE m.tenant_id = ? AND m.user_id = ? AND m.account_sequence > ? AND m.account_sequence <= ? \
-                     ORDER BY m.account_sequence LIMIT ?",
+                    "SELECT account_sequence, conversation_id, history_id, access_version FROM account_events
+                     WHERE tenant_id = ? AND user_id = ? AND account_sequence > ? AND account_sequence <= ?
+                     ORDER BY account_sequence LIMIT ?",
                 )
-                .bind(identity.tenant_id)
-                .bind(identity.user_id)
-                .bind(after)
-                .bind(through)
-                .bind(expected)
-                .fetch_all(&self.pool)
-                .await?;
+                .bind(identity.tenant_id).bind(identity.user_id).bind(after).bind(through).bind(expected)
+                .fetch_all(db).await?;
                 rows.iter()
                     .map(|row| {
-                        Ok(Entry {
-                            sequence: row.try_get("account_sequence")?,
-                            item: snapshot_item::Value::Conversation(ConversationState {
-                                conversation_id: Some(row.try_get("conversation_id")?),
-                                kind: Some(ConversationKind::Direct as i32),
-                                history_id: Some(id_column(row, "history_id")?.to_vec().into()),
-                                access_version: Some(ACCESS_VERSION),
-                            }),
+                        let payload = if row.try_get::<Option<u64>, _>("access_version")?.is_some()
+                        {
+                            change::Payload::ConversationUpsert(conversation_state(row)?)
+                        } else {
+                            change::Payload::ConversationRemove(row.try_get("conversation_id")?)
+                        };
+                        Ok(iam_protocol::pb::Change {
+                            event_seq: Some(row.try_get("account_sequence")?),
+                            payload: Some(payload),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?
             }
             Scope::Conversation(id) => {
-                let query = format!("{MESSAGES} WHERE m.tenant_id = ? AND m.conversation_id = ? \
+                let query = format!("{MESSAGES} WHERE m.tenant_id = ? AND m.conversation_id = ?
                                     AND m.`sequence` > ? AND m.`sequence` <= ? ORDER BY m.`sequence` LIMIT ?");
                 let rows = sqlx::query(&query)
                     .bind(identity.tenant_id)
@@ -532,27 +563,73 @@ impl TidbStore {
                     .bind(after)
                     .bind(through)
                     .bind(expected)
-                    .fetch_all(&self.pool)
+                    .fetch_all(db)
                     .await?;
                 rows.iter()
                     .map(|row| {
-                        Ok(Entry {
-                            sequence: row.try_get("sequence")?,
-                            item: snapshot_item::Value::Message(decode_message(row)?.view()),
+                        Ok(iam_protocol::pb::Change {
+                            event_seq: Some(row.try_get("sequence")?),
+                            payload: Some(change::Payload::MessageUpsert(
+                                decode_message(row)?.view(),
+                            )),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?
             }
         };
-        if entries.len() as u64 != expected
-            || entries
+        if changes.len() as u64 != expected
+            || changes
                 .iter()
                 .zip(after + 1..=through)
-                .any(|(entry, sequence)| entry.sequence != sequence)
+                .any(|(change, sequence)| change.event_seq != Some(sequence))
         {
             return Err(Error::Integrity("gap in committed stream"));
         }
-        Ok(entries)
+        Ok(changes)
+    }
+
+    pub async fn account_snapshot(
+        db: &mut MySqlConnection,
+        identity: Identity,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<ConversationState>> {
+        let rows = sqlx::query(
+            "SELECT m.conversation_id, c.history_id, e.access_version FROM members m
+             JOIN account_events e USING (tenant_id, user_id, account_sequence)
+             JOIN conversations c ON c.tenant_id = m.tenant_id AND c.conversation_id = m.conversation_id
+             WHERE m.tenant_id = ? AND m.user_id = ? ORDER BY m.conversation_id LIMIT ? OFFSET ?",
+        )
+        .bind(identity.tenant_id).bind(identity.user_id).bind(limit as u64).bind(offset)
+        .fetch_all(db).await?;
+        rows.iter().map(conversation_state).collect()
+    }
+
+    pub async fn history_messages(
+        db: &mut MySqlConnection,
+        identity: Identity,
+        stream: &Stream,
+        before: u64,
+        upper: u64,
+        limit: usize,
+    ) -> Result<Vec<MessageView>> {
+        let query = format!(
+            "{MESSAGES} WHERE m.tenant_id = ? AND m.conversation_id = ?
+                            AND m.`sequence` >= ? AND m.`sequence` <= ? AND m.`sequence` < ?
+                            ORDER BY m.`sequence` DESC LIMIT ?"
+        );
+        let rows = sqlx::query(&query)
+            .bind(identity.tenant_id)
+            .bind(stream.scope.conversation_id())
+            .bind(stream.floor)
+            .bind(upper)
+            .bind(before)
+            .bind(limit as u64)
+            .fetch_all(db)
+            .await?;
+        rows.iter()
+            .map(|row| Ok(decode_message(row)?.view()))
+            .collect()
     }
 
     pub async fn page(
@@ -562,48 +639,56 @@ impl TidbStore {
         before: Option<u64>,
         limit: u32,
     ) -> Result<TextPage> {
+        let mut tx = self.begin_read().await?;
         let stream = self
-            .stream(identity, Scope::Conversation(conversation_id))
+            .read_stream(&mut tx, identity, Scope::Conversation(conversation_id))
             .await?;
-        let history_id = stream.epoch;
-        let query = format!(
-            "{MESSAGES} WHERE m.tenant_id = ? AND m.conversation_id = ? \
-             AND m.`sequence` < ? ORDER BY m.`sequence` DESC LIMIT ?"
-        );
-        let rows = sqlx::query(&query)
-            .bind(identity.tenant_id)
-            .bind(conversation_id)
-            .bind(before.unwrap_or(u64::MAX))
-            .bind(u64::from(limit) + 1)
-            .fetch_all(&self.pool)
-            .await?;
-        let mut messages: Vec<_> = rows.iter().map(decode_message).collect::<Result<_>>()?;
-        if messages.iter().any(|message| {
-            message
-                .receipt
-                .position
-                .as_ref()
-                .and_then(|p| p.history_id.as_deref())
-                != Some(history_id.as_slice())
-        }) {
-            return Err(Error::Integrity("history changed during page read"));
-        }
+        let mut messages = Self::history_messages(
+            &mut tx,
+            identity,
+            &stream,
+            before.unwrap_or(u64::MAX),
+            stream.upper,
+            limit as usize + 1,
+        )
+        .await?;
+        tx.commit().await?;
         let more = messages.len() > limit as usize;
         messages.truncate(limit as usize);
         let next_before = if more {
             messages
                 .last()
-                .and_then(|m| m.receipt.position.as_ref())
+                .and_then(|m| m.position.as_ref())
                 .and_then(|p| p.create_seq)
         } else {
             None
         };
         Ok(TextPage {
-            history_id,
-            messages: messages.iter().map(StoredText::view).collect(),
+            history_id: stream.epoch,
+            messages,
             next_before,
         })
     }
+}
+
+fn conversation_state(row: &MySqlRow) -> Result<ConversationState> {
+    Ok(ConversationState {
+        conversation_id: Some(row.try_get("conversation_id")?),
+        kind: Some(ConversationKind::Direct as i32),
+        history_id: Some(id_column(row, "history_id")?.to_vec().into()),
+        access_version: Some(row.try_get("access_version")?),
+    })
+}
+
+async fn account_upper(db: &mut MySqlConnection, tenant: u64, user: u64) -> Result<u64> {
+    Ok(sqlx::query_scalar(
+        "SELECT CAST(COALESCE(MAX(account_sequence), 0) AS UNSIGNED)
+                          FROM account_events WHERE tenant_id = ? AND user_id = ?",
+    )
+    .bind(tenant)
+    .bind(user)
+    .fetch_one(db)
+    .await?)
 }
 
 pub(crate) fn local_options(url: &str) -> Result<MySqlConnectOptions> {
@@ -686,7 +771,7 @@ async fn require_empty_tables(pool: &MySqlPool) -> Result<()> {
     Ok(())
 }
 
-async fn check_schema(pool: &MySqlPool) -> Result<()> {
+async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
     for query in [
         "SELECT singleton, store_id, token_key, max_observed_now_ms, closed_through_client_ms FROM store_control LIMIT 0",
         "SELECT tenant_id, conversation_id, history_id, next_sequence FROM conversations LIMIT 0",
@@ -696,15 +781,26 @@ async fn check_schema(pool: &MySqlPool) -> Result<()> {
     ] {
         sqlx::query(query).execute(pool).await?;
     }
+    if !legacy_only {
+        for query in [
+            "SELECT tenant_id, user_id, account_sequence, conversation_id, history_id, access_version FROM account_events LIMIT 0",
+            "SELECT tenant_id, conversation_id, floor_sequence FROM conversation_retention LIMIT 0",
+        ] {
+            sqlx::query(query).execute(pool).await?;
+        }
+    }
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT table_name, index_name, column_name FROM information_schema.statistics \
-         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members') \
+         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention') \
          AND non_unique = 0 ORDER BY table_name, index_name, seq_in_index",
     )
     .fetch_all(pool)
     .await?;
     let mut keys = BTreeMap::<_, Vec<_>>::new();
     for (table, index, column) in rows {
+        if legacy_only && matches!(table.as_str(), "account_events" | "conversation_retention") {
+            continue;
+        }
         keys.entry((table, index)).or_default().push(column);
     }
     let send_key = &[
@@ -714,7 +810,7 @@ async fn check_schema(pool: &MySqlPool) -> Result<()> {
         "conversation_id",
         "client_msg_id",
     ];
-    let expected: [(&str, &str, &[&str]); 8] = [
+    let expected: [(&str, &str, &[&str]); 10] = [
         ("store_control", "PRIMARY", &["singleton"]),
         (
             "conversations",
@@ -743,7 +839,22 @@ async fn check_schema(pool: &MySqlPool) -> Result<()> {
             "membership",
             &["tenant_id", "conversation_id", "user_id"],
         ),
+        (
+            "account_events",
+            "PRIMARY",
+            &["tenant_id", "user_id", "account_sequence"],
+        ),
+        (
+            "conversation_retention",
+            "PRIMARY",
+            &["tenant_id", "conversation_id"],
+        ),
     ];
+    let expected = if legacy_only {
+        &expected[..8]
+    } else {
+        &expected[..]
+    };
     if keys.len() != expected.len()
         || expected.iter().any(|(table, index, columns)| {
             keys.get(&(table.to_string(), index.to_string()))
@@ -914,6 +1025,16 @@ async fn initialize(
             .bind(conv.conversation_id)
             .bind(*position)
             .execute(&mut **tx)
+            .await?;
+            write_account_event(
+                tx,
+                conv.tenant_id,
+                user,
+                *position,
+                conv.conversation_id,
+                conv.history_id,
+                Some(INITIAL_ACCESS),
+            )
             .await?;
         }
     }

@@ -49,3 +49,21 @@ CREATE TABLE IF NOT EXISTS members (
     PRIMARY KEY (tenant_id, user_id, account_sequence),
     UNIQUE KEY membership (tenant_id, conversation_id, user_id)
 );
+
+CREATE TABLE IF NOT EXISTS account_events (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    user_id BIGINT UNSIGNED NOT NULL,
+    account_sequence BIGINT UNSIGNED NOT NULL,
+    conversation_id BIGINT UNSIGNED NOT NULL,
+    history_id BINARY(16) NOT NULL,
+    access_version BIGINT UNSIGNED NULL,
+    PRIMARY KEY (tenant_id, user_id, account_sequence),
+    KEY conversation_events (tenant_id, user_id, conversation_id, account_sequence)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_retention (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    conversation_id BIGINT UNSIGNED NOT NULL,
+    floor_sequence BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (tenant_id, conversation_id)
+);

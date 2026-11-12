@@ -60,6 +60,8 @@ async fn tidb_single_schema_supports_unsigned_ids_and_ordered_pages() {
     assert_eq!(
         tables(&store.pool).await,
         [
+            "account_events",
+            "conversation_retention",
             "conversations",
             "members",
             "messages",
@@ -310,4 +312,78 @@ async fn wait_for_writer(store: &TidbStore) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.expect("writer reached the control row lock");
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_upgrade_preserves_receipts_and_account_cursors() {
+    use iam_protocol::pb::{
+        snapshot_response, sync_response, sync_target, Empty, PageLimit, SnapshotRequest,
+        SyncRequest, SyncTarget,
+    };
+
+    let (url, store, key) = fixture(1, 100).await;
+    let receipt = committed(
+        store
+            .decide(&key, Some(&text_content("before upgrade")), true)
+            .await
+            .unwrap(),
+    );
+    let limit = Some(PageLimit {
+        max_items: Some(10),
+        max_bytes: Some(256 * 1024),
+    });
+    let mut request = SyncRequest {
+        target: Some(SyncTarget {
+            value: Some(sync_target::Value::Account(Empty {})),
+        }),
+        limit,
+        ..SyncRequest::default()
+    };
+    let sync_response::Value::Reset(reset) = store.sync(key.owner, &request).await else {
+        panic!("expected initial account reset");
+    };
+    let snapshot_response::Value::Page(page) = store
+        .snapshot(
+            key.owner,
+            &SnapshotRequest {
+                page_token: reset.snapshot_token,
+                limit,
+            },
+        )
+        .await
+    else {
+        panic!("expected account snapshot");
+    };
+    request.cursor = page.resume_cursor;
+    assert!(request.cursor.is_some());
+
+    for statement in [
+        "DROP TABLE account_events",
+        "DROP TABLE conversation_retention",
+    ] {
+        sqlx::query(statement).execute(&store.pool).await.unwrap();
+    }
+    let id = store.id;
+    assert!(TidbStore::open(url.as_str(), id, None).await.is_err());
+    assert!(TidbStore::upgrade(url.as_str(), generate_id128())
+        .await
+        .is_err());
+    assert!(!tables(&store.pool)
+        .await
+        .iter()
+        .any(|table| table == "account_events"));
+    TidbStore::upgrade(url.as_str(), id).await.unwrap();
+    TidbStore::upgrade(url.as_str(), id).await.unwrap();
+
+    let resumed = TidbStore::open(url.as_str(), id, None).await.unwrap();
+    assert_eq!(
+        committed(resumed.decide(&key, None, true).await.unwrap()),
+        receipt
+    );
+    let sync_response::Value::Page(page) = resumed.sync(key.owner, &request).await else {
+        panic!("old account cursor must remain valid");
+    };
+    assert_eq!(page.covered_through, Some(1));
+    assert!(page.changes.is_empty());
 }

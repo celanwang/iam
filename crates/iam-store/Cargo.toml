@@ -16,5 +16,7 @@ thiserror = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time"] }
 
 [dev-dependencies]
+iam-client = { path = "../iam-client" }
+tempfile = "3"
 tokio = { version = "1", features = ["net", "process"] }
 url = "2"

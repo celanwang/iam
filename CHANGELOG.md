@@ -14,6 +14,14 @@ a dated version section when cutting a release.
 
 ### Added
 
+- TiDB-backed history pagination and durable client backfill after a sync
+  cursor expires, including ranges below the retention floor.
+- Durable account changes for direct conversations and access changes, with
+  a local schema upgrade that preserves existing cursors and send receipts.
+- Real TiDB acceptance tests for reordered and duplicate pushes, expired
+  sync page tokens, and a service crash after commit but before push.
+- Durable text client with a local send queue, automatic sync on reconnect,
+  and periodic recovery from lost pushes, verified against TiDB.
 - Message reliability design for durable sends, server forwarding, and
   receiver recovery.
 - TiDB-backed wire SEND, SEND_STATUS, SYNC, and SNAPSHOT for seeded direct

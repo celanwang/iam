@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/iam-client",
     "crates/iam-protocol",
     "crates/iam-core",
     "crates/iam-loop",

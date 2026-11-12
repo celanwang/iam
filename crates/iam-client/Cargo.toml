@@ -1,0 +1,17 @@
+[package]
+name = "iam-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Durable text messaging client for the IAM protocol"
+
+[dependencies]
+iam-protocol = { path = "../iam-protocol" }
+prost = { workspace = true }
+sqlx = { version = "=0.8.6", default-features = false, features = ["sqlite", "runtime-tokio"] }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["macros", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "process", "rt"] }
