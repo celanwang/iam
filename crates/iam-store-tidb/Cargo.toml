@@ -1,0 +1,14 @@
+[package]
+name = "iam-store-tidb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Two-table TiDB text storage and authenticated local application path"
+
+[dependencies]
+hex = { workspace = true }
+iam-core = { path = "../iam-core" }
+iam-protocol = { path = "../iam-protocol" }
+sqlx = { version = "=0.8.6", default-features = false, features = ["mysql", "runtime-tokio-rustls"] }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time"] }
