@@ -6,6 +6,7 @@ A general IM engine built for 10B scale.
 
 - Design direction: [`docs/design.md`](docs/design.md)
 - Message protocol: [`docs/protocol.md`](docs/protocol.md)
+- Message reliability: [`docs/message.md`](docs/message.md)
 - Storage design: [`docs/storage.md`](docs/storage.md)
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 - Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
