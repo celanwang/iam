@@ -22,6 +22,14 @@ use std::{
 #[path = "tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
+
+#[cfg(test)]
+#[path = "perf.rs"]
+pub(crate) mod perf;
+
 #[path = "membership.rs"]
 mod membership;
 use membership::write_account_event;
@@ -198,12 +206,17 @@ impl TidbStore {
     }
 
     pub async fn now(&self) -> Result<i64> {
+        #[cfg(test)]
+        let start = std::time::Instant::now();
         let mut tx = self.pool.begin().await?;
         let result = self
             .observe_clock(&mut tx)
             .await
             .map(|clock| clock.effective_now());
-        finish(tx, result).await
+        let result = finish(tx, result).await;
+        #[cfg(test)]
+        perf::record("clock_tx", start);
+        result
     }
 
     pub async fn decide(
@@ -212,9 +225,14 @@ impl TidbStore {
         content: Option<&MessageContent>,
         accepting: bool,
     ) -> Result<Decision> {
+        #[cfg(test)]
+        let start = std::time::Instant::now();
         let mut tx = self.pool.begin().await?;
         let result = self.decide_in(&mut tx, key, content, accepting).await;
-        finish(tx, result).await
+        let result = finish(tx, result).await;
+        #[cfg(test)]
+        perf::record("send_tx", start);
+        result
     }
 
     async fn decide_in(
@@ -292,7 +310,12 @@ impl TidbStore {
     }
 
     async fn observe_clock(&self, tx: &mut Transaction<'_, MySql>) -> Result<DecisionClock> {
-        let row = sqlx::query(CONTROL).fetch_one(&mut **tx).await?;
+        #[cfg(test)]
+        let start = std::time::Instant::now();
+        let row = sqlx::query(CONTROL).fetch_one(&mut **tx).await;
+        #[cfg(test)]
+        perf::record("control_sql", start);
+        let row = row?;
         check_store_id(&row, self.id)?;
         let (previous, previous_watermark) = control_clock(&row)?;
         let now: i64 = sqlx::query_scalar(CLOCK_SQL).fetch_one(&mut **tx).await?;
