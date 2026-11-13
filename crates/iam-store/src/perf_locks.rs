@@ -110,7 +110,18 @@ pub(super) async fn scrape() -> Option<Histogram> {
         }
     }
     buckets.sort_by(|left, right| left.0.total_cmp(&right.0));
-    assert!(!buckets.is_empty(), "TiKV waiter histogram unavailable");
+    // TiKV registers the series lazily, after the first wait following startup.
+    if count.is_none() && seconds.is_none() && buckets.is_empty() {
+        assert!(contents
+            .lines()
+            .any(|line| line.starts_with("tikv_server_info{")));
+        return Some(Histogram {
+            count: 0,
+            seconds: 0.0,
+            buckets,
+        });
+    }
+    assert!(!buckets.is_empty(), "incomplete TiKV waiter histogram");
     Some(Histogram {
         count: count.expect("TiKV waiter count"),
         seconds: seconds.expect("TiKV waiter duration"),
@@ -130,11 +141,22 @@ impl Histogram {
             println!("TIKV_WAITERS n=0");
             return;
         }
-        assert_eq!(self.buckets.len(), before.buckets.len());
+        let empty;
+        let prior_buckets = if before.buckets.is_empty() {
+            empty = self
+                .buckets
+                .iter()
+                .map(|(bound, _)| (*bound, 0))
+                .collect::<Vec<_>>();
+            &empty
+        } else {
+            &before.buckets
+        };
+        assert_eq!(self.buckets.len(), prior_buckets.len());
         let delta: Vec<_> = self
             .buckets
             .iter()
-            .zip(&before.buckets)
+            .zip(prior_buckets)
             .map(|(&(bound, after), &(old_bound, old))| {
                 assert_eq!(bound, old_bound);
                 (bound, after.checked_sub(old).expect("waiter bucket reset"))

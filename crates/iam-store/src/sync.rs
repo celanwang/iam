@@ -56,8 +56,13 @@ struct Round {
 }
 
 impl TidbStore {
-    pub async fn sync(&self, identity: Identity, request: &SyncRequest) -> sync_response::Value {
-        self.read_sync(identity, request)
+    pub async fn sync_at(
+        &self,
+        identity: Identity,
+        request: &SyncRequest,
+        now: i64,
+    ) -> sync_response::Value {
+        self.read_sync(identity, request, now)
             .await
             .unwrap_or_else(|(code, action)| sync_response::Value::Error(error_info(code, action)))
     }
@@ -66,8 +71,8 @@ impl TidbStore {
         &self,
         identity: Identity,
         request: &SyncRequest,
+        now: i64,
     ) -> ReadResult<sync_response::Value> {
-        let now = self.now().await.map_err(read_error)?;
         #[cfg(test)]
         let start = std::time::Instant::now();
         let mut tx = self.begin_read().await.map_err(read_error)?;

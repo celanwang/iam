@@ -1,5 +1,6 @@
 //! TiDB storage for the wire protocol and the local text console.
 
+mod clock;
 mod service;
 mod store;
 mod sync;
@@ -32,6 +33,12 @@ pub enum Error {
     Database(#[from] sqlx::Error),
     #[error("transaction outcome is unknown; query the original key")]
     CommitUnknown(#[source] sqlx::Error),
+    #[error("clock sampling queue is full")]
+    ClockOverloaded,
+    #[error("clock sampler stopped")]
+    ClockStopped,
+    #[error("clock sampling transaction failed")]
+    ClockSample(#[source] std::sync::Arc<Error>),
     #[error(transparent)]
     Core(#[from] iam_core::CoreError),
 }

@@ -1,3 +1,4 @@
+use crate::clock::ClockBatch;
 use crate::store::{unresolved, Decision, Scope, SendKey, TidbStore};
 use crate::{ConversationInfo, Error, Identity, Result, TextPage};
 use iam_core::{CoreError, Engine, EngineOutput, EngineReply, StorageRequest};
@@ -11,6 +12,10 @@ use iam_protocol::{
     Frame, Id128, MsgType,
 };
 use prost::Message;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum OpenMode {
@@ -21,10 +26,14 @@ pub enum OpenMode {
 }
 
 /// Wire handler for authenticated sessions backed by TiDB.
+#[derive(Clone)]
 pub struct TidbService {
-    engine: Engine,
-    database: TidbStore,
-    accepting: bool,
+    engine: Arc<Mutex<Engine>>,
+    database: Arc<TidbStore>,
+    accepting: Arc<AtomicBool>,
+    clock: ClockBatch,
+    #[cfg(test)]
+    clock_batching: bool,
 }
 
 impl TidbService {
@@ -83,27 +92,45 @@ impl TidbService {
             ));
         }
         let seeds = matches!(mode, OpenMode::Initialize).then_some(&engine.store);
-        let database = TidbStore::open(url, store_id, seeds).await?;
+        let database = Arc::new(TidbStore::open(url, store_id, seeds).await?);
+        let clock = ClockBatch::start(database.clone());
         Ok(Self {
-            engine,
+            engine: Arc::new(Mutex::new(engine)),
             database,
-            accepting: true,
+            accepting: Arc::new(AtomicBool::new(true)),
+            clock,
+            #[cfg(test)]
+            clock_batching: true,
         })
     }
 
-    pub fn disconnect(&mut self, connection_id: Option<Id128>) {
-        self.engine.disconnect(connection_id);
+    pub fn disconnect(&self, connection_id: Option<Id128>) {
+        self.engine.lock().unwrap().disconnect(connection_id);
     }
 
-    pub fn stop_accepting(&mut self) {
-        self.accepting = false;
+    pub fn stop_accepting(&self) {
+        self.accepting.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_clock_batching(&mut self, enabled: bool) {
+        self.clock_batching = enabled;
+    }
+
+    async fn request_time(&self) -> Result<i64> {
+        #[cfg(test)]
+        if !self.clock_batching {
+            return self.database.now().await;
+        }
+        self.clock.now().await
     }
 
     /// Reads the current position of an authenticated member's conversation.
     pub async fn conversation(&self, cid: Id128, id: u64) -> Result<ConversationInfo> {
+        let identity = Self::identity(&self.engine.lock().unwrap(), cid)?;
         let stream = self
             .database
-            .stream(self.identity(cid)?, Scope::Conversation(id))
+            .stream(identity, Scope::Conversation(id))
             .await?;
         Ok(ConversationInfo {
             history_id: stream.epoch,
@@ -124,20 +151,17 @@ impl TidbService {
                 "page limit must be 1..100 and before must be nonzero",
             ));
         }
-        self.database
-            .page(self.identity(cid)?, id, before, limit)
-            .await
+        let identity = Self::identity(&self.engine.lock().unwrap(), cid)?;
+        self.database.page(identity, id, before, limit).await
     }
 
-    fn identity(&self, cid: Id128) -> Result<Identity> {
-        let session = self
-            .engine
+    fn identity(engine: &Engine, cid: Id128) -> Result<Identity> {
+        let session = engine
             .store
             .connections
             .get(&cid)
             .ok_or(Error::Unauthenticated)?;
-        if self
-            .engine
+        if engine
             .store
             .revoked_auth_epochs
             .contains(&session.auth_epoch)
@@ -151,34 +175,61 @@ impl TidbService {
         })
     }
 
+    /// Calls on different connections may overlap. The caller processes each connection in order.
     pub async fn handle_frame(
-        &mut self,
+        &self,
         connection_id: Option<Id128>,
         frame: &Frame,
     ) -> Result<EngineReply> {
         let Ok(decoded) = decode_frame(frame) else {
-            // The Engine owns malformed-frame and command-specific error routing.
-            return Ok(self.engine.handle_frame(connection_id, frame)?);
+            return Ok(self
+                .engine
+                .lock()
+                .unwrap()
+                .handle_frame(connection_id, frame)?);
         };
         match &decoded.body {
             DecodedBody::Auth(_) | DecodedBody::Reconnect(_) | DecodedBody::Heartbeat(_) => {
-                self.engine.store.set_now(self.database.now().await?);
-                return Ok(self.engine.handle(connection_id, &decoded)?);
+                let time = if matches!(decoded.body, DecodedBody::Heartbeat(_)) {
+                    self.database.now().await
+                } else {
+                    self.request_time().await
+                };
+                let now = match time {
+                    Ok(now) => now,
+                    Err(error) if !matches!(decoded.body, DecodedBody::Heartbeat(_)) => {
+                        return clock_error(connection_id, &decoded, error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                let mut engine = self.engine.lock().unwrap();
+                engine.store.set_now(now);
+                return Ok(engine.handle(connection_id, &decoded)?);
             }
-            DecodedBody::PushAck(_) => return Ok(self.engine.handle(connection_id, &decoded)?),
+            DecodedBody::PushAck(_) => {
+                return Ok(self
+                    .engine
+                    .lock()
+                    .unwrap()
+                    .handle(connection_id, &decoded)?);
+            }
             _ if !decoded.msg_type.is_client_to_server() => {
-                return Ok(self.engine.handle(connection_id, &decoded)?);
+                return Ok(self
+                    .engine
+                    .lock()
+                    .unwrap()
+                    .handle(connection_id, &decoded)?);
             }
             _ => {}
         }
-        let cid = match self
-            .engine
-            .prepare_storage_request(connection_id, &decoded)?
-        {
-            StorageRequest::Ready(cid) => cid,
-            StorageRequest::Respond(reply) => return Ok(reply),
+        let (cid, identity) = {
+            let mut engine = self.engine.lock().unwrap();
+            let cid = match engine.prepare_storage_request(connection_id, &decoded)? {
+                StorageRequest::Ready(cid) => cid,
+                StorageRequest::Respond(reply) => return Ok(reply),
+            };
+            (cid, Self::identity(&engine, cid)?)
         };
-        let identity = self.identity(cid)?;
         match &decoded.body {
             DecodedBody::Send(req) => {
                 let content = req.content.as_ref().filter(|content| {
@@ -198,7 +249,17 @@ impl TidbService {
                     .await
             }
             DecodedBody::Sync(req) => {
-                let value = self.database.sync(identity, req).await;
+                let now = match self.request_time().await {
+                    Ok(now) => now,
+                    Err(error) => return clock_error(Some(cid), &decoded, error),
+                };
+                if let Some(error) = self.check_read_session(cid, &decoded)? {
+                    return Ok(error);
+                }
+                let value = self.database.sync_at(identity, req, now).await;
+                if let Some(error) = self.check_read_session(cid, &decoded)? {
+                    return Ok(error);
+                }
                 reply(
                     cid,
                     &decoded,
@@ -208,6 +269,9 @@ impl TidbService {
             }
             DecodedBody::Snapshot(req) => {
                 let value = self.database.snapshot(identity, req).await;
+                if let Some(error) = self.check_read_session(cid, &decoded)? {
+                    return Ok(error);
+                }
                 reply(
                     cid,
                     &decoded,
@@ -217,6 +281,9 @@ impl TidbService {
             }
             DecodedBody::History(req) => {
                 let value = self.database.history(identity, req).await;
+                if let Some(error) = self.check_read_session(cid, &decoded)? {
+                    return Ok(error);
+                }
                 reply(
                     cid,
                     &decoded,
@@ -228,8 +295,21 @@ impl TidbService {
         }
     }
 
+    fn check_read_session(&self, cid: Id128, frame: &DecodedFrame) -> Result<Option<EngineReply>> {
+        if Self::identity(&self.engine.lock().unwrap(), cid).is_ok() {
+            return Ok(None);
+        }
+        protocol_error(
+            None,
+            frame,
+            ErrorCode::Unauthenticated,
+            RetryAction::Reauthenticate,
+        )
+        .map(Some)
+    }
+
     async fn send(
-        &mut self,
+        &self,
         cid: Id128,
         identity: Identity,
         frame: &DecodedFrame,
@@ -246,17 +326,21 @@ impl TidbService {
         ) else {
             return wire_error(cid, frame, ErrorCode::InvalidArgument);
         };
-        let session = self.engine.store.connections.get_mut(&cid).unwrap();
-        if content.is_some() {
-            if session
-                .inflight_send
-                .get(&conversation)
-                .is_some_and(|id| *id != client_id)
-            {
-                let value = unresolved(ErrorCode::InProgress, RetryAction::QuerySend, false);
-                return send_reply(cid, frame, key, SendOutcome { value: Some(value) });
+        {
+            let mut engine = self.engine.lock().unwrap();
+            Self::identity(&engine, cid)?;
+            let session = engine.store.connections.get_mut(&cid).unwrap();
+            if content.is_some() {
+                if session
+                    .inflight_send
+                    .get(&conversation)
+                    .is_some_and(|id| *id != client_id)
+                {
+                    let value = unresolved(ErrorCode::InProgress, RetryAction::QuerySend, false);
+                    return send_reply(cid, frame, key, SendOutcome { value: Some(value) });
+                }
+                session.inflight_send.insert(conversation, client_id);
             }
-            session.inflight_send.insert(conversation, client_id);
         }
 
         let scope = SendKey {
@@ -266,7 +350,7 @@ impl TidbService {
         };
         let Decision { outcome, delivery } = self
             .database
-            .decide(&scope, content, self.accepting)
+            .decide(&scope, content, self.accepting.load(Ordering::Relaxed))
             .await
             .unwrap_or_else(|_| Decision {
                 outcome: SendOutcome {
@@ -283,8 +367,11 @@ impl TidbService {
             Some(send_outcome::Value::Unresolved(result)) => result.acceptance_closed == Some(true),
             None => false,
         };
-        if release && session.inflight_send.get(&conversation) == Some(&client_id) {
-            session.inflight_send.remove(&conversation);
+        let mut engine = self.engine.lock().unwrap();
+        if let Some(session) = engine.store.connections.get_mut(&cid) {
+            if release && session.inflight_send.get(&conversation) == Some(&client_id) {
+                session.inflight_send.remove(&conversation);
+            }
         }
         let (cid_out, mut output) = send_reply(cid, frame, key, outcome)?;
         if let Some(delivery) = delivery {
@@ -296,7 +383,7 @@ impl TidbService {
             let mut stream = delivery.stream;
             for (user, version) in delivery.members {
                 stream.access_version = version;
-                let _ = self.engine.push_change(
+                let _ = engine.push_change(
                     &mut output,
                     cid,
                     identity.tenant_id,
@@ -355,18 +442,36 @@ fn reply(
     ))
 }
 
+fn clock_error(cid: Option<Id128>, frame: &DecodedFrame, error: Error) -> Result<EngineReply> {
+    let code = if matches!(error, Error::ClockOverloaded) {
+        ErrorCode::Overloaded
+    } else {
+        ErrorCode::InternalError
+    };
+    protocol_error(cid, frame, code, RetryAction::RetrySameRequest)
+}
+
 fn wire_error(cid: Id128, frame: &DecodedFrame, code: ErrorCode) -> Result<EngineReply> {
+    protocol_error(Some(cid), frame, code, RetryAction::None)
+}
+
+fn protocol_error(
+    cid: Option<Id128>,
+    frame: &DecodedFrame,
+    code: ErrorCode,
+    action: RetryAction,
+) -> Result<EngineReply> {
     let bytes = encode_protocol_error(
         frame.head.req_id,
         Some(frame.msg_type as u32),
         code,
-        RetryAction::None,
+        action,
         false,
         None,
     )
     .map_err(CoreError::from)?;
     Ok((
-        Some(cid),
+        cid,
         EngineOutput {
             responses: vec![bytes],
             pushes: vec![],
