@@ -39,11 +39,51 @@ const TOKEN: &[u8] = b"reader";
 type Samples = BTreeMap<(&'static str, &'static str), Vec<Duration>>;
 
 tokio::task_local! {
-    static SPANS: RefCell<Vec<(&'static str, Duration)>>;
+    static SPANS: RefCell<Spans>;
+}
+
+#[derive(Default)]
+pub(crate) struct Spans {
+    timings: Vec<(&'static str, Duration)>,
+    batch: Option<(u64, usize, Duration, Duration)>,
+}
+
+impl Spans {
+    pub fn duration(&self, metric: &str) -> Duration {
+        self.timings
+            .iter()
+            .find(|(name, _)| *name == metric)
+            .map_or(Duration::ZERO, |(_, elapsed)| *elapsed)
+    }
+}
+
+pub(crate) async fn capture<T>(future: impl std::future::Future<Output = T>) -> (T, Spans) {
+    SPANS
+        .scope(RefCell::new(Spans::default()), async {
+            let result = future.await;
+            (result, SPANS.with(|spans| spans.take()))
+        })
+        .await
 }
 
 pub(crate) fn record(metric: &'static str, start: Instant) {
-    let _ = SPANS.try_with(|spans| spans.borrow_mut().push((metric, start.elapsed())));
+    let _ = SPANS.try_with(|spans| spans.borrow_mut().timings.push((metric, start.elapsed())));
+}
+
+pub(crate) fn record_batch(
+    id: u64,
+    size: usize,
+    transaction: Duration,
+    control_sql: Duration,
+    elapsed: Duration,
+    queued: Duration,
+) {
+    let _ = SPANS.try_with(|spans| {
+        let mut spans = spans.borrow_mut();
+        spans.timings.push(("clock_request", elapsed));
+        spans.timings.push(("clock_queue", queued));
+        spans.batch = Some((id, size, transaction, control_sql));
+    });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,25 +100,30 @@ async fn profile_sync_contention() {
     tokio::task::LocalSet::new()
         .run_until(async {
             for load in [Load::Send, Load::Auth, Load::EmptySync, Load::Reconnect] {
-                tokio::time::timeout(Duration::from_secs(90), run_case(load))
-                    .await
-                    .unwrap_or_else(|_| panic!("{load:?} timed out"));
+                for batching in [false, true] {
+                    tokio::time::timeout(Duration::from_secs(90), run_case(load, batching))
+                        .await
+                        .unwrap_or_else(|_| panic!("{load:?} batching={batching} timed out"));
+                }
             }
         })
         .await;
 }
 
-async fn run_case(load: Load) {
+async fn run_case(load: Load, batching: bool) {
     let database = support::isolated_database().await;
     let id = generate_id128();
     let mut writer = Peer::open(database.as_str(), id, OpenMode::Initialize).await;
+    writer.service.set_clock_batching(batching);
     writer.auth(b"writer", generate_id128()).await;
     let workers = if load == Load::Send { 0 } else { DEVICES };
     let barrier = Arc::new(Barrier::new(workers + 1));
     let directory = tempfile::tempdir().unwrap();
     let mut readers = Vec::new();
+    let mut service = writer.service.clone();
+    service.set_clock_batching(batching);
     for index in 0..workers {
-        let mut peer = Peer::open(database.as_str(), id, OpenMode::Resume).await;
+        let mut peer = Peer::new(service.clone());
         let device = generate_id128();
         let root = directory.path().join(index.to_string());
         std::fs::create_dir(&root).unwrap();
@@ -151,7 +196,7 @@ async fn run_case(load: Load) {
                     }
                     barrier.wait().await;
                 }
-                peer.samples
+                (peer.samples, peer.batches)
             })
         })
         .collect();
@@ -181,13 +226,34 @@ async fn run_case(load: Load) {
     let observed = observer.await.unwrap();
 
     println!(
-        "CASE {load:?} waves={WAVES} sends_per_wave={SENDS_PER_WAVE} background={workers} elapsed_s={:.3}",
+        "CASE {load:?} batching={batching} waves={WAVES} sends_per_wave={SENDS_PER_WAVE} background={workers} elapsed_s={:.3}",
         elapsed.as_secs_f64()
     );
     let mut samples = writer.samples;
+    let mut batches = writer.batches;
     for reader in readers {
-        for (key, values) in reader.await.unwrap() {
+        let (read_samples, read_batches) = reader.await.unwrap();
+        batches.extend(read_batches);
+        for (key, values) in read_samples {
             samples.entry(key).or_default().extend(values);
+        }
+    }
+    if !batches.is_empty() {
+        println!(
+            "CLOCK_BATCHES n={} requests={} max_size={}",
+            batches.len(),
+            batches.values().map(|(size, _, _)| size).sum::<usize>(),
+            batches.values().map(|(size, _, _)| size).max().unwrap()
+        );
+        for (_, (_, transaction, control_sql)) in batches {
+            samples
+                .entry(("BATCH", "clock_tx"))
+                .or_default()
+                .push(transaction);
+            samples
+                .entry(("BATCH", "control_sql"))
+                .or_default()
+                .push(control_sql);
         }
     }
     for ((command, metric), mut values) in samples {
@@ -222,6 +288,7 @@ struct Peer {
     req: u64,
     measured: bool,
     samples: Samples,
+    batches: BTreeMap<u64, (usize, Duration, Duration)>,
     receiver: Option<ReceiverProbe>,
 }
 
@@ -236,12 +303,17 @@ impl Peer {
         let service = TidbService::connect_local(database, id, engine(), mode)
             .await
             .unwrap();
+        Self::new(service)
+    }
+
+    fn new(service: TidbService) -> Self {
         Self {
             service,
             cid: None,
             req: 0,
             measured: false,
             samples: Samples::new(),
+            batches: BTreeMap::new(),
             receiver: None,
         }
     }
@@ -355,14 +427,9 @@ impl Peer {
         let started = Instant::now();
         let call = self.service.handle_frame(self.cid, &frame);
         let (result, spans) = if self.measured {
-            SPANS
-                .scope(RefCell::new(Vec::new()), async {
-                    let result = call.await;
-                    (result, SPANS.with(|spans| spans.take()))
-                })
-                .await
+            capture(call).await
         } else {
-            (call.await, Vec::new())
+            (call.await, Spans::default())
         };
         let elapsed = started.elapsed();
         let (cid, output) = result.unwrap();
@@ -370,12 +437,21 @@ impl Peer {
         let [response] = output.responses.try_into().expect("one response");
         self.sample(kind, "request", elapsed);
         if let (Some((_, total)), Some((_, control))) = (
-            spans.iter().find(|(metric, _)| *metric == "send_tx"),
-            spans.iter().find(|(metric, _)| *metric == "control_sql"),
+            spans
+                .timings
+                .iter()
+                .find(|(metric, _)| *metric == "send_tx"),
+            spans
+                .timings
+                .iter()
+                .find(|(metric, _)| *metric == "control_sql"),
         ) {
             self.sample(kind, "send_tx_other", total.saturating_sub(*control));
         }
-        for (metric, value) in spans {
+        if let Some((id, size, transaction, control_sql)) = spans.batch {
+            self.batches.insert(id, (size, transaction, control_sql));
+        }
+        for (metric, value) in spans.timings {
             self.sample(kind, metric, value);
         }
         let decoded = decode_frame(&self::frame(&response)).unwrap().body;

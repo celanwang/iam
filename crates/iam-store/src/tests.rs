@@ -337,7 +337,10 @@ async fn tidb_upgrade_preserves_receipts_and_account_cursors() {
         limit,
         ..SyncRequest::default()
     };
-    let sync_response::Value::Reset(reset) = store.sync(key.owner, &request).await else {
+    let sync_response::Value::Reset(reset) = store
+        .sync_at(key.owner, &request, store.now().await.unwrap())
+        .await
+    else {
         panic!("expected initial account reset");
     };
     let snapshot_response::Value::Page(page) = store
@@ -378,7 +381,10 @@ async fn tidb_upgrade_preserves_receipts_and_account_cursors() {
         committed(resumed.decide(&key, None, true).await.unwrap()),
         receipt
     );
-    let sync_response::Value::Page(page) = resumed.sync(key.owner, &request).await else {
+    let sync_response::Value::Page(page) = resumed
+        .sync_at(key.owner, &request, resumed.now().await.unwrap())
+        .await
+    else {
         panic!("old account cursor must remain valid");
     };
     assert_eq!(page.covered_through, Some(1));
