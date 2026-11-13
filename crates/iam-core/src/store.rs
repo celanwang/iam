@@ -17,6 +17,15 @@ pub struct UserRecord {
     pub access_token: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceCredential {
+    pub tenant_id: u64,
+    pub user_id: u64,
+    pub device_id: Id128,
+    pub expires_at_ms: i64,
+    pub token_sha256: [u8; 32],
+}
+
 #[derive(Debug, Clone)]
 pub struct Conversation {
     pub tenant_id: u64,
@@ -77,6 +86,7 @@ pub struct ConnState {
     pub tenant_id: u64,
     pub device_id: Id128,
     pub auth_epoch: Id128,
+    pub authorization_expires_at_ms: Option<i64>,
     pub last_req_id: u64,
     pub push_ack: bool,
     pub next_push_id: u64,
@@ -102,6 +112,8 @@ pub struct MemoryStore {
     pub device_conn: HashMap<(u64, u64, Id128), Id128>,
     pub account_streams: HashMap<(u64, u64), AccountStream>,
     pub revoked_auth_epochs: HashSet<Id128>,
+    pub(crate) device_credentials: Option<HashMap<[u8; 32], (Id128, DeviceCredential)>>,
+    pub(crate) credential_devices: HashMap<(u64, u64, Id128), [u8; 32]>,
     /// Monotonic close proof watermark over client_msg time coverage (ms).
     pub close_watermark_ms: i64,
     pub now_ms: i64,
@@ -114,6 +126,98 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// Enables device-bound credentials for a fresh network service.
+    pub fn configure_device_credentials(
+        &mut self,
+        credentials: impl IntoIterator<Item = DeviceCredential>,
+    ) -> Result<(), &'static str> {
+        if !self.connections.is_empty() || self.device_credentials.is_some() {
+            return Err("credentials require a fresh service");
+        }
+        let mut tokens = HashMap::new();
+        let mut devices = HashMap::new();
+        for c in credentials {
+            if c.tenant_id == 0
+                || c.user_id == 0
+                || iam_protocol::validate_id128(&c.device_id).is_err()
+                || c.expires_at_ms <= 0
+                || devices
+                    .insert((c.tenant_id, c.user_id, c.device_id), c.token_sha256)
+                    .is_some()
+                || tokens
+                    .insert(c.token_sha256, (generate_id128(), c))
+                    .is_some()
+            {
+                return Err("invalid or duplicate device credential");
+            }
+        }
+        if tokens.is_empty() {
+            return Err("device credentials are required");
+        }
+        self.credential_devices = devices;
+        self.device_credentials = Some(tokens);
+        Ok(())
+    }
+
+    pub fn uses_device_credentials(&self) -> bool {
+        self.device_credentials.is_some()
+    }
+
+    pub(crate) fn credential_for_token(&self, token: &[u8]) -> Option<(Id128, DeviceCredential)> {
+        let digest: [u8; 32] = Sha256::digest(token).into();
+        self.device_credentials.as_ref()?.get(&digest).copied()
+    }
+
+    pub fn session_expires_at(&self, cid: Id128) -> Option<i64> {
+        self.connections.get(&cid)?.authorization_expires_at_ms
+    }
+
+    pub(crate) fn credential(
+        &self,
+        tenant: u64,
+        user: u64,
+        device: Id128,
+        epoch: Id128,
+    ) -> Option<DeviceCredential> {
+        let digest = self.credential_devices.get(&(tenant, user, device))?;
+        let (current, credential) = self.device_credentials.as_ref()?.get(digest)?;
+        (*current == epoch).then_some(*credential)
+    }
+
+    pub fn session_authorized(&self, cid: Id128) -> bool {
+        self.connections.get(&cid).is_some_and(|conn| {
+            conn.authorized_at(&self.revoked_auth_epochs, self.authorization_time())
+        })
+    }
+
+    pub fn revoke_device(&mut self, tenant: u64, user: u64, device: Id128) -> Option<Id128> {
+        let owner = (tenant, user, device);
+        let digest = self.credential_devices.get(&owner)?;
+        let (epoch, _) = self.device_credentials.as_ref()?.get(digest)?;
+        self.revoked_auth_epochs.insert(*epoch);
+        self.device_conn.get(&owner).copied()
+    }
+
+    pub(crate) fn authorization_valid(
+        &self,
+        tenant: u64,
+        user: u64,
+        device: Id128,
+        epoch: Id128,
+    ) -> bool {
+        !self.revoked_auth_epochs.contains(&epoch)
+            && (!self.uses_device_credentials()
+                || self
+                    .credential(tenant, user, device, epoch)
+                    .is_some_and(|c| c.expires_at_ms > self.authorization_time()))
+    }
+
+    pub(crate) fn authorization_time(&self) -> i64 {
+        self.now_ms
+            .max(self.max_observed_now_ms)
+            .max(wall_time_ms())
+    }
+
     pub fn new(now_ms: i64) -> Self {
         Self {
             now_ms,
@@ -293,6 +397,23 @@ impl MemoryStore {
         });
         msgs
     }
+}
+
+impl ConnState {
+    pub(crate) fn authorized_at(&self, revoked: &HashSet<Id128>, now_ms: i64) -> bool {
+        !revoked.contains(&self.auth_epoch)
+            && self
+                .authorization_expires_at_ms
+                .is_none_or(|deadline| now_ms < deadline)
+    }
+}
+
+fn wall_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| duration.as_millis().try_into().ok())
+        .unwrap_or(i64::MAX)
 }
 
 pub fn conversation_state(c: &Conversation) -> ConversationState {

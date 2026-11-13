@@ -3,12 +3,14 @@ use iam_protocol::pb::{auth_response, AuthRequest, Head, PageLimit, ProtocolErro
 use iam_protocol::{decode_frame, encode_frame, DecodedBody, DecodedFrame, FrameDecoder, MsgType};
 use prost::Message;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 pub(crate) struct Wire<'a, T> {
     pub transport: &'a mut T,
     timeout: Duration,
     req_id: u64,
+    heartbeat_interval: Duration,
+    heartbeat_at: Instant,
     pub limit: PageLimit,
 }
 
@@ -18,6 +20,8 @@ impl<'a, T: Transport> Wire<'a, T> {
             transport,
             timeout: options.request_timeout,
             req_id: 0,
+            heartbeat_interval: Duration::from_secs(30),
+            heartbeat_at: Instant::now(),
             limit: PageLimit {
                 max_items: Some(options.page_items),
                 max_bytes: Some(256 * 1024),
@@ -50,11 +54,33 @@ impl<'a, T: Transport> Wire<'a, T> {
                     && session.user_id == Some(identity.user_id)
                     && session.device_id.as_deref() == Some(identity.device_id.as_slice()) =>
             {
+                self.heartbeat_interval = session
+                    .limits
+                    .and_then(|limits| limits.heartbeat_interval_ms)
+                    .filter(|&interval| interval != 0)
+                    .map_or(Duration::from_secs(30), |interval| {
+                        Duration::from_millis(interval.into())
+                    });
+                self.heartbeat_at = Instant::now() + self.heartbeat_interval;
                 Ok(())
             }
             Some(auth_response::Value::Session(_)) => Err(Error::IdentityMismatch),
             Some(auth_response::Value::Error(error)) => Err(Error::Server(error)),
             None => Err(Error::Invalid("missing auth result")),
+        }
+    }
+
+    pub fn heartbeat_at(&self) -> Instant {
+        self.heartbeat_at
+    }
+
+    pub async fn heartbeat(&mut self) -> Result<()> {
+        let response = self
+            .request(MsgType::Heartbeat, &iam_protocol::pb::HeartbeatRequest {})
+            .await?;
+        match response {
+            DecodedBody::HeartbeatAck(_) => Ok(()),
+            _ => Err(Error::Invalid("expected HEARTBEAT_ACK")),
         }
     }
 
@@ -75,6 +101,7 @@ impl<'a, T: Transport> Wire<'a, T> {
         if response.head != head && !is_connection_error(&response) {
             return Err(Error::Invalid("response request ID"));
         }
+        self.heartbeat_at = Instant::now() + self.heartbeat_interval;
         match response.body {
             DecodedBody::Error(error) => Err(server_error(error)),
             body => Ok(body),

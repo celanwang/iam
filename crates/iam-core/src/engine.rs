@@ -261,6 +261,49 @@ impl Engine {
         })
     }
 
+    /// Reject a complete request before dispatch, using the same request ID watermark.
+    pub fn reject_overloaded(
+        &mut self,
+        connection_id: Option<Id128>,
+        frame: &iam_protocol::Frame,
+    ) -> Result<EngineReply, CoreError> {
+        let Ok(decoded) = iam_protocol::decode_frame(frame) else {
+            return self.handle_frame(connection_id, frame);
+        };
+        if let Some(reply) = self.preflight(connection_id, &decoded)? {
+            return Ok(reply);
+        }
+        if connection_id.is_some() && matches!(decoded.msg_type, MsgType::Auth | MsgType::Reconnect)
+        {
+            return self.wire_error(
+                &decoded,
+                connection_id,
+                ErrorCode::InvalidArgument,
+                RetryAction::None,
+                false,
+                Some("already authenticated"),
+            );
+        }
+        if let Some(cid) = connection_id {
+            if !matches!(
+                decoded.msg_type,
+                MsgType::PushAck | MsgType::Auth | MsgType::Reconnect
+            ) {
+                if let Err(reply) = self.check_req_id(cid, &decoded) {
+                    return Ok(reply);
+                }
+            }
+        }
+        self.wire_error(
+            &decoded,
+            connection_id,
+            ErrorCode::Overloaded,
+            RetryAction::RetrySameRequest,
+            false,
+            None,
+        )
+    }
+
     fn preflight(
         &mut self,
         connection_id: Option<Id128>,
@@ -280,7 +323,14 @@ impl Engine {
                 )
                 .map(Some);
         }
-        if !matches!(frame.body, DecodedBody::Auth(_) | DecodedBody::Reconnect(_)) {
+        if matches!(frame.body, DecodedBody::Auth(_) | DecodedBody::Reconnect(_)) {
+            if let Some(cid) = connection_id.filter(|cid| self.store.connections.contains_key(cid))
+            {
+                if let Err(reply) = self.check_req_id(cid, frame) {
+                    return Ok(Some(reply));
+                }
+            }
+        } else {
             let cid = match self.require_auth(connection_id, frame)? {
                 AuthGate::Ok(cid) => cid,
                 AuthGate::Respond(out) => return Ok(Some(out)),
@@ -506,8 +556,32 @@ impl Engine {
                 ));
             }
         };
-        let user = match self.store.users_by_token.get(token).cloned() {
-            Some(u) => u,
+        let authorization = if self.store.uses_device_credentials() {
+            self.store
+                .credential_for_token(token)
+                .and_then(|(epoch, credential)| {
+                    (credential.device_id == device_id
+                        && self.store.authorization_valid(
+                            credential.tenant_id,
+                            credential.user_id,
+                            device_id,
+                            epoch,
+                        ))
+                    .then_some((
+                        credential.tenant_id,
+                        credential.user_id,
+                        epoch,
+                        Some(credential.expires_at_ms),
+                    ))
+                })
+        } else {
+            self.store
+                .users_by_token
+                .get(token)
+                .map(|user| (user.tenant_id, user.user_id, generate_id128(), None))
+        };
+        let (tenant_id, user_id, auth_epoch, authorization_expires_at_ms) = match authorization {
+            Some(authorization) => authorization,
             None => {
                 let body = AuthResponse {
                     value: Some(iam_protocol::pb::auth_response::Value::Error(error_info(
@@ -527,17 +601,17 @@ impl Engine {
         };
 
         let connection_id = generate_id128();
-        let auth_epoch = generate_id128();
-        let pushes = self
-            .replace_device_connection((user.tenant_id, user.user_id, device_id), connection_id)?;
+        let pushes =
+            self.replace_device_connection((tenant_id, user_id, device_id), connection_id)?;
         self.store.connections.insert(
             connection_id,
             ConnState {
                 connection_id,
-                user_id: user.user_id,
-                tenant_id: user.tenant_id,
+                user_id,
+                tenant_id,
                 device_id,
                 auth_epoch,
+                authorization_expires_at_ms,
                 last_req_id: frame.head.req_id.unwrap_or(0),
                 push_ack: caps.iter().any(|c| c == "push_ack"),
                 next_push_id: 1,
@@ -546,20 +620,14 @@ impl Engine {
             },
         );
         let resume = self.tokens.sign_resume(&ResumeToken {
-            tenant_id: user.tenant_id,
-            user_id: user.user_id,
+            tenant_id,
+            user_id,
             device_id,
             auth_epoch,
             issued_at_ms: self.store.now_ms,
         });
-        let session = self.build_session(
-            user.tenant_id,
-            user.user_id,
-            device_id,
-            connection_id,
-            caps,
-            resume,
-        );
+        let session =
+            self.build_session(tenant_id, user_id, device_id, connection_id, caps, resume);
         let body = AuthResponse {
             value: Some(iam_protocol::pb::auth_response::Value::Session(session)),
         };
@@ -661,7 +729,12 @@ impl Engine {
                 ));
             }
         };
-        if self.store.revoked_auth_epochs.contains(&resume.auth_epoch) {
+        if !self.store.authorization_valid(
+            resume.tenant_id,
+            resume.user_id,
+            device_id,
+            resume.auth_epoch,
+        ) {
             let body = ReconnectResponse {
                 value: Some(iam_protocol::pb::reconnect_response::Value::Error(
                     error_info(ErrorCode::Unauthenticated, RetryAction::Reauthenticate),
@@ -690,6 +763,15 @@ impl Engine {
                 tenant_id: resume.tenant_id,
                 device_id,
                 auth_epoch: resume.auth_epoch,
+                authorization_expires_at_ms: self
+                    .store
+                    .credential(
+                        resume.tenant_id,
+                        resume.user_id,
+                        device_id,
+                        resume.auth_epoch,
+                    )
+                    .map(|credential| credential.expires_at_ms),
                 last_req_id: frame.head.req_id.unwrap_or(0),
                 push_ack: caps.iter().any(|c| c == "push_ack"),
                 next_push_id: 1,
@@ -1079,11 +1161,13 @@ impl Engine {
         context: &iam_protocol::pb::StreamContext,
         change: &Change,
     ) -> Result<(), CoreError> {
-        for peer in self.store.connections.values_mut().filter(|peer| {
+        let authorization_time = self.store.authorization_time();
+        let store = &mut self.store;
+        for peer in store.connections.values_mut().filter(|peer| {
             peer.tenant_id == tenant_id
                 && peer.connection_id != sender
                 && members.contains(&peer.user_id)
-                && !self.store.revoked_auth_epochs.contains(&peer.auth_epoch)
+                && peer.authorized_at(&store.revoked_auth_epochs, authorization_time)
         }) {
             let push_id = peer.next_push_id;
             let Some(next) = push_id.checked_add(1) else {
@@ -2427,11 +2511,7 @@ impl Engine {
             )?;
             return Ok(AuthGate::Respond(out));
         }
-        if self
-            .store
-            .revoked_auth_epochs
-            .contains(&self.store.connections[&cid].auth_epoch)
-        {
+        if !self.store.session_authorized(cid) {
             return Ok(AuthGate::Respond(self.wire_error(
                 frame,
                 Some(cid),

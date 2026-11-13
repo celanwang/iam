@@ -108,6 +108,34 @@ impl TidbService {
         self.engine.lock().unwrap().disconnect(connection_id);
     }
 
+    pub fn uses_device_credentials(&self) -> bool {
+        self.engine.lock().unwrap().store.uses_device_credentials()
+    }
+
+    pub fn gateway_session_expiry(&self, cid: Id128) -> std::result::Result<i64, ErrorCode> {
+        let engine = self.engine.lock().unwrap();
+        let expires_at = engine
+            .store
+            .session_expires_at(cid)
+            .ok_or(ErrorCode::SessionReplaced)?;
+        if !engine.store.session_authorized(cid) {
+            return Err(ErrorCode::Unauthenticated);
+        }
+        Ok(expires_at)
+    }
+
+    pub fn revoke_device(&self, tenant: u64, user: u64, device: Id128) -> Option<Id128> {
+        self.engine
+            .lock()
+            .unwrap()
+            .store
+            .revoke_device(tenant, user, device)
+    }
+
+    pub fn reject_overloaded(&self, cid: Option<Id128>, frame: &Frame) -> Result<EngineReply> {
+        Ok(self.engine.lock().unwrap().reject_overloaded(cid, frame)?)
+    }
+
     pub fn stop_accepting(&self) {
         self.accepting.store(false, Ordering::Relaxed);
     }
@@ -161,11 +189,7 @@ impl TidbService {
             .connections
             .get(&cid)
             .ok_or(Error::Unauthenticated)?;
-        if engine
-            .store
-            .revoked_auth_epochs
-            .contains(&session.auth_epoch)
-        {
+        if !engine.store.session_authorized(cid) {
             return Err(Error::Unauthenticated);
         }
         Ok(Identity {

@@ -3,7 +3,10 @@
 mod history;
 mod storage;
 mod sync;
+mod tls;
 mod wire;
+
+pub use tls::TlsTransport;
 
 use history::HistoryRounds;
 use iam_protocol::pb::{
@@ -232,7 +235,10 @@ impl Client {
                 return Ok(());
             }
             let due = if online {
-                sync_at.min(send_at).min(history_at.unwrap_or(sync_at))
+                sync_at
+                    .min(send_at)
+                    .min(history_at.unwrap_or(sync_at))
+                    .min(wire.heartbeat_at())
             } else {
                 connect_at
             };
@@ -253,6 +259,11 @@ impl Client {
                             history_rounds.clear();
                         }
                         result
+                    } else if wire.heartbeat_at() == due {
+                        match wire.heartbeat().await {
+                            Err(error) if retryable(&error) => Ok(()),
+                            result => result,
+                        }
                     } else if sync_at == due {
                         match self.synchronize(&mut wire).await {
                             Ok(()) => {
