@@ -273,8 +273,22 @@ impl Engine {
         if let Some(reply) = self.preflight(connection_id, &decoded)? {
             return Ok(reply);
         }
+        if connection_id.is_some() && matches!(decoded.msg_type, MsgType::Auth | MsgType::Reconnect)
+        {
+            return self.wire_error(
+                &decoded,
+                connection_id,
+                ErrorCode::InvalidArgument,
+                RetryAction::None,
+                false,
+                Some("already authenticated"),
+            );
+        }
         if let Some(cid) = connection_id {
-            if decoded.msg_type != MsgType::PushAck {
+            if !matches!(
+                decoded.msg_type,
+                MsgType::PushAck | MsgType::Auth | MsgType::Reconnect
+            ) {
                 if let Err(reply) = self.check_req_id(cid, &decoded) {
                     return Ok(reply);
                 }
@@ -309,7 +323,14 @@ impl Engine {
                 )
                 .map(Some);
         }
-        if !matches!(frame.body, DecodedBody::Auth(_) | DecodedBody::Reconnect(_)) {
+        if matches!(frame.body, DecodedBody::Auth(_) | DecodedBody::Reconnect(_)) {
+            if let Some(cid) = connection_id.filter(|cid| self.store.connections.contains_key(cid))
+            {
+                if let Err(reply) = self.check_req_id(cid, frame) {
+                    return Ok(Some(reply));
+                }
+            }
+        } else {
             let cid = match self.require_auth(connection_id, frame)? {
                 AuthGate::Ok(cid) => cid,
                 AuthGate::Respond(out) => return Ok(Some(out)),

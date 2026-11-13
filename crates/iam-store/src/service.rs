@@ -112,13 +112,16 @@ impl TidbService {
         self.engine.lock().unwrap().store.uses_device_credentials()
     }
 
-    pub fn session_expires_at(&self, cid: Id128) -> Option<i64> {
+    pub fn gateway_session_expiry(&self, cid: Id128) -> std::result::Result<i64, ErrorCode> {
         let engine = self.engine.lock().unwrap();
-        if engine.store.session_authorized(cid) {
-            engine.store.session_expires_at(cid)
-        } else {
-            None
+        let expires_at = engine
+            .store
+            .session_expires_at(cid)
+            .ok_or(ErrorCode::SessionReplaced)?;
+        if !engine.store.session_authorized(cid) {
+            return Err(ErrorCode::Unauthenticated);
         }
+        Ok(expires_at)
     }
 
     pub fn revoke_device(&self, tenant: u64, user: u64, device: Id128) -> Option<Id128> {

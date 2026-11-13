@@ -6,6 +6,7 @@ members = [
     "crates/iam-core",
     "crates/iam-loop",
     "crates/iam-store",
+    "crates/iam-gateway",
 ]
 
 [workspace.package]
@@ -21,4 +22,5 @@ prost = "0.13"
 prost-types = "0.13"
 sha2 = "0.10"
 thiserror = "2"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 uuid = { version = "1", features = ["v7"] }
