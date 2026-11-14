@@ -16,6 +16,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug)]
 pub enum OpenMode {
@@ -86,6 +87,46 @@ impl TidbService {
         engine: Engine,
         mode: OpenMode,
     ) -> Result<Self> {
+        Self::open(url, store_id, engine, mode, crate::clock::WINDOW).await
+    }
+
+    #[cfg(feature = "profile")]
+    #[doc(hidden)]
+    pub async fn connect_local_profiled(
+        url: &str,
+        store_id: Id128,
+        engine: Engine,
+        mode: OpenMode,
+        window_ms: u64,
+    ) -> Result<Self> {
+        if !matches!(window_ms, 1 | 2 | 4) {
+            return Err(Error::Configuration(
+                "profile clock window must be 1, 2 or 4 ms",
+            ));
+        }
+        Self::open(
+            url,
+            store_id,
+            engine,
+            mode,
+            Duration::from_millis(window_ms),
+        )
+        .await
+    }
+
+    #[cfg(feature = "profile")]
+    #[doc(hidden)]
+    pub fn clock_counts(&self) -> crate::profile::ClockCounts {
+        self.clock.counts()
+    }
+
+    async fn open(
+        url: &str,
+        store_id: Id128,
+        engine: Engine,
+        mode: OpenMode,
+        window: Duration,
+    ) -> Result<Self> {
         if !engine.store.connections.is_empty() || engine.store.recovery_incomplete {
             return Err(Error::Configuration(
                 "expected a fresh engine for the TiDB protocol",
@@ -93,7 +134,7 @@ impl TidbService {
         }
         let seeds = matches!(mode, OpenMode::Initialize).then_some(&engine.store);
         let database = Arc::new(TidbStore::open(url, store_id, seeds).await?);
-        let clock = ClockBatch::start(database.clone());
+        let clock = ClockBatch::start(database.clone(), window);
         Ok(Self {
             engine: Arc::new(Mutex::new(engine)),
             database,

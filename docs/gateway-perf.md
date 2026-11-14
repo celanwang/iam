@@ -94,3 +94,43 @@ IAM_TIDB_ALLOW_TEST_WRITES=1 \
 cargo test --locked -p iam-gateway --features profile --test tls \
   capacity::tidb_tls_gateway_reconnect_profile -- --exact --ignored --nocapture
 ```
+
+## 时钟合批窗口对照
+
+以 `e700682` 为基线，沿用网关的 75 ms 入场等待、原有发送事务和压测负载。在同一真实 TCP + TLS 和 TiDB 环境下，分别用 1、2、4 ms 的时钟收集窗口测试纯发送、32 台和 64 台重连。每个场景做三轮，轮换窗口先后顺序，共 27 组。每组独立建库，测量前结束建连和预热。
+
+`clock_committed` 在时钟后台任务确认 TiDB 提交时增一，一笔事务只记一次。`clock_requests` 是成功取得该批次采样结果的请求数。时钟提交数覆盖 `AUTH`、`RECONNECT`、`SYNC` 共用的采样器。纯发送仍在各自的发送事务内采样，因此合批时钟事务数应为零。发送 P99 使用客户端实际发出并取得提交回执的请求，另外记录未发出数量。补齐时间从重连放行计到最后一台设备的游标和消息落盘。
+
+表中每格按第一、第二、第三轮顺序记录。各组计划发送 600 次。全部发出的请求均取得提交回执，所有重连设备均补齐并通过消息连续性检查。各组时钟事务尝试数与确认提交数相同。
+
+| 重连设备数 | 窗口（ms） | 合批时钟事务数 | 发送 P99（ms） | 最后一台落盘（ms） | 未发出 |
+|---|---:|---:|---:|---:|---:|
+| 0 | 1 | 0 / 0 / 0 | 10.64 / 9.15 / 23.34 | — | 0 / 0 / 1 |
+| 0 | 2 | 0 / 0 / 0 | 62.50 / 10.34 / 15.83 | — | 16 / 0 / 0 |
+| 0 | 4 | 0 / 0 / 0 | 105.43 / 13.24 / 11.10 | — | 57 / 0 / 0 |
+| 32 | 1 | 18 / 18 / 30 | 21.47 / 30.50 / 202.06 | 228.87 / 233.88 / 591.20 | 0 / 0 / 147 |
+| 32 | 2 | 19 / 18 / 20 | 23.90 / 17.46 / 68.04 | 239.87 / 254.36 / 283.83 | 0 / 0 / 18 |
+| 32 | 4 | 19 / 19 / 18 | 23.35 / 17.05 / 203.55 | 244.61 / 227.42 / 322.86 | 1 / 0 / 105 |
+| 64 | 1 | 41 / 43 / 40 | 31.64 / 20.90 / 24.53 | 543.33 / 538.86 / 550.84 | 1 / 0 / 0 |
+| 64 | 2 | 40 / 39 / 38 | 30.02 / 27.60 / 27.17 | 549.01 / 554.45 / 576.41 | 0 / 0 / 0 |
+| 64 | 4 | 55 / 39 / 37 | 62.20 / 24.89 / 31.21 | 1,252.53 / 545.00 / 535.35 | 11 / 0 / 1 |
+
+保留 **1 ms**。64 台重连时，2 ms 三轮都减少了时钟事务，合计从 124 笔降到 117 笔，约减少 5.6%。但三轮发送 P99 的中位数从 24.53 升到 27.60 ms，最后落盘中位数从 543.33 升到 554.45 ms。4 ms 在首轮增加了时钟事务，补齐耗时达到 1.25 秒。32 台的时钟事务中位数为 18、19、19。该负载的第三轮发送 P99 波动较大，纯发送也出现了长尾。选择窗口时保留这些样本，并同时比较提交量和未发出数量。
+
+1、2、4 ms 分别复验了 TiDB 时钟回拨、增量同步与分页票据到期、恢复票据到期、时钟批次提交响应丢失和未决发送跨关窗。分页票据在等于到期时间时返回 `PAGE_TOKEN_EXPIRED`，客户端可从最后保存的游标继续。旧发送持锁时，时钟批次和状态查询等待结算。
+
+```sh
+export IAM_TIDB_TEST_URL='mysql://root@127.0.0.1:4000/iam_test'
+export IAM_TIDB_ALLOW_TEST_WRITES=1
+cargo test --locked -p iam-gateway --features profile --test tls \
+  capacity::tidb_tls_gateway_clock_windows -- --exact --ignored --nocapture
+
+for window in 1 2 4; do
+  IAM_TIDB_TEST_CLOCK_WINDOW_MS="$window" \
+    cargo test --locked -p iam-store --features profile --test durability \
+    tidb_clock_batch_ -- --ignored --test-threads=1
+  IAM_TIDB_TEST_CLOCK_WINDOW_MS="$window" \
+    cargo test --locked -p iam-store --features profile --test durability \
+    tidb_protocol_preserves_the_close_watermark_during_clock_rollback -- --exact --ignored
+done
+```

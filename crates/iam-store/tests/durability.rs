@@ -316,7 +316,7 @@ async fn tidb_protocol_preserves_the_close_watermark_during_clock_rollback() {
     let database = support::isolated_database().await;
     let store_id = generate_id128();
     let service =
-        TidbService::connect_local(database.as_str(), store_id, seeded(), OpenMode::Initialize)
+        open_clock_test_service(database.as_str(), store_id, seeded(), OpenMode::Initialize)
             .await
             .unwrap();
     let mut alice = Peer::new();
@@ -338,7 +338,7 @@ async fn tidb_protocol_preserves_the_close_watermark_during_clock_rollback() {
         .unwrap();
 
     let service =
-        TidbService::connect_local(database.as_str(), store_id, identities(), OpenMode::Resume)
+        open_clock_test_service(database.as_str(), store_id, identities(), OpenMode::Resume)
             .await
             .unwrap();
     alice.auth(&service, b"alice").await;
@@ -626,10 +626,10 @@ fn client_id_days_ago(milliseconds: u64) -> Id128 {
 #[tokio::test]
 #[ignore = "requires real local TiDB"]
 async fn tidb_clock_batch_rejects_expired_tickets_during_clock_rollback() {
-    use iam_protocol::pb::{reconnect_response, ReconnectRequest, ResetReason};
+    use iam_protocol::pb::{reconnect_response, ReconnectRequest, ResetReason, RetryAction};
 
     let database = support::isolated_database().await;
-    let service = TidbService::connect_local(
+    let service = open_clock_test_service(
         database.as_str(),
         generate_id128(),
         seeded(),
@@ -677,6 +677,22 @@ async fn tidb_clock_batch_rejects_expired_tickets_during_clock_rollback() {
         .await,
     );
     assert_change(&normal, &sent);
+    let (sent, _) = alice
+        .send(&service, &message_key(1, generate_id128()), "next page")
+        .await;
+    committed(sent);
+    let first_page = sync_page(
+        bob.sync(
+            &service,
+            target,
+            Some(old_cursor.clone()),
+            None,
+            1,
+            256 * 1024,
+        )
+        .await,
+    );
+    let page_token = first_page.next_page_token.unwrap().to_vec();
 
     let db = sqlx::MySqlPool::connect(database.as_str()).await.unwrap();
     let (observed,): (i64,) = sqlx::query_as("SELECT max_observed_now_ms FROM store_control")
@@ -690,6 +706,31 @@ async fn tidb_clock_batch_rejects_expired_tickets_during_clock_rollback() {
     let signer = iam_core::TokenSigner::new(token_key.try_into().unwrap());
     let cursor = signer.verify_cursor(&old_cursor, observed).unwrap();
     let day = 86_400_000;
+    let (page, expired) = signer
+        .verify_page_with_expiry(&page_token, observed)
+        .unwrap();
+    assert!(!expired);
+    let page_deadline = page.round_started_ms + 15 * 60 * 1000;
+    sqlx::query("UPDATE store_control SET max_observed_now_ms = ?, closed_through_client_ms = ? WHERE singleton = 1")
+        .bind(page_deadline).bind(page_deadline - day).execute(&db).await.unwrap();
+    let expired_page = bob
+        .sync(&service, target, None, Some(page_token), 1, 256 * 1024)
+        .await;
+    assert!(matches!(expired_page, sync_response::Value::Error(error)
+        if error.code() == ErrorCode::PageTokenExpired && error.action() == RetryAction::ResumeSync));
+    let resumed = sync_page(
+        bob.sync(
+            &service,
+            target,
+            Some(first_page.next_cursor.unwrap().to_vec()),
+            None,
+            1,
+            256 * 1024,
+        )
+        .await,
+    );
+    assert_eq!(resumed.covered_through, Some(2));
+
     let deadline = cursor.issued_at_ms + 30 * day;
     sqlx::query("UPDATE store_control SET max_observed_now_ms = ?, closed_through_client_ms = ? WHERE singleton = 1")
         .bind(deadline).bind(deadline - day).execute(&db).await.unwrap();
@@ -760,7 +801,7 @@ async fn tidb_clock_batch_retries_when_its_commit_response_is_lost() {
 
     let database = support::isolated_database().await;
     let proxy = CommitProxy::start(&database).await;
-    let service = TidbService::connect_local(
+    let service = open_clock_test_service(
         proxy.url.as_str(),
         generate_id128(),
         seeded(),
@@ -837,10 +878,10 @@ async fn tidb_clock_batch_and_status_wait_for_an_unsettled_send_at_close() {
     let store_id = generate_id128();
     let proxy = CommitProxy::start(&db).await;
     let writer =
-        TidbService::connect_local(proxy.url.as_str(), store_id, seeded(), OpenMode::Initialize)
+        open_clock_test_service(proxy.url.as_str(), store_id, seeded(), OpenMode::Initialize)
             .await
             .unwrap();
-    let reader = TidbService::connect_local(db.as_str(), store_id, identities(), OpenMode::Resume)
+    let reader = open_clock_test_service(db.as_str(), store_id, identities(), OpenMode::Resume)
         .await
         .unwrap();
     let mut alice = Peer::new();
@@ -914,4 +955,20 @@ async fn tidb_clock_batch_and_status_wait_for_an_unsettled_send_at_close() {
     assert!(matches!(retry, send_outcome::Value::RejectedFinal(error)
         if error.code() == ErrorCode::RequestExpired));
     assert!(pushes.is_empty());
+}
+
+async fn open_clock_test_service(
+    url: &str,
+    store_id: Id128,
+    engine: Engine,
+    mode: OpenMode,
+) -> iam_store::Result<TidbService> {
+    #[cfg(feature = "profile")]
+    if let Ok(window) = std::env::var("IAM_TIDB_TEST_CLOCK_WINDOW_MS") {
+        let window = window
+            .parse()
+            .expect("integer clock window in milliseconds");
+        return TidbService::connect_local_profiled(url, store_id, engine, mode, window).await;
+    }
+    TidbService::connect_local(url, store_id, engine, mode).await
 }
