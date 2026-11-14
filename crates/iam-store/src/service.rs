@@ -1,7 +1,7 @@
 use crate::clock::ClockBatch;
 use crate::store::{unresolved, Decision, Scope, SendKey, TidbStore};
 use crate::{ConversationInfo, Error, Identity, Result, TextPage};
-use iam_core::{CoreError, Engine, EngineOutput, EngineReply, StorageRequest};
+use iam_core::{CoreError, DeviceCredential, Engine, EngineOutput, EngineReply, StorageRequest};
 use iam_protocol::pb::{
     change, message_content, send_outcome, Change, ErrorCode, HistoryResponse, MessageContent,
     MessageKey, RetryAction, SendOutcome, SendResponse, SendStatusResponse, SnapshotResponse,
@@ -110,6 +110,18 @@ impl TidbService {
 
     pub fn uses_device_credentials(&self) -> bool {
         self.engine.lock().unwrap().store.uses_device_credentials()
+    }
+
+    pub fn reload_device_credentials(
+        &self,
+        credentials: Vec<DeviceCredential>,
+    ) -> Result<Vec<Id128>> {
+        self.engine
+            .lock()
+            .unwrap()
+            .store
+            .reload_device_credentials(credentials)
+            .map_err(Error::Configuration)
     }
 
     pub fn gateway_session_expiry(&self, cid: Id128) -> std::result::Result<i64, ErrorCode> {
