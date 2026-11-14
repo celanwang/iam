@@ -206,9 +206,11 @@ impl TidbStore {
     }
 
     pub async fn now(&self) -> Result<i64> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "profile"))]
         let start = std::time::Instant::now();
         let mut tx = self.pool.begin().await?;
+        #[cfg(feature = "profile")]
+        crate::profile::record("clock_pool_begin", start.elapsed());
         let result = self
             .observe_clock(&mut tx)
             .await
@@ -216,6 +218,8 @@ impl TidbStore {
         let result = finish(tx, result).await;
         #[cfg(test)]
         perf::record("clock_tx", start);
+        #[cfg(feature = "profile")]
+        crate::profile::record("clock_tx", start.elapsed());
         result
     }
 
@@ -225,13 +229,17 @@ impl TidbStore {
         content: Option<&MessageContent>,
         accepting: bool,
     ) -> Result<Decision> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "profile"))]
         let start = std::time::Instant::now();
         let mut tx = self.pool.begin().await?;
+        #[cfg(feature = "profile")]
+        crate::profile::record("send_pool_begin", start.elapsed());
         let result = self.decide_in(&mut tx, key, content, accepting).await;
         let result = finish(tx, result).await;
         #[cfg(test)]
         perf::record("send_tx", start);
+        #[cfg(feature = "profile")]
+        crate::profile::record("send_tx", start.elapsed());
         result
     }
 
@@ -310,11 +318,13 @@ impl TidbStore {
     }
 
     async fn observe_clock(&self, tx: &mut Transaction<'_, MySql>) -> Result<DecisionClock> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "profile"))]
         let start = std::time::Instant::now();
         let row = sqlx::query(CONTROL).fetch_one(&mut **tx).await;
         #[cfg(test)]
         perf::record("control_sql", start);
+        #[cfg(feature = "profile")]
+        crate::profile::record("control_sql", start.elapsed());
         let row = row?;
         check_store_id(&row, self.id)?;
         let (previous, previous_watermark) = control_clock(&row)?;
