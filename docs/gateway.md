@@ -174,10 +174,12 @@ TLS 握手、认证和重连后的补齐分别限额。客户端已有带抖动�
 ```sh
 IAM_TIDB_TEST_URL='mysql://root@127.0.0.1:4000/iam_test' \
 IAM_TIDB_ALLOW_TEST_WRITES=1 \
-cargo test -p iam-gateway --test tls -- --ignored
+cargo test -p iam-gateway --test tls -- --ignored --skip capacity::
 ```
 
 首期优先验证心跳隔离、收发字节预算、发送和恢复的容量保护，以及发布排空。在相同硬件、负载与故障下找到首次无法满足发送 P99 或恢复目标的负载，再根据可接受的拒绝率和故障余量确定实例容量。若剖析显示复制、编码、调度或系统调用成为主耗时，再比较连接表分片、批量写与 `TCP_NODELAY`。
+
+真实 TCP + TLS 和 TiDB 下的固定速率发送、集中重连和慢读对照见 [网关容量压测](./gateway-perf.md)。
 
 ## 多实例与跨地域验收
 
