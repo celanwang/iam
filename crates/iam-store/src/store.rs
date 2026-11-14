@@ -328,7 +328,14 @@ impl TidbStore {
         let row = row?;
         check_store_id(&row, self.id)?;
         let (previous, previous_watermark) = control_clock(&row)?;
-        let now: i64 = sqlx::query_scalar(CLOCK_SQL).fetch_one(&mut **tx).await?;
+        #[cfg(feature = "profile")]
+        let started = std::time::Instant::now();
+        let sample = sqlx::query_scalar::<_, i64>(CLOCK_SQL)
+            .fetch_one(&mut **tx)
+            .await;
+        #[cfg(feature = "profile")]
+        crate::profile::record("clock_sample_sql", started.elapsed());
+        let now = sample?;
         if now < 0 {
             return Err(Error::Integrity("invalid database clock"));
         }
@@ -339,14 +346,19 @@ impl TidbStore {
             previous_watermark
         };
         if reliable && (now != previous || watermark != previous_watermark) {
-            sqlx::query(
-                "UPDATE store_control SET max_observed_now_ms = ?, \
+            #[cfg(feature = "profile")]
+            let started = std::time::Instant::now();
+            let update = sqlx::query(
+                "UPDATE store_control SET max_observed_now_ms = ?,
                          closed_through_client_ms = ? WHERE singleton = 1",
             )
             .bind(now)
             .bind(watermark)
             .execute(&mut **tx)
-            .await?;
+            .await;
+            #[cfg(feature = "profile")]
+            crate::profile::record("clock_update_sql", started.elapsed());
+            update?;
         }
         Ok(DecisionClock {
             now,
@@ -904,7 +916,12 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
 async fn finish<T>(transaction: Transaction<'_, MySql>, result: Result<T>) -> Result<T> {
     match result {
         Ok(value) => {
-            transaction.commit().await.map_err(Error::CommitUnknown)?;
+            #[cfg(feature = "profile")]
+            let started = std::time::Instant::now();
+            let committed = transaction.commit().await;
+            #[cfg(feature = "profile")]
+            crate::profile::record("commit_sql", started.elapsed());
+            committed.map_err(Error::CommitUnknown)?;
             Ok(value)
         }
         Err(error) => {
