@@ -1,3 +1,5 @@
+#[path = "support/capacity.rs"]
+mod capacity;
 #[allow(dead_code)]
 #[path = "../../iam-store/tests/support/commit_proxy.rs"]
 mod commit_proxy;
@@ -418,7 +420,7 @@ impl Fixture {
             certificate,
             key: PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()),
             roots,
-            expires_at_ms: iam_protocol::id128_timestamp_ms(&generate_id128()) as i64 + 60_000,
+            expires_at_ms: iam_protocol::id128_timestamp_ms(&generate_id128()) as i64 + 600_000,
         }
     }
 
@@ -427,18 +429,29 @@ impl Fixture {
     }
 
     async fn start_at(&self, mode: OpenMode, limits: Limits, address: &str) -> RunningGateway {
+        self.start_with_credentials(mode, limits, address, self.credentials())
+            .await
+    }
+
+    async fn start_with_credentials(
+        &self,
+        mode: OpenMode,
+        limits: Limits,
+        address: &str,
+        credentials: impl IntoIterator<Item = DeviceCredential>,
+    ) -> RunningGateway {
         let mut engine = Engine::new(0);
         engine.store.seed_direct(1, 1, 100, 200);
         engine
             .store
-            .configure_device_credentials(self.credentials())
+            .configure_device_credentials(credentials)
             .unwrap();
 
         let service = TidbService::connect_local(self.database.as_str(), self.store, engine, mode)
             .await
             .unwrap();
         let gateway = Gateway::new(
-            service,
+            service.clone(),
             vec![self.certificate.clone()],
             self.key.clone_key().into(),
             limits,
@@ -458,6 +471,7 @@ impl Fixture {
         });
         RunningGateway {
             gateway,
+            service,
             roots: self.roots.clone(),
             address,
             stop,
@@ -480,6 +494,7 @@ impl Fixture {
 
 struct RunningGateway {
     gateway: Arc<Gateway>,
+    service: TidbService,
     roots: rustls::RootCertStore,
     address: String,
     stop: oneshot::Sender<()>,
