@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "TiDB storage for the IAM protocol and local console"
 
+[features]
+profile = []
+
 [dependencies]
 getrandom = "0.4"
 hex = { workspace = true }

@@ -5,6 +5,10 @@ mod service;
 mod store;
 mod sync;
 
+#[cfg(feature = "profile")]
+#[doc(hidden)]
+pub mod profile;
+
 pub use service::{OpenMode, TidbService};
 
 use iam_protocol::pb::{

@@ -24,6 +24,15 @@ async fn tidb_tls_gateway_capacity() {
     slow_reader_profile(true).await;
 }
 
+#[cfg(feature = "profile")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "detailed profile; requires an idle real local TiDB"]
+async fn tidb_tls_gateway_reconnect_profile() {
+    for devices in [0, 32, 64] {
+        reconnect_profile(devices, 100).await;
+    }
+}
+
 async fn reconnect_profile(devices: usize, rate: u64) {
     let fixture = Fixture::new().await;
     let senders = credentials(&fixture, 100, SENDERS);
@@ -68,6 +77,8 @@ async fn reconnect_profile(devices: usize, rate: u64) {
         }
     }
     warm(&mut writers, "warm up").await;
+    #[cfg(feature = "profile")]
+    iam_gateway::profile::start();
     let start = Instant::now() + Duration::from_millis(100);
     let local = LocalSet::new();
     let mut recoveries = tokio::task::JoinSet::new();
@@ -102,6 +113,24 @@ async fn reconnect_profile(devices: usize, rate: u64) {
     sends.report(&label, Some((start + BURST_OFFSET, burst_end)));
     if devices != 0 {
         report.print(&label);
+    }
+    #[cfg(feature = "profile")]
+    {
+        let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for (kind, stage, duration) in iam_gateway::profile::finish() {
+            groups
+                .entry((kind.map(|kind| kind as u8), stage))
+                .or_default()
+                .push(duration);
+        }
+        for ((kind, stage), samples) in groups {
+            println!(
+                "case={label} command={:?} stage={stage} n={} ms={}",
+                kind.and_then(MsgType::from_u8),
+                samples.len(),
+                percentiles(samples)
+            );
+        }
     }
     gateway.stop().await;
     remove_database(&fixture).await;

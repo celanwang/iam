@@ -21,9 +21,11 @@ struct Waiter {
 
 type SampleResult = std::result::Result<Sample, Arc<Error>>;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Sample {
     now: i64,
+    #[cfg(feature = "profile")]
+    spans: Arc<[crate::profile::Span]>,
     #[cfg(test)]
     batch: u64,
     #[cfg(test)]
@@ -32,7 +34,7 @@ struct Sample {
     transaction: Duration,
     #[cfg(test)]
     control_sql: Duration,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "profile"))]
     sealed_at: Instant,
 }
 
@@ -68,6 +70,16 @@ impl ClockBatch {
             queued_at.elapsed(),
             sample.sealed_at.saturating_duration_since(queued_at),
         );
+        #[cfg(feature = "profile")]
+        {
+            crate::profile::record(
+                "clock_queue",
+                sample.sealed_at.saturating_duration_since(queued_at),
+            );
+            for &(name, elapsed) in sample.spans.iter() {
+                crate::profile::record(name, elapsed);
+            }
+        }
         Ok(sample.now)
     }
 }
@@ -103,23 +115,29 @@ async fn run<F: Future<Output = Result<i64>>>(
             continue;
         }
         // The batch is sealed before beginning the transaction. No response can reuse it later.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "profile"))]
         let sealed_at = Instant::now();
+        let sample = sample_now();
+        #[cfg(feature = "profile")]
+        let sample = crate::profile::capture(sample);
         #[cfg(test)]
-        let (result, transaction, control_sql) = {
-            let (result, spans) = crate::store::perf::capture(sample_now()).await;
-            batch_id += 1;
-            (
-                result,
-                spans.duration("clock_tx"),
-                spans.duration("control_sql"),
-            )
-        };
+        let (result, spans) = crate::store::perf::capture(sample).await;
         #[cfg(not(test))]
-        let result = sample_now().await;
+        let result = sample.await;
+        #[cfg(test)]
+        let (transaction, control_sql) = {
+            batch_id += 1;
+            (spans.duration("clock_tx"), spans.duration("control_sql"))
+        };
+        #[cfg(feature = "profile")]
+        let (result, profile_spans) = result;
+        #[cfg(feature = "profile")]
+        let profile_spans: Arc<[_]> = profile_spans.into();
         let result = result
             .map(|now| Sample {
                 now,
+                #[cfg(feature = "profile")]
+                spans: profile_spans,
                 #[cfg(test)]
                 batch: batch_id,
                 #[cfg(test)]
@@ -128,7 +146,7 @@ async fn run<F: Future<Output = Result<i64>>>(
                 transaction,
                 #[cfg(test)]
                 control_sql,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "profile"))]
                 sealed_at,
             })
             .map_err(Arc::new);

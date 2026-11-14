@@ -22,11 +22,36 @@ use tokio::time::{timeout, timeout_at, Instant};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
 
+#[cfg(feature = "profile")]
+#[doc(hidden)]
+pub mod profile {
+    use iam_protocol::MsgType;
+    use std::{sync::Mutex, time::Duration};
+
+    pub type Sample = (Option<MsgType>, &'static str, Duration);
+    static SAMPLES: Mutex<Option<Vec<Sample>>> = Mutex::new(None);
+
+    pub fn start() {
+        *SAMPLES.lock().unwrap() = Some(Vec::new());
+    }
+
+    pub fn finish() -> Vec<Sample> {
+        SAMPLES.lock().unwrap().take().unwrap_or_default()
+    }
+
+    pub(crate) fn record(kind: Option<MsgType>, label: &'static str, elapsed: Duration) {
+        if let Some(samples) = SAMPLES.lock().unwrap().as_mut() {
+            samples.push((kind, label, elapsed));
+        }
+    }
+}
+
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+const RECOVERY_ADMISSION_WAIT: Duration = Duration::from_millis(75);
 const RESPONSE_SLOTS: usize = 4;
 const PUSH_SLOTS: usize = 16;
 
@@ -67,8 +92,10 @@ pub struct Gateway {
     sources: Mutex<HashMap<IpAddr, usize>>,
     handshakes: Arc<Semaphore>,
     auth: Arc<Semaphore>,
+    waiting_auth: Semaphore,
     requests: Arc<Semaphore>,
     recovery: Arc<Semaphore>,
+    waiting_recovery: Semaphore,
     reads: Arc<Semaphore>,
     pushes: Arc<Semaphore>,
     responses: Arc<Semaphore>,
@@ -97,6 +124,8 @@ enum Close {
 struct Queued {
     bytes: Vec<u8>,
     deadline: Instant,
+    #[cfg(feature = "profile")]
+    request: Option<MsgType>,
     _budget: OwnedSemaphorePermit,
 }
 
@@ -132,8 +161,10 @@ impl Gateway {
             acceptor: Mutex::new(tls_acceptor(certificates, key)?),
             handshakes: budget(limits.handshakes),
             auth: budget(limits.auth_requests),
+            waiting_auth: Semaphore::new(limits.auth_requests),
             requests: budget(limits.requests),
             recovery: budget(limits.recovery_requests),
+            waiting_recovery: Semaphore::new(limits.recovery_requests),
             reads: budget(limits.read_bytes),
             pushes: budget(limits.push_bytes),
             responses: budget(limits.response_bytes),
@@ -254,6 +285,8 @@ impl Gateway {
     ) {
         let _ = socket.set_nodelay(true);
         let acceptor = self.acceptor.lock().unwrap().clone();
+        #[cfg(feature = "profile")]
+        let handshake_started = Instant::now();
         let stream = tokio::select! {
             _ = stopping(&mut stopped) => return,
             stream = timeout(IO_TIMEOUT, acceptor.accept(socket)) => {
@@ -261,6 +294,8 @@ impl Gateway {
                 stream
             }
         };
+        #[cfg(feature = "profile")]
+        profile::record(None, "tls_accept", handshake_started.elapsed());
         let mut stream = stream;
         stream.get_mut().1.set_buffer_limit(Some(32 * 1024));
         drop(handshake);
@@ -316,14 +351,32 @@ impl Gateway {
             if cid.is_some() {
                 idle = Instant::now() + IDLE_TIMEOUT;
             }
-            let pool = match MsgType::from_u8(frame.header.msg_type) {
-                Some(MsgType::Auth | MsgType::Reconnect) => &self.auth,
-                Some(MsgType::Sync | MsgType::Snapshot | MsgType::History) => &self.recovery,
-                _ => &self.requests,
+            let kind = MsgType::from_u8(frame.header.msg_type);
+            #[cfg(feature = "profile")]
+            let admitted = Instant::now();
+            let (pool, waiting) = match kind {
+                Some(MsgType::Auth | MsgType::Reconnect) => {
+                    (&self.auth, cid.is_none().then_some(&self.waiting_auth))
+                }
+                Some(MsgType::Sync) => (
+                    &self.recovery,
+                    cid.is_some().then_some(&self.waiting_recovery),
+                ),
+                Some(MsgType::Snapshot | MsgType::History) => (&self.recovery, None),
+                _ => (&self.requests, None),
             };
-            let Ok(inflight) = pool.clone().try_acquire_owned() else {
+            let inflight = tokio::select! {
+                biased;
+                _ = closing(&mut closed) => return Close::Now,
+                _ = stopping(&mut stopped) => return Close::Drain,
+                _ = expiry(expires) => return unauthenticated(),
+                permit = request_permit(pool, waiting, idle) => permit,
+            };
+            #[cfg(feature = "profile")]
+            profile::record(kind, "admission", admitted.elapsed());
+            let Some(inflight) = inflight else {
                 let result = self.service.reject_overloaded(cid, &frame);
-                if let Err(close) = self.publish(peer, cid, result) {
+                if let Err(close) = self.publish(peer, cid, result, kind) {
                     return close;
                 }
                 continue;
@@ -331,11 +384,27 @@ impl Gateway {
             let gateway = self.clone();
             let target = peer.clone();
             let (done, result) = oneshot::channel();
+            #[cfg(feature = "profile")]
+            let dispatch = Instant::now();
             tokio::spawn(async move {
                 let _inflight = inflight;
                 let _bytes = bytes;
+                #[cfg(feature = "profile")]
+                let reply = {
+                    profile::record(kind, "dispatch_queue", dispatch.elapsed());
+                    let started = Instant::now();
+                    let (reply, spans) =
+                        iam_store::profile::capture(gateway.service.handle_frame(cid, &frame))
+                            .await;
+                    profile::record(kind, "service", started.elapsed());
+                    for (name, elapsed) in spans {
+                        profile::record(kind, name, elapsed);
+                    }
+                    reply
+                };
+                #[cfg(not(feature = "profile"))]
                 let reply = gateway.service.handle_frame(cid, &frame).await;
-                let _ = done.send(gateway.publish(&target, cid, reply));
+                let _ = done.send(gateway.publish(&target, cid, reply, kind));
             });
             let deadline = if cid.is_none() {
                 idle
@@ -402,15 +471,20 @@ impl Gateway {
         peer: &Arc<Peer>,
         previous: Option<Id128>,
         reply: iam_store::Result<EngineReply>,
+        kind: Option<MsgType>,
     ) -> Result<Option<(Id128, i64)>, Close> {
         let (cid, output) = reply.map_err(|_| Close::Now)?;
+        #[cfg(feature = "profile")]
+        let started = Instant::now();
         let mut peers = self.peers.lock().unwrap();
+        #[cfg(feature = "profile")]
+        profile::record(kind, "publish_lock", started.elapsed());
         for (target, bytes) in output.pushes {
             if let Some(recipient) = peers.get(&target) {
                 if is_terminal(&bytes) {
                     recipient.close(Close::Error(bytes.into()));
                 } else if recipient.close.borrow().is_none() {
-                    let _ = queue(&recipient.pushes, &self.pushes, bytes);
+                    let _ = queue(&recipient.pushes, &self.pushes, bytes, None);
                 }
             }
         }
@@ -441,7 +515,7 @@ impl Gateway {
             if is_terminal(&bytes) {
                 return Err(Close::Error(bytes.into()));
             }
-            queue(&peer.responses, &self.responses, bytes).map_err(|_| Close::Now)?;
+            queue(&peer.responses, &self.responses, bytes, kind).map_err(|_| Close::Now)?;
         }
         if let Some((cid, _)) = new_session {
             peers.insert(cid, peer.clone());
@@ -500,7 +574,28 @@ fn budget(size: usize) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(size))
 }
 
-fn queue(sender: &mpsc::Sender<Queued>, budget: &Arc<Semaphore>, bytes: Vec<u8>) -> Result<(), ()> {
+async fn request_permit(
+    pool: &Arc<Semaphore>,
+    waiting: Option<&Semaphore>,
+    idle: Instant,
+) -> Option<OwnedSemaphorePermit> {
+    if let Ok(permit) = pool.clone().try_acquire_owned() {
+        return Some(permit);
+    }
+    let _waiting = waiting?.try_acquire().ok()?;
+    let deadline = idle.min(Instant::now() + RECOVERY_ADMISSION_WAIT);
+    timeout_at(deadline, pool.clone().acquire_owned())
+        .await
+        .ok()?
+        .ok()
+}
+
+fn queue(
+    sender: &mpsc::Sender<Queued>,
+    budget: &Arc<Semaphore>,
+    bytes: Vec<u8>,
+    _request: Option<MsgType>,
+) -> Result<(), ()> {
     let permit = budget
         .clone()
         .try_acquire_many_owned(bytes.len() as u32)
@@ -509,6 +604,8 @@ fn queue(sender: &mpsc::Sender<Queued>, budget: &Arc<Semaphore>, bytes: Vec<u8>)
         .try_send(Queued {
             bytes,
             deadline: Instant::now() + IO_TIMEOUT,
+            #[cfg(feature = "profile")]
+            request: _request,
             _budget: permit,
         })
         .map_err(|_| ())
@@ -541,9 +638,17 @@ async fn write_frames(
                 return;
             }
             Some(frame) = responses.recv() => {
+                #[cfg(feature = "profile")]
+                let started = {
+                    let now = Instant::now();
+                    profile::record(frame.request, "response_queue", now.saturating_duration_since(frame.deadline - IO_TIMEOUT));
+                    now
+                };
                 if write_frame(&mut write, &frame.bytes, frame.deadline).await.is_err() {
                     return;
                 }
+                #[cfg(feature = "profile")]
+                profile::record(frame.request, "response_tls_write", started.elapsed());
             }
             Some(frame) = pushes.recv() => {
                 if frame.deadline > Instant::now()
@@ -650,4 +755,38 @@ fn tls_acceptor(
         .with_single_cert(certificates, key)
         .map_err(io::Error::other)?;
     Ok(TlsAcceptor::from(Arc::new(tls)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_admission_bounds_waiters_and_respects_deadline() {
+        let pool = budget(1);
+        let waiting = Semaphore::new(1);
+        let occupied = pool.clone().try_acquire_owned().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let pending = request_permit(&pool, Some(&waiting), deadline);
+        tokio::pin!(pending);
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("request bypassed the occupied permit"),
+            _ = std::future::ready(()) => {}
+        }
+        assert_eq!(waiting.available_permits(), 0);
+        assert!(request_permit(&pool, Some(&waiting), deadline)
+            .await
+            .is_none());
+        assert!(request_permit(&pool, None, deadline).await.is_none());
+        drop(occupied);
+        let admitted = pending.await.unwrap();
+        assert_eq!(waiting.available_permits(), 1);
+        assert!(request_permit(&pool, Some(&waiting), Instant::now())
+            .await
+            .is_none());
+        assert_eq!(waiting.available_permits(), 1);
+        drop(admitted);
+        assert_eq!(pool.available_permits(), 1);
+    }
 }
