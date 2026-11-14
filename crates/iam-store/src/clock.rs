@@ -5,13 +5,15 @@ use tokio::{
     time::{sleep_until, Instant},
 };
 
-const WINDOW: Duration = Duration::from_millis(1);
+pub(crate) const WINDOW: Duration = Duration::from_millis(1);
 const MAX_BATCH: usize = 64;
 const MAX_PENDING: usize = 128;
 
 #[derive(Clone)]
 pub(crate) struct ClockBatch {
     pending: mpsc::Sender<Waiter>,
+    #[cfg(feature = "profile")]
+    counts: Arc<crate::profile::ClockCounters>,
 }
 
 struct Waiter {
@@ -39,13 +41,37 @@ struct Sample {
 }
 
 impl ClockBatch {
-    pub fn start(database: Arc<TidbStore>) -> Self {
+    pub fn start(database: Arc<TidbStore>, window: Duration) -> Self {
         let (pending, requests) = mpsc::channel(MAX_PENDING);
-        tokio::spawn(run(requests, WINDOW, move || {
+        #[cfg(feature = "profile")]
+        let counts = Arc::new(crate::profile::ClockCounters::default());
+        #[cfg(feature = "profile")]
+        let worker_counts = counts.clone();
+        tokio::spawn(run(requests, window, move || {
             let database = database.clone();
-            async move { database.now().await }
+            #[cfg(feature = "profile")]
+            let counts = worker_counts.clone();
+            async move {
+                #[cfg(feature = "profile")]
+                counts.attempt();
+                let result = database.now().await;
+                #[cfg(feature = "profile")]
+                if result.is_ok() {
+                    counts.commit();
+                }
+                result
+            }
         }));
-        Self { pending }
+        Self {
+            pending,
+            #[cfg(feature = "profile")]
+            counts,
+        }
+    }
+
+    #[cfg(feature = "profile")]
+    pub fn counts(&self) -> crate::profile::ClockCounts {
+        self.counts.snapshot()
     }
 
     pub async fn now(&self) -> Result<i64> {

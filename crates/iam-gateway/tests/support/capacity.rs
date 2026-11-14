@@ -18,7 +18,7 @@ const RECOVERY_LIMIT: Duration = Duration::from_secs(20);
 #[ignore = "capacity profile; requires an idle real local TiDB"]
 async fn tidb_tls_gateway_capacity() {
     for (devices, rate) in [(0, 100), (0, 200), (8, 100), (32, 100), (64, 100)] {
-        reconnect_profile(devices, rate).await;
+        reconnect_profile(devices, rate, None).await;
     }
     slow_reader_profile(false).await;
     slow_reader_profile(true).await;
@@ -29,21 +29,36 @@ async fn tidb_tls_gateway_capacity() {
 #[ignore = "detailed profile; requires an idle real local TiDB"]
 async fn tidb_tls_gateway_reconnect_profile() {
     for devices in [0, 32, 64] {
-        reconnect_profile(devices, 100).await;
+        reconnect_profile(devices, 100, None).await;
     }
 }
 
-async fn reconnect_profile(devices: usize, rate: u64) {
+#[cfg(feature = "profile")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "clock window comparison; requires an idle real local TiDB"]
+async fn tidb_tls_gateway_clock_windows() {
+    for (round, windows) in [[1, 2, 4], [2, 4, 1], [4, 1, 2]].into_iter().enumerate() {
+        for devices in [0, 32, 64] {
+            for window in windows {
+                println!("round={} devices={devices} window_ms={window}", round + 1);
+                reconnect_profile(devices, 100, Some(window)).await;
+            }
+        }
+    }
+}
+
+async fn reconnect_profile(devices: usize, rate: u64, clock_window_ms: Option<u64>) {
     let fixture = Fixture::new().await;
     let senders = credentials(&fixture, 100, SENDERS);
     let receivers = credentials(&fixture, 400, devices);
     let source = credentials(&fixture, 300, 1)[0];
     let gateway = fixture
-        .start_with_credentials(
+        .start_gateway(
             OpenMode::Initialize,
             Limits::default(),
             "127.0.0.1:0",
             senders.iter().chain(&receivers).copied().chain([source]),
+            clock_window_ms,
         )
         .await;
     let mut writers = open_senders(&gateway, &senders).await;
@@ -79,6 +94,8 @@ async fn reconnect_profile(devices: usize, rate: u64) {
     warm(&mut writers, "warm up").await;
     #[cfg(feature = "profile")]
     iam_gateway::profile::start();
+    #[cfg(feature = "profile")]
+    let clock_start = gateway.service.clock_counts();
     let start = Instant::now() + Duration::from_millis(100);
     let local = LocalSet::new();
     let mut recoveries = tokio::task::JoinSet::new();
@@ -116,12 +133,30 @@ async fn reconnect_profile(devices: usize, rate: u64) {
     }
     #[cfg(feature = "profile")]
     {
+        let clock_end = gateway.service.clock_counts();
         let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
         for (kind, stage, duration) in iam_gateway::profile::finish() {
             groups
                 .entry((kind.map(|kind| kind as u8), stage))
                 .or_default()
                 .push(duration);
+        }
+        let clock_requests: usize = groups
+            .iter()
+            .filter(|((_, stage), _)| *stage == "clock_queue")
+            .map(|(_, times)| times.len())
+            .sum();
+        let attempted = clock_end.attempted - clock_start.attempted;
+        let committed = clock_end.committed - clock_start.committed;
+        println!("case={label} clock_requests={clock_requests} clock_attempted={attempted} clock_committed={committed}");
+        assert_eq!(
+            attempted, committed,
+            "failed clock transactions in capacity run"
+        );
+        if devices == 0 {
+            assert_eq!((clock_requests, committed), (0, 0));
+        } else {
+            assert!(committed > 0 && committed <= clock_requests as u64);
         }
         for ((kind, stage), samples) in groups {
             println!(

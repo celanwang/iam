@@ -1,4 +1,34 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{cell::RefCell, future::Future, time::Duration};
+
+#[derive(Default)]
+pub(crate) struct ClockCounters {
+    attempted: AtomicU64,
+    committed: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClockCounts {
+    pub attempted: u64,
+    pub committed: u64,
+}
+
+impl ClockCounters {
+    pub(crate) fn attempt(&self) {
+        self.attempted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn commit(&self) {
+        self.committed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> ClockCounts {
+        ClockCounts {
+            attempted: self.attempted.load(Ordering::Relaxed),
+            committed: self.committed.load(Ordering::Relaxed),
+        }
+    }
+}
 
 pub type Span = (&'static str, Duration);
 

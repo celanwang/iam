@@ -440,6 +440,18 @@ impl Fixture {
         address: &str,
         credentials: impl IntoIterator<Item = DeviceCredential>,
     ) -> RunningGateway {
+        self.start_gateway(mode, limits, address, credentials, None)
+            .await
+    }
+
+    async fn start_gateway(
+        &self,
+        mode: OpenMode,
+        limits: Limits,
+        address: &str,
+        credentials: impl IntoIterator<Item = DeviceCredential>,
+        _clock_window_ms: Option<u64>,
+    ) -> RunningGateway {
         let mut engine = Engine::new(0);
         engine.store.seed_direct(1, 1, 100, 200);
         engine
@@ -447,9 +459,26 @@ impl Fixture {
             .configure_device_credentials(credentials)
             .unwrap();
 
-        let service = TidbService::connect_local(self.database.as_str(), self.store, engine, mode)
-            .await
-            .unwrap();
+        #[cfg(feature = "profile")]
+        let service = match _clock_window_ms {
+            Some(window) => {
+                TidbService::connect_local_profiled(
+                    self.database.as_str(),
+                    self.store,
+                    engine,
+                    mode,
+                    window,
+                )
+                .await
+            }
+            None => {
+                TidbService::connect_local(self.database.as_str(), self.store, engine, mode).await
+            }
+        };
+        #[cfg(not(feature = "profile"))]
+        let service =
+            TidbService::connect_local(self.database.as_str(), self.store, engine, mode).await;
+        let service = service.unwrap();
         let gateway = Gateway::new(
             service.clone(),
             vec![self.certificate.clone()],
