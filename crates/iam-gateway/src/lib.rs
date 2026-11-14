@@ -1,6 +1,6 @@
 //! Single-instance TCP/TLS gateway for the TiDB message service.
 
-use iam_core::EngineReply;
+use iam_core::{DeviceCredential, EngineReply};
 use iam_protocol::pb::{ErrorCode, ProtocolError, RetryAction};
 use iam_protocol::{
     encode_protocol_error, FixedHeader, Frame, FrameDecoder, Id128, MsgType, ProtocolErrorKind,
@@ -19,6 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, timeout_at, Instant};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,7 +61,7 @@ impl Default for Limits {
 
 pub struct Gateway {
     service: TidbService,
-    acceptor: TlsAcceptor,
+    acceptor: Mutex<TlsAcceptor>,
     limits: Limits,
     peers: Mutex<HashMap<Id128, Arc<Peer>>>,
     sources: Mutex<HashMap<IpAddr, usize>>,
@@ -102,8 +103,8 @@ struct Queued {
 impl Gateway {
     pub fn new(
         service: TidbService,
-        certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
-        key: rustls::pki_types::PrivateKeyDer<'static>,
+        certificates: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
         limits: Limits,
     ) -> io::Result<Arc<Self>> {
         if !service.uses_device_credentials() {
@@ -126,13 +127,9 @@ impl Gateway {
         {
             return Err(invalid("invalid gateway limits"));
         }
-        let tls = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(certificates, key)
-            .map_err(io::Error::other)?;
         Ok(Arc::new(Self {
             service,
-            acceptor: TlsAcceptor::from(Arc::new(tls)),
+            acceptor: Mutex::new(tls_acceptor(certificates, key)?),
             handshakes: budget(limits.handshakes),
             auth: budget(limits.auth_requests),
             requests: budget(limits.requests),
@@ -144,6 +141,30 @@ impl Gateway {
             peers: Mutex::new(HashMap::new()),
             sources: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Apply a complete configuration after validating its certificate and credentials.
+    pub fn reload(
+        &self,
+        certificates: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        credentials: Vec<DeviceCredential>,
+    ) -> io::Result<()> {
+        let acceptor = tls_acceptor(certificates, key)?;
+        // Serialize with session publication so a racing AUTH cannot publish a removed credential.
+        let peers = self.peers.lock().unwrap();
+        let mut current_acceptor = self.acceptor.lock().unwrap();
+        let invalidated = self
+            .service
+            .reload_device_credentials(credentials)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        for cid in invalidated {
+            if let Some(peer) = peers.get(&cid) {
+                peer.close(unauthenticated());
+            }
+        }
+        *current_acceptor = acceptor;
+        Ok(())
     }
 
     /// Apply a revocation from the application and close the associated socket.
@@ -232,9 +253,10 @@ impl Gateway {
         mut stopped: watch::Receiver<bool>,
     ) {
         let _ = socket.set_nodelay(true);
+        let acceptor = self.acceptor.lock().unwrap().clone();
         let stream = tokio::select! {
             _ = stopping(&mut stopped) => return,
-            stream = timeout(IO_TIMEOUT, self.acceptor.accept(socket)) => {
+            stream = timeout(IO_TIMEOUT, acceptor.accept(socket)) => {
                 let Ok(Ok(stream)) = stream else { return };
                 stream
             }
@@ -617,4 +639,15 @@ async fn expiry(deadline: Option<Instant>) {
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn tls_acceptor(
+    certificates: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> io::Result<TlsAcceptor> {
+    let tls = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .map_err(io::Error::other)?;
+    Ok(TlsAcceptor::from(Arc::new(tls)))
 }

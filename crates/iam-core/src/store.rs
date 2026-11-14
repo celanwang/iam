@@ -17,7 +17,7 @@ pub struct UserRecord {
     pub access_token: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceCredential {
     pub tenant_id: u64,
     pub user_id: u64,
@@ -134,8 +134,28 @@ impl MemoryStore {
         if !self.connections.is_empty() || self.device_credentials.is_some() {
             return Err("credentials require a fresh service");
         }
+        self.apply_device_credentials(credentials)?;
+        Ok(())
+    }
+
+    /// Replace the complete credential list and return sessions whose authorization changed.
+    pub fn reload_device_credentials(
+        &mut self,
+        credentials: impl IntoIterator<Item = DeviceCredential>,
+    ) -> Result<Vec<Id128>, &'static str> {
+        if !self.uses_device_credentials() {
+            return Err("device credentials are not configured");
+        }
+        self.apply_device_credentials(credentials)
+    }
+
+    fn apply_device_credentials(
+        &mut self,
+        credentials: impl IntoIterator<Item = DeviceCredential>,
+    ) -> Result<Vec<Id128>, &'static str> {
         let mut tokens = HashMap::new();
         let mut devices = HashMap::new();
+        let mut retained_revocations = HashSet::new();
         for c in credentials {
             if c.tenant_id == 0
                 || c.user_id == 0
@@ -144,19 +164,47 @@ impl MemoryStore {
                 || devices
                     .insert((c.tenant_id, c.user_id, c.device_id), c.token_sha256)
                     .is_some()
-                || tokens
-                    .insert(c.token_sha256, (generate_id128(), c))
-                    .is_some()
+                || tokens.contains_key(&c.token_sha256)
             {
                 return Err("invalid or duplicate device credential");
             }
+            let previous = self
+                .device_credentials
+                .as_ref()
+                .and_then(|old| old.get(&c.token_sha256));
+            let epoch = match previous {
+                Some((epoch, old)) if *old == c => *epoch,
+                _ => generate_id128(),
+            };
+            if previous.is_some_and(|(old_epoch, _)| self.revoked_auth_epochs.contains(old_epoch)) {
+                retained_revocations.insert(epoch);
+            }
+            tokens.insert(c.token_sha256, (epoch, c));
         }
-        if tokens.is_empty() {
-            return Err("device credentials are required");
-        }
+        let now = self.authorization_time();
+        let invalidated = self
+            .connections
+            .values()
+            .filter_map(|conn| {
+                let current = devices
+                    .get(&(conn.tenant_id, conn.user_id, conn.device_id))
+                    .and_then(|digest| tokens.get(digest));
+                if let Some((epoch, credential)) =
+                    current.filter(|(epoch, _)| *epoch == conn.auth_epoch)
+                {
+                    return (credential.expires_at_ms <= now
+                        || retained_revocations.contains(epoch))
+                    .then_some(conn.connection_id);
+                }
+                // A previously admitted session may still be awaiting gateway cleanup.
+                retained_revocations.insert(conn.auth_epoch);
+                Some(conn.connection_id)
+            })
+            .collect::<Vec<_>>();
+        self.revoked_auth_epochs = retained_revocations;
         self.credential_devices = devices;
         self.device_credentials = Some(tokens);
-        Ok(())
+        Ok(invalidated)
     }
 
     pub fn uses_device_credentials(&self) -> bool {

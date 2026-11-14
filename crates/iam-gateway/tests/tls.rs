@@ -42,6 +42,102 @@ const BOB: &[u8] = b"gateway-bob-test";
 
 #[tokio::test]
 #[ignore = "requires real local TiDB"]
+async fn tidb_tls_reloads_certificates_and_rotates_only_changed_devices() {
+    let fixture = Fixture::new().await;
+    let gateway = fixture.start(OpenMode::Initialize, Limits::default()).await;
+    let mut alice = gateway.client();
+    let mut bob = gateway.client();
+    alice.reconnect().await.unwrap();
+    bob.reconnect().await.unwrap();
+    let auth_response::Value::Session(bob_session) = auth(&mut bob, 1, fixture.bob, BOB).await
+    else {
+        panic!("expected Bob's session");
+    };
+    assert!(matches!(
+        auth(&mut alice, 1, fixture.alice, ALICE).await,
+        auth_response::Value::Session(_)
+    ));
+    let [alice_credential, bob_credential] = fixture.credentials();
+    let rotated = DeviceCredential {
+        token_sha256: Sha256::digest(b"rotated-bob").into(),
+        ..bob_credential
+    };
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert = certificate.cert.der().clone();
+    let private_key = PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der());
+    let reload = |credentials| {
+        gateway.gateway.reload(
+            vec![cert.clone()],
+            private_key.clone_key().into(),
+            credentials,
+        )
+    };
+
+    assert!(reload(vec![rotated, rotated]).is_err());
+    assert!(gateway
+        .gateway
+        .reload(
+            vec![cert.clone()],
+            fixture.key.clone_key().into(),
+            vec![alice_credential],
+        )
+        .is_err());
+    let mut before_reload = gateway.client();
+    before_reload.reconnect().await.unwrap();
+    send(&mut alice, 2, key(), "before reload").await;
+    assert!(matches!(receive(&mut bob).await, DecodedBody::Push(_)));
+
+    reload(vec![alice_credential, rotated]).unwrap();
+    expect_close(&mut bob, ErrorCode::Unauthenticated).await;
+    assert!(before_reload.reconnect().await.is_err());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.clone()).unwrap();
+    let mut bob = TlsTransport::new(
+        gateway.address.clone(),
+        "localhost".try_into().unwrap(),
+        roots,
+    );
+    bob.reconnect().await.unwrap();
+    let resumed = request(
+        &mut bob,
+        1,
+        MsgType::Reconnect,
+        &resume(&bob_session, fixture.bob),
+    )
+    .await;
+    assert!(matches!(resumed, DecodedBody::ReconnectAck(reply)
+        if matches!(&reply.value, Some(reconnect_response::Value::Error(error))
+            if error.code() == ErrorCode::Unauthenticated)));
+    assert!(matches!(
+        auth(&mut bob, 2, fixture.bob, BOB).await,
+        auth_response::Value::Error(error) if error.code() == ErrorCode::Unauthenticated
+    ));
+    assert!(matches!(
+        auth(&mut bob, 3, fixture.bob, b"rotated-bob").await,
+        auth_response::Value::Session(_)
+    ));
+    send(&mut alice, 3, key(), "after reload").await;
+    assert!(matches!(receive(&mut bob).await, DecodedBody::Push(_)));
+
+    gateway.gateway.revoke_device(1, 200, fixture.bob);
+    expect_close(&mut bob, ErrorCode::Unauthenticated).await;
+    let renewed = DeviceCredential {
+        expires_at_ms: rotated.expires_at_ms + 1_000,
+        ..rotated
+    };
+    reload(vec![alice_credential, renewed]).unwrap();
+    bob.reconnect().await.unwrap();
+    assert!(matches!(
+        auth(&mut bob, 1, fixture.bob, b"rotated-bob").await,
+        auth_response::Value::Error(error) if error.code() == ErrorCode::Unauthenticated
+    ));
+    reload(vec![]).unwrap();
+    expect_close(&mut alice, ErrorCode::Unauthenticated).await;
+    gateway.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
 async fn tidb_tls_authenticates_and_delivers_then_replaces_and_revokes() {
     let fixture = Fixture::new().await;
     let gateway = fixture.start(OpenMode::Initialize, Limits::default()).await;
@@ -305,6 +401,7 @@ struct Fixture {
     certificate: CertificateDer<'static>,
     key: PrivatePkcs8KeyDer<'static>,
     roots: rustls::RootCertStore,
+    expires_at_ms: i64,
 }
 
 impl Fixture {
@@ -321,6 +418,7 @@ impl Fixture {
             certificate,
             key: PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()),
             roots,
+            expires_at_ms: iam_protocol::id128_timestamp_ms(&generate_id128()) as i64 + 60_000,
         }
     }
 
@@ -331,18 +429,9 @@ impl Fixture {
     async fn start_at(&self, mode: OpenMode, limits: Limits, address: &str) -> RunningGateway {
         let mut engine = Engine::new(0);
         engine.store.seed_direct(1, 1, 100, 200);
-        let expires_at_ms = iam_protocol::id128_timestamp_ms(&generate_id128()) as i64 + 60_000;
         engine
             .store
-            .configure_device_credentials([(100, self.alice, ALICE), (200, self.bob, BOB)].map(
-                |(user_id, device_id, token)| DeviceCredential {
-                    tenant_id: 1,
-                    user_id,
-                    device_id,
-                    expires_at_ms,
-                    token_sha256: Sha256::digest(token).into(),
-                },
-            ))
+            .configure_device_credentials(self.credentials())
             .unwrap();
 
         let service = TidbService::connect_local(self.database.as_str(), self.store, engine, mode)
@@ -374,6 +463,18 @@ impl Fixture {
             stop,
             task,
         }
+    }
+
+    fn credentials(&self) -> [DeviceCredential; 2] {
+        [(100, self.alice, ALICE), (200, self.bob, BOB)].map(|(user_id, device_id, token)| {
+            DeviceCredential {
+                tenant_id: 1,
+                user_id,
+                device_id,
+                expires_at_ms: self.expires_at_ms,
+                token_sha256: Sha256::digest(token).into(),
+            }
+        })
     }
 }
 
