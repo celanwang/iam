@@ -6,35 +6,38 @@ use iam_protocol::pb::{
 };
 
 // One authenticated TLS connection per device, including for fault-injected requests.
-struct Peer {
+pub(super) struct Peer {
     tls: TlsTransport,
     next_id: u64,
 }
 
 impl Peer {
-    async fn open(gateway: &RunningGateway, device: Id128, token: &[u8]) -> Self {
+    pub(super) async fn open(gateway: &RunningGateway, device: Id128, token: &[u8]) -> Self {
         Self {
             tls: login(gateway, device, token).await,
             next_id: 2,
         }
     }
 
-    async fn call(&mut self, kind: MsgType, body: &impl Message) -> DecodedBody {
+    pub(super) async fn call(&mut self, kind: MsgType, body: &impl Message) -> DecodedBody {
         let id = self.next_id;
         self.next_id += 1;
         request(&mut self.tls, id, kind, body).await
     }
 
-    async fn apply(&mut self, target: u64, key: Id128) {
-        let reply = self
-            .call(
-                MsgType::FriendApply,
-                &FriendApplyRequest {
-                    target_user_id: Some(target),
-                    request_id: Some(key.to_vec().into()),
-                },
-            )
-            .await;
+    pub(super) async fn apply_reply(&mut self, target: u64, key: Id128) -> DecodedBody {
+        self.call(
+            MsgType::FriendApply,
+            &FriendApplyRequest {
+                target_user_id: Some(target),
+                request_id: Some(key.to_vec().into()),
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn apply(&mut self, target: u64, key: Id128) {
+        let reply = self.apply_reply(target, key).await;
         assert!(
             matches!(&reply, DecodedBody::FriendApplyAck(ack) if matches!(&ack.value,
             Some(friend_attempt_ack::Value::Pending(_)))),
@@ -42,17 +45,25 @@ impl Peer {
         );
     }
 
-    async fn accept(&mut self, from: u64, key: Id128) -> u64 {
-        let reply = self
-            .call(
-                MsgType::FriendDecide,
-                &FriendDecideRequest {
-                    from_user_id: Some(from),
-                    request_id: Some(key.to_vec().into()),
-                    accept: Some(true),
-                },
-            )
-            .await;
+    pub(super) async fn decide_reply(
+        &mut self,
+        from: u64,
+        key: Id128,
+        accept: bool,
+    ) -> DecodedBody {
+        self.call(
+            MsgType::FriendDecide,
+            &FriendDecideRequest {
+                from_user_id: Some(from),
+                request_id: Some(key.to_vec().into()),
+                accept: Some(accept),
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn accept(&mut self, from: u64, key: Id128) -> u64 {
+        let reply = self.decide_reply(from, key, true).await;
         let DecodedBody::FriendDecideAck(ack) = reply else {
             panic!("expected accepted, got {reply:?}");
         };
@@ -62,7 +73,7 @@ impl Peer {
         id
     }
 
-    async fn status(&mut self, peer: u64) -> Option<FriendRelationship> {
+    pub(super) async fn status(&mut self, peer: u64) -> Option<FriendRelationship> {
         let reply = self
             .call(
                 MsgType::FriendStatus,
@@ -80,7 +91,7 @@ impl Peer {
         }
     }
 
-    async fn remove(&mut self, peer: u64, generation: Id128) -> DecodedBody {
+    pub(super) async fn remove(&mut self, peer: u64, generation: Id128) -> DecodedBody {
         self.call(
             MsgType::FriendRemove,
             &FriendRemoveRequest {
@@ -91,7 +102,7 @@ impl Peer {
         .await
     }
 
-    async fn group(&mut self, key: Id128) -> DecodedBody {
+    pub(super) async fn group(&mut self, key: Id128) -> DecodedBody {
         self.call(
             MsgType::GroupCreate,
             &GroupCreateRequest {
@@ -102,7 +113,7 @@ impl Peer {
         .await
     }
 
-    async fn send(&mut self, key: &MessageKey, text: &str) -> send_outcome::Value {
+    pub(super) async fn send(&mut self, key: &MessageKey, text: &str) -> send_outcome::Value {
         let reply = self
             .call(MsgType::Send, &send_request(key.clone(), text))
             .await;
@@ -113,7 +124,7 @@ impl Peer {
         ack.outcome.unwrap().value.unwrap()
     }
 
-    async fn send_status(&mut self, key: &MessageKey) -> send_outcome::Value {
+    pub(super) async fn send_status(&mut self, key: &MessageKey) -> send_outcome::Value {
         let reply = self
             .call(
                 MsgType::SendStatus,
@@ -129,7 +140,7 @@ impl Peer {
         ack.outcome.unwrap().value.unwrap()
     }
 
-    async fn push_context(&mut self, id: u64) -> StreamContext {
+    pub(super) async fn push_context(&mut self, id: u64) -> StreamContext {
         let reply = receive(&mut self.tls).await;
         let DecodedBody::Push(push) = reply else {
             panic!("expected PUSH: {reply:?}");
@@ -142,7 +153,10 @@ impl Peer {
         context
     }
 
-    async fn history(&mut self, context: &StreamContext) -> Vec<iam_protocol::pb::MessageView> {
+    pub(super) async fn history(
+        &mut self,
+        context: &StreamContext,
+    ) -> Vec<iam_protocol::pb::MessageView> {
         let reply = self
             .call(
                 MsgType::History,
@@ -169,32 +183,35 @@ impl Peer {
     }
 }
 
-fn generation(status: &FriendRelationship) -> Id128 {
+pub(super) fn generation(status: &FriendRelationship) -> Id128 {
     iam_protocol::parse_id128_bytes(status.generation.as_deref().unwrap()).unwrap()
 }
 
-fn removed(reply: DecodedBody, expected: u64) {
+pub(super) fn removed(reply: DecodedBody, expected: u64) {
     assert!(
         matches!(&reply, DecodedBody::FriendRemoveAck(ack) if ack.conversation_id == Some(expected)),
         "{reply:?}"
     );
 }
 
-fn committed(outcome: &send_outcome::Value, sequence: u64) {
+pub(super) fn committed(outcome: &send_outcome::Value, sequence: u64) {
     assert!(
         matches!(outcome, send_outcome::Value::Committed(receipt) if receipt.position.as_ref().unwrap().create_seq == Some(sequence)),
         "{outcome:?}"
     );
 }
 
-fn denied(outcome: &send_outcome::Value) {
+pub(super) fn denied(outcome: &send_outcome::Value) {
     assert!(
         matches!(outcome, send_outcome::Value::RejectedFinal(info) if info.code() == ErrorCode::PermissionDenied),
         "{outcome:?}"
     );
 }
 
-fn assert_only_message(history: &[iam_protocol::pb::MessageView], outcome: &send_outcome::Value) {
+pub(super) fn assert_only_message(
+    history: &[iam_protocol::pb::MessageView],
+    outcome: &send_outcome::Value,
+) {
     let [view] = history else {
         panic!("expected one historical message, found {}", history.len());
     };
@@ -205,7 +222,10 @@ fn assert_only_message(history: &[iam_protocol::pb::MessageView], outcome: &send
     assert_eq!(view.position, receipt.position);
 }
 
-async fn establish(alice: &mut Peer, bob: &mut Peer) -> (Id128, u64, FriendRelationship) {
+pub(super) async fn establish(
+    alice: &mut Peer,
+    bob: &mut Peer,
+) -> (Id128, u64, FriendRelationship) {
     let attempt = generate_id128();
     alice.apply(200, attempt).await;
     let direct = bob.accept(100, attempt).await;
@@ -370,6 +390,33 @@ async fn wait_for_statement(db: &MySqlPool, prefix: &str) {
     .unwrap_or_else(|_| panic!("no transaction reached {prefix}"));
 }
 
+// Start the competing change only after SEND owns store_control and has checked authorization.
+pub(super) async fn send_before_change<T>(
+    db: &MySqlPool,
+    direct: u64,
+    send: impl std::future::Future<Output = send_outcome::Value>,
+    change: impl std::future::Future<Output = T>,
+) -> (send_outcome::Value, T) {
+    let mut blocker = db.acquire().await.unwrap();
+    sqlx::query("SET SESSION tidb_txn_mode = 'pessimistic'")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let mut lock = blocker.begin().await.unwrap();
+    sqlx::query("SELECT conversation_id FROM conversations WHERE tenant_id = 1 AND conversation_id = ? FOR UPDATE")
+        .bind(direct).fetch_one(&mut *lock).await.unwrap();
+    let change_second = async {
+        wait_for_statement(db, "UPDATE conversations SET next_sequence%").await;
+        let unlock = async {
+            wait_for_statement(db, "SELECT store_id, token_key,%").await;
+            lock.rollback().await.unwrap();
+        };
+        let (result, ()) = tokio::join!(change, unlock);
+        result
+    };
+    tokio::join!(send, change_second)
+}
+
 #[tokio::test]
 #[ignore = "requires real local TiDB"]
 async fn tidb_tls_removal_waits_for_an_earlier_send_to_commit() {
@@ -380,27 +427,14 @@ async fn tidb_tls_removal_waits_for_an_earlier_send_to_commit() {
     let mut bob = Peer::open(&gateway, fixture.bob, BOB).await;
     let (_, direct, state) = establish(&mut alice, &mut bob).await;
     let gen = generation(&state);
-    // Block SEND's sequence update, after it owns the control row and has checked membership.
-    let mut blocker = db.acquire().await.unwrap();
-    sqlx::query("SET SESSION tidb_txn_mode = 'pessimistic'")
-        .execute(&mut *blocker)
-        .await
-        .unwrap();
-    let mut lock = blocker.begin().await.unwrap();
-    sqlx::query("SELECT conversation_id FROM conversations WHERE tenant_id = 1 AND conversation_id = ? FOR UPDATE")
-        .bind(direct).fetch_one(&mut *lock).await.unwrap();
     let before = message_key(direct);
-    let remove_second = async {
-        wait_for_statement(&db, "UPDATE conversations SET next_sequence%").await;
-        let unlock = async {
-            wait_for_statement(&db, "SELECT store_id, token_key,%").await;
-            lock.rollback().await.unwrap();
-        };
-        let (result, ()) = tokio::join!(bob.remove(100, gen), unlock);
-        result
-    };
-    let (receipt, result) =
-        tokio::join!(alice.send(&before, "owns the control row"), remove_second);
+    let (receipt, result) = send_before_change(
+        &db,
+        direct,
+        alice.send(&before, "owns the control row"),
+        bob.remove(100, gen),
+    )
+    .await;
     committed(&receipt, 1);
     removed(result, direct);
     let after = message_key(direct);
@@ -417,12 +451,8 @@ async fn tidb_tls_removal_waits_for_an_earlier_send_to_commit() {
     gateway.stop().await;
 }
 
-#[tokio::test]
-#[ignore = "requires real local TiDB"]
-async fn tidb_tls_removal_upgrade_blocks_all_legacy_directs_and_keeps_their_history() {
-    let fixture = empty_fixture().await;
-    let db = MySqlPool::connect(fixture.database.as_str()).await.unwrap();
-    decisions::old_friend_store(&fixture, &db).await;
+pub(super) async fn upgrade_duplicate_directs(fixture: &Fixture, db: &MySqlPool) {
+    decisions::old_friend_store(fixture, db).await;
     let epoch = generate_id128();
     let mut tx = db.begin().await.unwrap();
     sqlx::query("INSERT INTO conversations VALUES (1, 43, ?, 1)")
@@ -447,6 +477,14 @@ async fn tidb_tls_removal_upgrade_blocks_all_legacy_directs_and_keeps_their_hist
     TidbService::upgrade_local(fixture.database.as_str(), fixture.store)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_tls_removal_upgrade_blocks_all_legacy_directs_and_keeps_their_history() {
+    let fixture = empty_fixture().await;
+    let db = MySqlPool::connect(fixture.database.as_str()).await.unwrap();
+    upgrade_duplicate_directs(&fixture, &db).await;
     let gateway = fixture.start(OpenMode::Resume, Limits::default()).await;
     let mut alice = Peer::open(&gateway, fixture.alice, ALICE).await;
     let mut bob = Peer::open(&gateway, fixture.bob, BOB).await;

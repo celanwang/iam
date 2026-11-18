@@ -1,3 +1,5 @@
+#[path = "user_blocks.rs"]
+mod blocks;
 #[path = "friend_decisions.rs"]
 mod decisions;
 #[path = "small_groups.rs"]
