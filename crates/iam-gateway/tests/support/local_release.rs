@@ -1,5 +1,6 @@
 use super::*;
 use iam_protocol::pb::friend_attempt_ack;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -17,6 +18,10 @@ struct ProcessConfig {
 
 impl ProcessConfig {
     async fn new() -> Self {
+        Self::in_database(support::isolated_database().await, generate_id128())
+    }
+
+    fn in_database(database: Url, store: Id128) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
@@ -35,7 +40,6 @@ impl ProcessConfig {
         let expires = iam_protocol::id128_timestamp_ms(&generate_id128()) + 600_000;
         let mut credentials = String::new();
         for (identity, token) in users.iter().zip([ALICE, BOB, CHARLIE]) {
-            use std::fmt::Write;
             writeln!(
                 credentials,
                 "{} {} {} {} {}",
@@ -51,8 +55,8 @@ impl ProcessConfig {
         Self {
             directory,
             roots,
-            database: support::isolated_database().await,
-            store: generate_id128(),
+            database,
+            store,
             users,
         }
     }
@@ -61,8 +65,9 @@ impl ProcessConfig {
         self.directory.path().join(name)
     }
 
-    async fn start(&self, mode: &str, bind: &str) -> (Child, String) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_iam-gateway"))
+    fn command(&self, mode: &str, bind: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_iam-gateway"));
+        command
             .env("IAM_TLS_CERT", self.file("chain.pem"))
             .env("IAM_TLS_KEY", self.file("key.pem"))
             .env("IAM_DEVICE_CREDENTIALS", self.file("devices.txt"))
@@ -70,8 +75,14 @@ impl ProcessConfig {
             .env("IAM_TIDB_URL", self.database.as_str())
             .env("IAM_STORE_ID", hex::encode(self.store))
             .env("IAM_TIDB_MODE", mode)
+            .kill_on_drop(true);
+        command
+    }
+
+    async fn start(&self, mode: &str, bind: &str) -> (Child, String) {
+        let mut child = self
+            .command(mode, bind)
             .stdout(Stdio::piped())
-            .kill_on_drop(true)
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -214,6 +225,34 @@ async fn tidb_tls_local_release_recovers_after_gateway_process_exit() {
     assert_eq!(bob.messages(direct).await.unwrap().len(), 2);
     assert_eq!(bob.messages(group).await.unwrap().len(), 1);
     drop(bob_wire);
+    let group_state = bob
+        .list_conversations(0, 100)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.state.conversation_id == Some(group))
+        .unwrap()
+        .state;
+    let mut bob_tls = config.transport(&address);
+    assert_eq!(
+        bob.unread_count(&mut bob_tls, BOB, &group_state)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        bob.advance_read_position(&mut bob_tls, BOB, &group_state, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        bob.unread_count(&mut bob_tls, BOB, &group_state)
+            .await
+            .unwrap(),
+        0
+    );
 
     let mut sender = config.transport(&address);
     sender.reconnect().await.unwrap();
@@ -228,4 +267,101 @@ async fn tidb_tls_local_release_recovers_after_gateway_process_exit() {
     };
     assert_eq!(after.outcome, before.outcome);
     resumed.kill().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB and starts the gateway binary"]
+async fn tidb_tls_local_release_upgrades_old_store_and_recovers_receipt() {
+    let fixture = Fixture::new().await;
+    let config = ProcessConfig::in_database(fixture.database.clone(), fixture.store);
+    let [alice, bob, _] = config.users;
+    let db = sqlx::MySqlPool::connect(config.database.as_str())
+        .await
+        .unwrap();
+    decisions::old_friend_store(&fixture, &db).await;
+
+    let key = message_key(42);
+    let message_id = generate_id128();
+    let accepted_at = iam_protocol::id128_timestamp_ms(&message_id) as i64;
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO messages
+         (tenant_id, conversation_id, message_id, user_id, device_id, client_msg_id,
+          `sequence`, `text`, accepted_at)
+         VALUES (1, 42, ?, 100, ?, ?, 1, ?, ?)",
+    )
+    .bind(message_id.as_slice())
+    .bind(alice.device_id.as_slice())
+    .bind(key.client_msg_id.as_deref().unwrap())
+    .bind(b"before upgrade".as_slice())
+    .bind(accepted_at)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE conversations SET next_sequence = 2 WHERE tenant_id = 1 AND conversation_id = 42",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let failed = timeout(WAIT, config.command("resume", "127.0.0.1:0").output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !failed.status.success(),
+        "resume must require explicit upgrade"
+    );
+    for _ in 0..2 {
+        TidbService::upgrade_local(config.database.as_str(), config.store)
+            .await
+            .unwrap();
+    }
+
+    let (mut gateway, address) = config.start("resume", "127.0.0.1:0").await;
+    let mut sender = config.transport(&address);
+    sender.reconnect().await.unwrap();
+    assert!(matches!(
+        auth(&mut sender, 1, alice.device_id, ALICE).await,
+        auth_response::Value::Session(_)
+    ));
+    let DecodedBody::SendStatusAck(status) = request(
+        &mut sender,
+        2,
+        MsgType::SendStatus,
+        &SendStatusRequest { key: Some(key) },
+    )
+    .await
+    else {
+        panic!("expected the saved receipt from the upgraded store");
+    };
+    let Some(send_outcome::Value::Committed(receipt)) =
+        status.outcome.and_then(|outcome| outcome.value)
+    else {
+        panic!("original send no longer committed");
+    };
+    assert_eq!(
+        receipt.r#ref.unwrap().message_id.as_deref(),
+        Some(message_id.as_slice())
+    );
+    assert_eq!(receipt.position.unwrap().create_seq, Some(1));
+    assert_eq!(receipt.accepted_at_ms, Some(accepted_at));
+
+    let path = config.file("upgraded-bob.db");
+    let mut reader = Client::open(&path, bob).await.unwrap();
+    let mut bob_db = observer(&path).await;
+    let mut wire = ObservedTls {
+        tls: config.transport(&address),
+        syncs: Vec::new(),
+    };
+    sync_through(&mut reader, &mut wire, &mut bob_db, BOB, 42, 1).await;
+    let messages = reader.messages(42).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(
+        messages[0].content.as_ref().unwrap().value.as_ref(),
+        Some(message_content::Value::Text(text)) if text.text.as_deref() == Some("before upgrade")
+    ));
+    gateway.kill().await.unwrap();
 }
