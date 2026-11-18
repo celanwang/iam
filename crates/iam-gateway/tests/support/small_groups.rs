@@ -6,7 +6,12 @@ const CHARLIE: &[u8] = b"group-charlie";
 const ALICE_LAPTOP: &[u8] = b"group-alice-laptop";
 const MEMBERS: [u64; 2] = [200, 300];
 
-fn credential(fixture: &Fixture, tenant_id: u64, user_id: u64, token: &[u8]) -> DeviceCredential {
+pub(super) fn credential(
+    fixture: &Fixture,
+    tenant_id: u64,
+    user_id: u64,
+    token: &[u8],
+) -> DeviceCredential {
     DeviceCredential {
         tenant_id,
         user_id,
@@ -112,7 +117,7 @@ async fn assert_one_three_person_group(db: &MySqlPool, id: u64) {
     }
 }
 
-async fn open_client(path: &Path, device: DeviceCredential) -> Client {
+pub(super) async fn open_client(path: &Path, device: DeviceCredential) -> Client {
     Client::open(
         path,
         Identity {

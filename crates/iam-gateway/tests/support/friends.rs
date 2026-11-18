@@ -2,6 +2,8 @@
 mod decisions;
 #[path = "small_groups.rs"]
 mod groups;
+#[path = "friend_removal.rs"]
+mod removal;
 
 use super::*;
 use iam_protocol::pb::{
