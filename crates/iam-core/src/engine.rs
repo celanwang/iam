@@ -230,6 +230,8 @@ impl Engine {
             | DecodedBody::FriendInbox(_)
             | DecodedBody::FriendDecide(_)
             | DecodedBody::GroupCreate(_)
+            | DecodedBody::GroupMembers(_)
+            | DecodedBody::GroupMemberRemove(_)
             | DecodedBody::FriendStatus(_)
             | DecodedBody::FriendRemove(_)
             | DecodedBody::UserBlock(_) => {

@@ -387,7 +387,7 @@ async fn conversation_in(
     conversation_info(&row)
 }
 
-async fn set_access(
+pub(super) async fn set_access(
     tx: &mut Transaction<'_, MySql>,
     tenant: u64,
     conversation: u64,

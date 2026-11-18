@@ -2,6 +2,9 @@ use super::*;
 use iam_protocol::pb::{ConversationKind, GroupCreateRequest};
 use std::path::Path;
 
+#[path = "group_members.rs"]
+mod member_management;
+
 const CHARLIE: &[u8] = b"group-charlie";
 const ALICE_LAPTOP: &[u8] = b"group-alice-laptop";
 const MEMBERS: [u64; 2] = [200, 300];
@@ -553,6 +556,17 @@ async fn tidb_tls_groups_limit_counts_distinct_members_including_creator() {
     let id = group_id(create(&mut alice, 37, key, &repeated).await);
     let unique: Vec<u64> = (1..=31).collect();
     assert_eq!(group_id(create(&mut alice, 38, key, &unique).await), id);
+    let roster = request(
+        &mut alice,
+        39,
+        MsgType::GroupMembers,
+        &iam_protocol::pb::GroupMembersRequest {
+            conversation_id: Some(id),
+        },
+    )
+    .await;
+    assert!(matches!(roster, DecodedBody::GroupMembersAck(list)
+        if list.owner_user_id == Some(100) && list.members.len() == 32));
     let db = MySqlPool::connect(base.database.as_str()).await.unwrap();
     assert_eq!(catalog_counts(&db).await, (32, 94, 94, 1));
     for table in ["members", "account_events"] {

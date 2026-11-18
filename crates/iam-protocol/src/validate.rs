@@ -57,6 +57,17 @@ pub(crate) fn validate_response(body: &crate::DecodedBody) -> Result<()> {
     use crate::pb::*;
     use crate::DecodedBody as B;
     match body {
+        B::GroupMembersAck(list) => {
+            if list.owner_user_id == Some(0)
+                || !(1..=crate::MAX_GROUP_MEMBERS).contains(&list.members.len())
+                || !list
+                    .members
+                    .windows(2)
+                    .all(|pair| pair[0].user_id < pair[1].user_id)
+            {
+                return invalid("invalid group roster");
+            }
+        }
         B::ReadPositionAck(ack) if ack.read_through == Some(0) => {
             return invalid("zero read position");
         }

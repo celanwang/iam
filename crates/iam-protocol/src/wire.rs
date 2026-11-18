@@ -11,6 +11,9 @@ use crate::pb::{
     SendStatusResponse, SnapshotRequest, SnapshotResponse, SyncRequest, SyncResponse, UserBlockAck,
     UserBlockRequest,
 };
+use crate::pb::{
+    GroupMemberRemoveAck, GroupMemberRemoveRequest, GroupMembersAck, GroupMembersRequest,
+};
 use crate::pb::{ReadPositionAck, ReadPositionRequest};
 use crate::pb::{UnreadCountAck, UnreadCountRequest};
 use crate::validate::validate_head;
@@ -55,6 +58,10 @@ pub enum DecodedBody {
     FriendDecideAck(FriendAttemptAck),
     GroupCreate(GroupCreateRequest),
     GroupCreateAck(GroupCreateAck),
+    GroupMembers(GroupMembersRequest),
+    GroupMembersAck(GroupMembersAck),
+    GroupMemberRemove(GroupMemberRemoveRequest),
+    GroupMemberRemoveAck(GroupMemberRemoveAck),
     FriendStatus(FriendStatusRequest),
     FriendStatusAck(FriendStatusAck),
     FriendRemove(FriendRemoveRequest),
@@ -205,6 +212,12 @@ fn decode_body_counted(msg_type: MsgType, body: &[u8], fields: &mut usize) -> Re
         MsgType::FriendDecideAck => DecodedBody::FriendDecideAck(decode_pb(body, fields)?),
         MsgType::GroupCreate => DecodedBody::GroupCreate(decode_pb(body, fields)?),
         MsgType::GroupCreateAck => DecodedBody::GroupCreateAck(decode_pb(body, fields)?),
+        MsgType::GroupMembers => DecodedBody::GroupMembers(decode_pb(body, fields)?),
+        MsgType::GroupMembersAck => DecodedBody::GroupMembersAck(decode_pb(body, fields)?),
+        MsgType::GroupMemberRemove => DecodedBody::GroupMemberRemove(decode_pb(body, fields)?),
+        MsgType::GroupMemberRemoveAck => {
+            DecodedBody::GroupMemberRemoveAck(decode_pb(body, fields)?)
+        }
         MsgType::FriendStatus => DecodedBody::FriendStatus(decode_pb(body, fields)?),
         MsgType::FriendStatusAck => DecodedBody::FriendStatusAck(decode_pb(body, fields)?),
         MsgType::FriendRemove => DecodedBody::FriendRemove(decode_pb(body, fields)?),

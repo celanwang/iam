@@ -106,13 +106,15 @@ Head {
 38 FRIEND_REMOVE  FriendRemoveRequest -> 39 FRIEND_REMOVE_ACK  FriendRemoveAck
 40 UNREAD_COUNT   UnreadCountRequest   -> 41 UNREAD_COUNT_ACK UnreadCountAck
 42 USER_BLOCK     UserBlockRequest    -> 43 USER_BLOCK_ACK     UserBlockAck
+44 GROUP_MEMBERS  GroupMembersRequest  -> 45 GROUP_MEMBERS_ACK GroupMembersAck
+46 GROUP_MEMBER_REMOVE GroupMemberRemoveRequest -> 47 GROUP_MEMBER_REMOVE_ACK GroupMemberRemoveAck
 ```
 
-`PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友、群创建、阅读位置和未读数命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
+`PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友、拉黑、小群、阅读位置和未读数命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
 
 命令方向错误、请求号未递增或需要应答的请求号为 0，属于协议错误，返回错误后关闭连接。未认证的业务请求返回 `UNAUTHENTICATED`，不改变认证状态，也不构成该逻辑发送的最终拒绝。
 
-认证、同步、快照和历史响应使用 `oneof` 表达成功数据或错误。发送与发送查询使用专门的 `SendOutcome`。好友和群创建的应答携带成功结果，业务错误通过 `ERROR` 返回。
+认证、同步、快照和历史响应使用 `oneof` 表达成功数据或错误。发送与发送查询使用专门的 `SendOutcome`。好友和小群命令的应答携带成功结果，业务错误通过 `ERROR` 返回。
 
 ## 公共结构
 
@@ -691,7 +693,19 @@ HistoryResponse = oneof {
 
 `GROUP_CREATE_ACK` 的 `conversation_id`（字段 1）在事务提交后返回。已成功创建的 ID 在同租户、同创建者下绑定原成员集合，换设备或重连重试返回原会话 ID。这个结果独立于后来发生的访问权限变化。同键更改成员集合返回 `IDEMPOTENCY_CONFLICT`。创建 ID 缺失或格式错误、原始成员项超限，以及首次创建时成员集合不合法，返回 `INVALID_ARGUMENT`。提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`，客户端以新帧请求号和原创建 ID 重试。
 
-本轮的群成员在创建时确定。后续版本处理邀请、群管理和群成员变更。
+群成员在创建时获得初始授权，创建者是固定群主。退出和移除使用下列命令。邀请和群主转让留待后续版本。
+
+## 小群名单、退出和移除
+
+`GROUP_MEMBERS` 以 `conversation_id`（字段 1）请求当前名单。仅活跃成员可读取同租户内的群名单。应答含 `conversation_id`（字段 1）、`history_id`（字段 2，UUIDv7）、固定群主 `owner_user_id`（字段 3）和最多 32 项的 `members`（字段 4）。成员项携带 `user_id`（字段 1）和当前 `access_version`（字段 2），按用户 ID 升序排列。
+
+`GROUP_MEMBER_REMOVE` 携带 `conversation_id`（字段 1）、`history_id`（字段 2）、目标 `user_id`（字段 3）和目标当前 `access_version`（字段 4）。普通成员指定本人即退出，活跃群主可指定其他成员。群主指定本人返回 `INVALID_ARGUMENT`。成功应答在事务提交后返回 `conversation_id`、`user_id` 和该周期的 `access_version`（字段 1–3）。
+
+同一目标周期已有撤权事件时，退出者本人或当前有权移除该成员的群主可重试原请求并获得成功应答。应答确认该周期已结束。目标重新加入后会有新的访问版本，此类重放仍只确认原周期。历史代次过时或目标当前活跃但请求版本未知时返回 `CONTEXT_CHANGED`。群主请求从未存在的成员或找不到的非活跃周期时返回 `NOT_FOUND`。
+
+第三人、跨租户请求、单聊请求、普通成员操作他人和无权读取名单均返回 `PERMISSION_DENIED`。参数缺失或零值、非法 UUIDv7 返回 `INVALID_ARGUMENT`。提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`，重试须沿用历史代次和目标访问版本。
+
+撤权后，后续提交的新消息不再投递给原成员，原成员的新发送和会话 `SYNC`、`HISTORY` 失去权限。账户同步当中会移除本地会话与消息缓存。已提交的发送仍可按原键和原有期限查询。
 
 ## 阅读位置
 
