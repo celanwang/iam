@@ -1415,6 +1415,95 @@ async fn tidb_client_discovers_a_new_conversation_and_applies_membership_changes
     );
 }
 
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_client_view_tracks_sync_without_reconnecting() {
+    let database = support::isolated_database().await;
+    let mut engine = Engine::new(0);
+    engine.store.seed_user(1, 100, b"alice".to_vec());
+    engine.store.seed_user(1, 200, b"bob".to_vec());
+    let service = open_server(
+        database.as_str(),
+        generate_id128(),
+        engine,
+        OpenMode::Initialize,
+    )
+    .await;
+    let mut alice = sender(&service).await;
+    let directory = tempfile::tempdir().unwrap();
+    let client = Client::open(directory.path().join("bob.db"), identity(200))
+        .await
+        .unwrap();
+    let mut view = client.open_view().await.unwrap();
+    let mut bob = Running::start(
+        client,
+        &service,
+        b"bob",
+        options(Duration::from_millis(150)),
+        None,
+    );
+    bob.wait_for_idle().await;
+    assert!(view
+        .list_conversations(0, 1)
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+
+    service
+        .lock()
+        .await
+        .create_direct(1, 1, 100, 200)
+        .await
+        .unwrap();
+    wait_conversation_snapshot(&mut bob, 1).await;
+    bob.wait_for_idle().await;
+    let page = view.list_conversations(0, 1).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].state.conversation_id, Some(1));
+    assert!(page.items[0].latest_cached_message.is_none());
+    assert!(view.messages(1).await.unwrap().is_empty());
+
+    // Discard the PUSH and let the running client's periodic SYNC recover the message.
+    assert_eq!(alice.send_text("recovered by sync").await.len(), 1);
+    bob.wait_for_sync_through(1).await;
+    bob.wait_for_idle().await;
+    let messages = view.messages(1).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(text(&messages[0]), "recovered by sync");
+    let page = view.list_conversations(0, 1).await.unwrap();
+    assert_eq!(
+        page.items[0].latest_cached_message.as_ref(),
+        messages.last()
+    );
+
+    service
+        .lock()
+        .await
+        .set_member_access(1, 1, 200, false)
+        .await
+        .unwrap();
+    bob.wait_for(|event| {
+        matches!(event, Event::Reply(body)
+            if matches!(body.as_ref(), DecodedBody::SyncAck(ack)
+                if matches!(&ack.value, Some(sync_response::Value::Page(page))
+                    if page.changes.iter().any(|change|
+                        matches!(change.payload, Some(change::Payload::ConversationRemove(1)))))))
+    })
+    .await;
+    bob.wait_for_idle().await;
+    assert!(view
+        .list_conversations(0, 1)
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    assert!(view.messages(1).await.unwrap().is_empty());
+
+    let (_, wire) = bob.stop().await;
+    assert_eq!(wire.connections, 1);
+}
+
 async fn wait_conversation_snapshot(
     bob: &mut Running,
     target: u64,

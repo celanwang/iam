@@ -11,7 +11,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS identity (
@@ -47,7 +47,31 @@ const SCHEMA: &str = "
 
 pub(crate) struct Storage {
     db: SqliteConnection,
+    path: PathBuf,
     _lock: File,
+}
+
+/// A read-only handle to the local cache, created by [`Client::open_view`](crate::Client::open_view).
+/// Each call reads committed SQLite data, including updates made while the client is syncing.
+pub struct ClientView {
+    db: SqliteConnection,
+}
+
+impl ClientView {
+    /// Lists conversations and their cached previews with the same pagination as
+    /// [`Client::list_conversations`](crate::Client::list_conversations).
+    pub async fn list_conversations(
+        &mut self,
+        after_conversation_id: u64,
+        limit: u32,
+    ) -> Result<ConversationPage> {
+        list_conversations(&mut self.db, after_conversation_id, limit).await
+    }
+
+    /// Reads cached messages in conversation order.
+    pub async fn messages(&mut self, conversation_id: u64) -> Result<Vec<MessageView>> {
+        read_messages(&mut self.db, conversation_id).await
+    }
 }
 
 pub(crate) struct Pending {
@@ -82,29 +106,34 @@ impl Storage {
             .open(lock_path)?;
         lock.try_lock().map_err(std::io::Error::from)?;
         let options = SqliteConnectOptions::new()
-            .filename(path)
+            .filename(&path)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full);
         let mut db = SqliteConnection::connect_with(&options).await?;
         let mut tx = db.begin().await?;
         sqlx::raw_sql(SCHEMA).execute(&mut *tx).await?;
-        let tenant = bytes(identity.tenant_id);
-        let user = bytes(identity.user_id);
         sqlx::query("INSERT OR IGNORE INTO identity VALUES (1, ?, ?, ?)")
-            .bind(tenant.to_vec())
-            .bind(user.to_vec())
+            .bind(bytes(identity.tenant_id).to_vec())
+            .bind(bytes(identity.user_id).to_vec())
             .bind(identity.device_id.to_vec())
             .execute(&mut *tx)
             .await?;
-        let saved: (Vec<u8>, Vec<u8>, Vec<u8>) =
-            sqlx::query_as("SELECT tenant, user, device FROM identity WHERE singleton = 1")
-                .fetch_one(&mut *tx)
-                .await?;
-        if saved.0 != tenant || saved.1 != user || saved.2 != identity.device_id {
-            return Err(Error::IdentityMismatch);
-        }
+        verify_identity(&mut tx, identity).await?;
         tx.commit().await?;
-        Ok(Self { db, _lock: lock })
+        Ok(Self {
+            db,
+            path,
+            _lock: lock,
+        })
+    }
+
+    pub async fn open_view(&self, identity: Identity) -> Result<ClientView> {
+        let options = SqliteConnectOptions::new()
+            .filename(&self.path)
+            .read_only(true);
+        let mut db = SqliteConnection::connect_with(&options).await?;
+        verify_identity(&mut db, identity).await?;
+        Ok(ClientView { db })
     }
 
     pub async fn enqueue(&mut self, conversation: u64, id: Id128, req: &SendRequest) -> Result<()> {
@@ -179,49 +208,11 @@ impl Storage {
     }
 
     pub async fn list_conversations(&mut self, after: u64, limit: u32) -> Result<ConversationPage> {
-        type ConversationRow = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
-        let mut rows: Vec<ConversationRow> = sqlx::query_as(
-            "SELECT c.id, c.state, (
-                 SELECT view FROM messages WHERE conversation = c.id
-                 ORDER BY sequence DESC LIMIT 1
-             )
-             FROM conversations AS c WHERE c.id > ? ORDER BY c.id LIMIT ?",
-        )
-        .bind(bytes(after).to_vec())
-        .bind(i64::from(limit) + 1)
-        .fetch_all(&mut self.db)
-        .await?;
-        let next_after = if rows.len() > limit as usize {
-            rows.pop();
-            rows.last().map(|(id, _, _)| number(id)).transpose()?
-        } else {
-            None
-        };
-        let items = rows
-            .into_iter()
-            .map(|(_, state, preview)| {
-                Ok(ConversationSummary {
-                    state: ConversationState::decode(state.as_slice())?,
-                    latest_cached_message: preview
-                        .as_deref()
-                        .map(MessageView::decode)
-                        .transpose()?,
-                })
-            })
-            .collect::<Result<_>>()?;
-        Ok(ConversationPage { items, next_after })
+        list_conversations(&mut self.db, after, limit).await
     }
 
     pub async fn messages(&mut self, target: u64) -> Result<Vec<MessageView>> {
-        let rows: Vec<Vec<u8>> = sqlx::query_scalar(
-            "SELECT view FROM messages WHERE conversation = ? ORDER BY sequence, id",
-        )
-        .bind(bytes(target).to_vec())
-        .fetch_all(&mut self.db)
-        .await?;
-        rows.into_iter()
-            .map(|row| Ok(MessageView::decode(row.as_slice())?))
-            .collect()
+        read_messages(&mut self.db, target).await
     }
 
     pub async fn progress(&mut self, target: u64) -> Result<Option<Progress>> {
@@ -487,6 +478,70 @@ impl Storage {
     }
 }
 
+async fn verify_identity(db: &mut SqliteConnection, identity: Identity) -> Result<()> {
+    let saved: (Vec<u8>, Vec<u8>, Vec<u8>) =
+        sqlx::query_as("SELECT tenant, user, device FROM identity WHERE singleton = 1")
+            .fetch_one(db)
+            .await?;
+    if saved.0 != bytes(identity.tenant_id)
+        || saved.1 != bytes(identity.user_id)
+        || saved.2 != identity.device_id
+    {
+        return Err(Error::IdentityMismatch);
+    }
+    Ok(())
+}
+
+async fn list_conversations(
+    db: &mut SqliteConnection,
+    after: u64,
+    limit: u32,
+) -> Result<ConversationPage> {
+    if !(1..=100).contains(&limit) {
+        return Err(Error::Invalid("conversation page size"));
+    }
+    type ConversationRow = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+    let mut rows: Vec<ConversationRow> = sqlx::query_as(
+        "SELECT c.id, c.state, (
+             SELECT view FROM messages WHERE conversation = c.id
+             ORDER BY sequence DESC LIMIT 1
+         )
+         FROM conversations AS c WHERE c.id > ? ORDER BY c.id LIMIT ?",
+    )
+    .bind(bytes(after).to_vec())
+    .bind(i64::from(limit) + 1)
+    .fetch_all(db)
+    .await?;
+    let next_after = if rows.len() > limit as usize {
+        rows.pop();
+        rows.last().map(|(id, _, _)| number(id)).transpose()?
+    } else {
+        None
+    };
+    let items = rows
+        .into_iter()
+        .map(|(_, state, preview)| {
+            Ok(ConversationSummary {
+                state: ConversationState::decode(state.as_slice())?,
+                latest_cached_message: preview.as_deref().map(MessageView::decode).transpose()?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    Ok(ConversationPage { items, next_after })
+}
+
+async fn read_messages(db: &mut SqliteConnection, target: u64) -> Result<Vec<MessageView>> {
+    let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT view FROM messages WHERE conversation = ? ORDER BY sequence, id",
+    )
+    .bind(bytes(target).to_vec())
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|row| Ok(MessageView::decode(row.as_slice())?))
+        .collect()
+}
+
 async fn save_conversation(
     tx: &mut Transaction<'_, Sqlite>,
     state: ConversationState,
@@ -650,6 +705,37 @@ mod tests {
     const CHILD_DB: &str = "IAM_CLIENT_PAGE_CRASH_DB";
 
     #[tokio::test]
+    async fn client_view_checks_identity_and_cannot_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = Identity {
+            tenant_id: 1,
+            user_id: 2,
+            device_id: generate_id128(),
+        };
+        let client = Client::open(directory.path().join("device.db"), identity)
+            .await
+            .unwrap();
+        let other_device = Identity {
+            device_id: generate_id128(),
+            ..identity
+        };
+        assert!(matches!(
+            client.storage.open_view(other_device).await,
+            Err(Error::IdentityMismatch)
+        ));
+
+        let mut view = client.open_view().await.unwrap();
+        let error = sqlx::query("DELETE FROM identity")
+            .execute(&mut view.db)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("8") // SQLITE_READONLY
+        );
+    }
+
+    #[tokio::test]
     async fn conversation_list_pages_across_unsigned_id_boundaries() {
         let directory = tempfile::tempdir().unwrap();
         let identity = Identity {
@@ -809,6 +895,7 @@ mod tests {
             cursor: vec![1],
         };
         storage.apply(1, vec![], Some(&previous)).await.unwrap();
+        let mut view = storage.open_view(identity).await.unwrap();
         drop(storage);
 
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
@@ -833,6 +920,7 @@ mod tests {
         })
         .await
         .expect("child did not reach the transaction boundary");
+        assert!(view.messages(1).await.unwrap().is_empty());
         child.kill().await.unwrap();
 
         let mut storage = Storage::open(&path, identity).await.unwrap();
@@ -842,6 +930,10 @@ mod tests {
         );
         assert!(storage.messages(1).await.unwrap().is_empty());
         storage.apply(1, vec![change], Some(&next)).await.unwrap();
+        assert_eq!(
+            view.messages(1).await.unwrap(),
+            std::slice::from_ref(&message)
+        );
         drop(storage);
 
         let mut storage = Storage::open(&path, identity).await.unwrap();

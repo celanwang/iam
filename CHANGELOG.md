@@ -25,6 +25,7 @@ a dated version section when cutting a release.
   cursor expires, including ranges below the retention floor.
 - Client-side pagination of synchronized conversations, including empty
   conversations and previews of the latest locally saved messages.
+- Read-only client views for cached conversations and messages while sync runs.
 - Durable account changes for direct conversations and access changes, with
   a local schema upgrade that preserves existing cursors and send receipts.
 - Real TiDB acceptance tests for reordered and duplicate pushes, expired

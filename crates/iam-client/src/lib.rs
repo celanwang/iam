@@ -7,6 +7,7 @@ mod sync;
 mod tls;
 mod wire;
 
+pub use storage::ClientView;
 pub use tls::TlsTransport;
 
 use history::HistoryRounds;
@@ -141,7 +142,7 @@ pub struct Client {
 }
 
 impl Client {
-    /// Opens the local database for exclusive use by this client and binds it to this identity.
+    /// Opens the local database for exclusive writing and binds it to this identity.
     pub async fn open(path: impl AsRef<Path>, identity: Identity) -> Result<Self> {
         validate_id128(&identity.device_id)?;
         if identity.tenant_id == 0 || identity.user_id == 0 {
@@ -151,6 +152,12 @@ impl Client {
             identity,
             storage: Storage::open(path.as_ref(), identity).await?,
         })
+    }
+
+    /// Opens a read-only view of this device's local database before starting [`Client::run`].
+    /// The view can be used from another task while this client is syncing.
+    pub async fn open_view(&self) -> Result<ClientView> {
+        self.storage.open_view(self.identity).await
     }
 
     /// Persists the full request before any attempt is made to send it.
@@ -187,20 +194,18 @@ impl Client {
     ///
     /// This reads SQLite without contacting the server. Each call sees the latest committed local
     /// view at the time of the read. If sync adds a conversation at or below a used cursor, start
-    /// again from zero to see it. Call this when the client is available outside [`Client::run`].
+    /// again from zero to see it. Use [`Client::open_view`] to read while the client is running.
     pub async fn list_conversations(
         &mut self,
         after_conversation_id: u64,
         limit: u32,
     ) -> Result<ConversationPage> {
-        if !(1..=100).contains(&limit) {
-            return Err(Error::Invalid("conversation page size"));
-        }
         self.storage
             .list_conversations(after_conversation_id, limit)
             .await
     }
 
+    /// Reads cached messages in conversation order. Use [`Client::open_view`] during sync.
     pub async fn messages(&mut self, conversation_id: u64) -> Result<Vec<MessageView>> {
         self.storage.messages(conversation_id).await
     }
