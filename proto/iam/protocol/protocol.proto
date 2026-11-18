@@ -449,3 +449,13 @@ message ReadPositionRequest {
 message ReadPositionAck {
   optional uint64 read_through = 1;
 }
+
+message UnreadCountRequest {
+  optional uint64 conversation_id = 1;
+  optional bytes history_id = 2;
+  optional uint64 access_version = 3;
+}
+
+message UnreadCountAck {
+  optional uint64 count = 1;
+}

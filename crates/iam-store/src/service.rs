@@ -377,6 +377,7 @@ impl TidbService {
             DecodedBody::ReadPosition(req) => {
                 self.read_position(cid, identity, &decoded, req).await
             }
+            DecodedBody::UnreadCount(req) => self.unread_count(cid, identity, &decoded, req).await,
             DecodedBody::FriendRequest(req) => {
                 let Some(target) = req.target_user_id else {
                     return wire_error(cid, &decoded, ErrorCode::InvalidArgument);

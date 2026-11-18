@@ -57,6 +57,18 @@
 
 查询以单条 SQL 读取当前成员、当前历史和对应位置。提交在与发送、成员变更相同的控制行锁内确认当前成员、历史及访问版本，再按 `next_sequence - 1` 校验提交上界。位置仅在同一历史和访问版本内取较大值。新范围的首次提交新建一条记录，旧范围的记录继续保留。提交应答丢失时重试同一位置即可得到当前已保存的位置。
 
+### 会话未读查询
+
+未读数在同一条 TiDB 语句中读取当前成员、历史代次、访问版本、个人阅读位置及历史保留下界，再统计已提交范围内由其他用户发送的消息。消息读取复用 `message_order (tenant_id, conversation_id, sequence)` 索引。先为当前成员计算创建序边界，再按租户、会话和该序范围扫描，按发送人过滤。该查询使用已有表，发送事务继续沿用原有写入路径。
+
+用以下测试对生产查询执行 `EXPLAIN ANALYZE`，验证索引只扫描五条测试消息中的两条。
+
+```sh
+IAM_TIDB_TEST_URL='mysql://root@127.0.0.1:4000/iam_test' \
+IAM_TIDB_ALLOW_TEST_WRITES=1 \
+cargo test -p iam-store --lib tidb_unread_count_uses_bounded_message_index -- --ignored --nocapture
+```
+
 ### 发送事务
 
 1. `SEND` 和 `SEND_STATUS` 在 TiDB 悲观事务内先锁住同一个控制行，再读取数据库时间和权威记录。所有正式路径写入遵循这一顺序。同一库的发送决定暂时串行化。

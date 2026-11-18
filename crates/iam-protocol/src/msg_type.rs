@@ -40,6 +40,8 @@ pub enum MsgType {
     FriendStatusAck = 37,
     FriendRemove = 38,
     FriendRemoveAck = 39,
+    UnreadCount = 40,
+    UnreadCountAck = 41,
 }
 
 impl MsgType {
@@ -84,6 +86,8 @@ impl MsgType {
             37 => Self::FriendStatusAck,
             38 => Self::FriendRemove,
             39 => Self::FriendRemoveAck,
+            40 => Self::UnreadCount,
+            41 => Self::UnreadCountAck,
             _ => return None,
         })
     }
@@ -112,6 +116,7 @@ impl MsgType {
                 | Self::Snapshot
                 | Self::History
                 | Self::ReadPosition
+                | Self::UnreadCount
                 | Self::FriendRequest
                 | Self::FriendList
                 | Self::FriendAccept

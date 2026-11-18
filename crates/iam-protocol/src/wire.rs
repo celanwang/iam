@@ -11,6 +11,7 @@ use crate::pb::{
     SendStatusResponse, SnapshotRequest, SnapshotResponse, SyncRequest, SyncResponse,
 };
 use crate::pb::{ReadPositionAck, ReadPositionRequest};
+use crate::pb::{UnreadCountAck, UnreadCountRequest};
 use crate::validate::validate_head;
 use prost::Message;
 
@@ -37,6 +38,8 @@ pub enum DecodedBody {
     HistoryAck(HistoryResponse),
     ReadPosition(ReadPositionRequest),
     ReadPositionAck(ReadPositionAck),
+    UnreadCount(UnreadCountRequest),
+    UnreadCountAck(UnreadCountAck),
     FriendRequest(FriendRequest),
     FriendRequestAck(FriendRequestAck),
     FriendList(FriendListRequest),
@@ -183,6 +186,8 @@ fn decode_body_counted(msg_type: MsgType, body: &[u8], fields: &mut usize) -> Re
         MsgType::HistoryAck => DecodedBody::HistoryAck(decode_pb(body, fields)?),
         MsgType::ReadPosition => DecodedBody::ReadPosition(decode_pb(body, fields)?),
         MsgType::ReadPositionAck => DecodedBody::ReadPositionAck(decode_pb(body, fields)?),
+        MsgType::UnreadCount => DecodedBody::UnreadCount(decode_pb(body, fields)?),
+        MsgType::UnreadCountAck => DecodedBody::UnreadCountAck(decode_pb(body, fields)?),
         MsgType::FriendRequest => DecodedBody::FriendRequest(decode_pb(body, fields)?),
         MsgType::FriendRequestAck => DecodedBody::FriendRequestAck(decode_pb(body, fields)?),
         MsgType::FriendList => DecodedBody::FriendList(decode_pb(body, fields)?),

@@ -2,23 +2,36 @@ use super::membership::lock_authority;
 use super::*;
 use iam_protocol::pb::ReadPositionRequest;
 
-struct PositionScope {
-    conversation: u64,
-    history: Id128,
-    access_version: u64,
+pub(super) const CURRENT_POSITION_SQL: &str = "
+    SELECT m.tenant_id, m.conversation_id, m.user_id, c.history_id, c.next_sequence,
+           e.access_version, p.read_through
+    FROM members m
+    JOIN account_events e USING (tenant_id, user_id, account_sequence)
+    JOIN conversations c ON c.tenant_id = m.tenant_id AND c.conversation_id = m.conversation_id
+    LEFT JOIN read_positions p ON p.tenant_id = m.tenant_id AND p.user_id = m.user_id
+         AND p.conversation_id = m.conversation_id AND p.history_id = c.history_id
+         AND p.access_version = e.access_version
+    WHERE m.tenant_id = ? AND m.conversation_id = ? AND m.user_id = ?";
+
+pub(super) struct PositionScope {
+    pub(super) conversation: u64,
+    pub(super) history: Id128,
+    pub(super) access_version: u64,
 }
 
 impl PositionScope {
-    fn from_request(request: &ReadPositionRequest) -> Result<Self> {
-        let conversation = request.conversation_id.unwrap_or(0);
-        let access_version = request.access_version.unwrap_or(0);
-        if conversation == 0 || access_version == 0 || request.read_through == Some(0) {
-            return Err(Error::InvalidRequest(
-                "invalid read position scope or sequence",
-            ));
+    pub(super) fn new(
+        conversation: Option<u64>,
+        history_id: Option<&[u8]>,
+        access_version: Option<u64>,
+    ) -> Result<Self> {
+        let conversation = conversation.unwrap_or(0);
+        let access_version = access_version.unwrap_or(0);
+        if conversation == 0 || access_version == 0 {
+            return Err(Error::InvalidRequest("invalid conversation scope"));
         }
-        let history = validate_id128(request.history_id.as_deref().unwrap_or_default())
-            .map_err(|_| Error::InvalidRequest("invalid read position history ID"))?;
+        let history = validate_id128(history_id.unwrap_or_default())
+            .map_err(|_| Error::InvalidRequest("invalid conversation history ID"))?;
         Ok(Self {
             conversation,
             history,
@@ -32,23 +45,18 @@ impl PositionScope {
         identity: Identity,
     ) -> Result<(Option<u64>, u64)> {
         // One statement keeps membership, history and the position in the same read view.
-        let row = sqlx::query(
-            "SELECT c.history_id, c.next_sequence, e.access_version, p.read_through
-             FROM members m
-             JOIN account_events e USING (tenant_id, user_id, account_sequence)
-             JOIN conversations c ON c.tenant_id = m.tenant_id AND c.conversation_id = m.conversation_id
-             LEFT JOIN read_positions p ON p.tenant_id = m.tenant_id AND p.user_id = m.user_id
-                 AND p.conversation_id = m.conversation_id AND p.history_id = c.history_id
-                 AND p.access_version = e.access_version
-             WHERE m.tenant_id = ? AND m.conversation_id = ? AND m.user_id = ?",
-        )
-        .bind(identity.tenant_id)
-        .bind(self.conversation)
-        .bind(identity.user_id)
-        .fetch_optional(db)
-        .await?
-        .ok_or(Error::PermissionDenied)?;
-        let conversation = conversation_info(&row)?;
+        let row = sqlx::query(CURRENT_POSITION_SQL)
+            .bind(identity.tenant_id)
+            .bind(self.conversation)
+            .bind(identity.user_id)
+            .fetch_optional(db)
+            .await?
+            .ok_or(Error::PermissionDenied)?;
+        self.validate_current(&row)
+    }
+
+    pub(super) fn validate_current(&self, row: &MySqlRow) -> Result<(Option<u64>, u64)> {
+        let conversation = conversation_info(row)?;
         let version: u64 = row.try_get("access_version")?;
         if conversation.history_id != self.history || version != self.access_version {
             return Err(Error::ReadPositionContextChanged);
@@ -89,7 +97,14 @@ impl TidbStore {
         request: &ReadPositionRequest,
         admit_write: impl FnOnce() -> Result<()>,
     ) -> Result<Option<u64>> {
-        let scope = PositionScope::from_request(request)?;
+        let scope = PositionScope::new(
+            request.conversation_id,
+            request.history_id.as_deref(),
+            request.access_version,
+        )?;
+        if request.read_through == Some(0) {
+            return Err(Error::InvalidRequest("zero read position"));
+        }
         let Some(through) = request.read_through else {
             let mut db = self.pool.acquire().await?;
             let (saved, _) = scope.current(&mut db, identity).await?;

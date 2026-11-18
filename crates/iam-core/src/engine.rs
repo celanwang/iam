@@ -222,6 +222,7 @@ impl Engine {
             DecodedBody::Snapshot(req) => self.handle_snapshot(connection_id, req, frame),
             DecodedBody::History(req) => self.handle_history(connection_id, req, frame),
             DecodedBody::ReadPosition(_)
+            | DecodedBody::UnreadCount(_)
             | DecodedBody::FriendRequest(_)
             | DecodedBody::FriendList(_)
             | DecodedBody::FriendAccept(_)

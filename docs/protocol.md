@@ -104,9 +104,10 @@ Head {
 34 READ_POSITION  ReadPositionRequest -> 35 READ_POSITION_ACK ReadPositionAck
 36 FRIEND_STATUS  FriendStatusRequest -> 37 FRIEND_STATUS_ACK  FriendStatusAck
 38 FRIEND_REMOVE  FriendRemoveRequest -> 39 FRIEND_REMOVE_ACK  FriendRemoveAck
+40 UNREAD_COUNT   UnreadCountRequest   -> 41 UNREAD_COUNT_ACK UnreadCountAck
 ```
 
-`PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友、群创建和阅读位置命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
+`PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友、群创建、阅读位置和未读数命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
 
 命令方向错误、请求号未递增或需要应答的请求号为 0，属于协议错误，返回错误后关闭连接。未认证的业务请求返回 `UNAUTHENTICATED`，不改变认证状态，也不构成该逻辑发送的最终拒绝。
 
@@ -703,6 +704,24 @@ ReadPositionAck {
 同一用户的设备共享本成员周期和历史内的位置。提交后返回原位置与提交位置的较大值，旧位置重试不会回退。如果提交应答丢失，可以用相同会话状态和位置重新提交。服务端在 TiDB 提交完成后才返回成功应答。
 
 读写均检查当前成员权限。无权限返回 `ERROR / PERMISSION_DENIED / NONE`。当前成员的历史代次或访问版本不匹配时，返回 `CONTEXT_CHANGED / RESTART_SYNC`。再授权或历史换代后须同步新状态，新范围从空位置开始。无效字段或超过上界返回 `INVALID_ARGUMENT / NONE`，未知请求字段返回 `UNSUPPORTED_CONTENT / NONE`。无法确认结果时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`。
+
+## 会话未读数
+
+```text
+UnreadCountRequest {
+  conversation_id: uint64 = 1
+  history_id: bytes[16] = 2
+  access_version: uint64 = 3
+}
+
+UnreadCountAck {
+  count: uint64 = 1
+}
+```
+
+`UNREAD_COUNT` 查询认证用户在一个单聊或小群的精确未读数。服务端在同一语句中检查当前成员、历史代次与访问版本，统计该用户可见的已提交消息。消息的创建序须在当前保留范围内，且大于该用户在当前历史代次和访问版本的阅读位置。该范围尚无阅读位置时，从 0 开始计数。本人发送的消息不计入，空结果显式返回 `count = 0`。
+
+无权限返回 `ERROR / PERMISSION_DENIED / NONE`。当前成员的请求范围不匹配时返回 `CONTEXT_CHANGED / RESTART_SYNC`。无效字段返回 `INVALID_ARGUMENT / NONE`，存储结果不可用返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`。
 
 ## 错误路由与连接处理
 
