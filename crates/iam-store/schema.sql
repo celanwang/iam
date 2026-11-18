@@ -126,6 +126,19 @@ CREATE TABLE IF NOT EXISTS group_creations (
     UNIQUE KEY created_group (tenant_id, conversation_id)
 );
 
+CREATE TABLE IF NOT EXISTS group_invites (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    inviter_id BIGINT UNSIGNED NOT NULL,
+    request_id BINARY(16) NOT NULL,
+    conversation_id BIGINT UNSIGNED NOT NULL,
+    recipient_id BIGINT UNSIGNED NOT NULL,
+    outcome TINYINT UNSIGNED NOT NULL,
+    pending_slot TINYINT GENERATED ALWAYS AS (IF(outcome = 1, 1, NULL)) VIRTUAL,
+    PRIMARY KEY (tenant_id, inviter_id, request_id),
+    UNIQUE KEY recipient_invite (tenant_id, recipient_id, conversation_id, request_id),
+    UNIQUE KEY pending_invite (tenant_id, recipient_id, pending_slot, conversation_id)
+);
+
 CREATE TABLE IF NOT EXISTS friend_removals (
     tenant_id BIGINT UNSIGNED NOT NULL,
     user_low BIGINT UNSIGNED NOT NULL,

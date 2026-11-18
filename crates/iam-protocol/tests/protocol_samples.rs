@@ -403,6 +403,53 @@ fn user_block_wire_preserves_an_explicit_unblock() {
 }
 
 #[test]
+fn group_invite_wire_preserves_decline_and_validates_inbox() {
+    use iam_protocol::pb::*;
+    use iam_protocol::{encode_frame, DecodedBody};
+
+    let id: prost::bytes::Bytes = hex::decode("018bcfe5680070008000000000000001")
+        .unwrap()
+        .into();
+    let decide = GroupInviteDecideRequest {
+        conversation_id: Some(42),
+        request_id: Some(id.clone()),
+        accept: Some(false),
+    };
+    let head = Head { req_id: Some(1) };
+    let bytes = encode_frame(MsgType::GroupInviteDecide, &head, &decide).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        "0134000000000002000000160801082a1210018bcfe56800700080000000000000011800"
+    );
+    let mut decoder = FrameDecoder::new();
+    decoder.push(&bytes);
+    let frame = decoder.next_frame().unwrap().unwrap();
+    assert!(
+        matches!(decode_frame(&frame).unwrap().body, DecodedBody::GroupInviteDecide(value) if value == decide)
+    );
+    assert!(raw_body(MsgType::GroupInviteDecideAck, &[10, 0]).is_err());
+    assert!(raw_body(MsgType::GroupInviteDecideAck, &[26, 0]).is_ok());
+    assert!(raw_body(MsgType::GroupInviteInboxAck, &[]).is_ok());
+
+    let mut page = GroupInviteInboxAck {
+        invitations: vec![GroupInvitation {
+            conversation_id: Some(42),
+            inviter_user_id: Some(1),
+            request_id: Some(id),
+        }],
+        next_after_conversation_id: None,
+    };
+    assert!(
+        matches!(raw_body(MsgType::GroupInviteInboxAck, &page.encode_to_vec()).unwrap(), DecodedBody::GroupInviteInboxAck(decoded) if decoded == page)
+    );
+    page.invitations.push(page.invitations[0].clone());
+    assert!(raw_body(MsgType::GroupInviteInboxAck, &page.encode_to_vec()).is_err());
+    page.invitations.pop();
+    page.invitations[0].inviter_user_id = Some(0);
+    assert!(raw_body(MsgType::GroupInviteInboxAck, &page.encode_to_vec()).is_err());
+}
+
+#[test]
 fn recursive_wire_validation_rejects_duplicates_and_multiple_branches() {
     // Duplicate SendRequest.key and nested MessageKey.conversation_id.
     for body in [&[0x0a, 0, 0x0a, 0][..], &[0x0a, 4, 8, 1, 8, 1][..]] {

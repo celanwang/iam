@@ -1,13 +1,15 @@
 use crate::clock::ClockBatch;
-use crate::store::{unresolved, Decision, FriendAttempt, Scope, SendKey, TidbStore};
+use crate::store::{
+    unresolved, Decision, FriendAttempt, GroupInviteOutcome, Scope, SendKey, TidbStore,
+};
 use crate::{ConversationInfo, Error, Identity, Result, TextPage};
 use iam_core::{CoreError, DeviceCredential, Engine, EngineOutput, EngineReply, StorageRequest};
 use iam_protocol::pb::{
-    change, friend_attempt_ack, friend_request_ack, friend_status_ack, message_content,
-    send_outcome, Change, Empty, ErrorCode, FriendAcceptAck, FriendAttemptAck, FriendRelationship,
-    FriendRemoveAck, FriendRequestAck, FriendStatusAck, GroupCreateAck, HistoryResponse,
-    MessageContent, MessageKey, RetryAction, SendOutcome, SendResponse, SendStatusResponse,
-    SnapshotResponse, SyncResponse, UserBlockAck,
+    change, friend_attempt_ack, friend_request_ack, friend_status_ack, group_invite_result_ack,
+    message_content, send_outcome, Change, Empty, ErrorCode, FriendAcceptAck, FriendAttemptAck,
+    FriendRelationship, FriendRemoveAck, FriendRequestAck, FriendStatusAck, GroupCreateAck,
+    GroupInviteResultAck, HistoryResponse, MessageContent, MessageKey, RetryAction, SendOutcome,
+    SendResponse, SendStatusResponse, SnapshotResponse, SyncResponse, UserBlockAck,
 };
 use iam_protocol::{
     decode_frame, encode_frame, encode_protocol_error, validate_id128, DecodedBody, DecodedFrame,
@@ -62,7 +64,7 @@ impl TidbService {
             .await
     }
 
-    /// Trusted application operation for the original participants of a conversation.
+    /// Trusted application operation for participants who previously held conversation access.
     pub async fn set_member_access(
         &self,
         tenant: u64,
@@ -556,6 +558,47 @@ impl TidbService {
                     }),
                 )
             }
+            DecodedBody::GroupInvite(req) => {
+                let Some(((group, recipient), id)) = req
+                    .conversation_id
+                    .zip(req.target_user_id)
+                    .zip(request_id128(req.request_id.as_deref()))
+                else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self
+                    .database
+                    .invite_group_member(identity, group, recipient, id, |write| {
+                        self.admit_membership(cid, write, None)
+                    })
+                    .await
+                    .map(group_invite_ack);
+                self.membership_reply(cid, &decoded, MsgType::GroupInviteAck, result)
+            }
+            DecodedBody::GroupInviteInbox(req) => {
+                let Some(after) = req.after_conversation_id else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self.database.group_invite_inbox(identity, after).await;
+                self.membership_reply(cid, &decoded, MsgType::GroupInviteInboxAck, result)
+            }
+            DecodedBody::GroupInviteDecide(req) => {
+                let Some(((group, id), accept)) = req
+                    .conversation_id
+                    .zip(request_id128(req.request_id.as_deref()))
+                    .zip(req.accept)
+                else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self
+                    .database
+                    .decide_group_invite(identity, group, id, accept, |write| {
+                        self.admit_membership(cid, write, None)
+                    })
+                    .await
+                    .map(group_invite_ack);
+                self.membership_reply(cid, &decoded, MsgType::GroupInviteDecideAck, result)
+            }
             _ => wire_error(cid, &decoded, ErrorCode::UnsupportedCommand),
         }
     }
@@ -589,16 +632,22 @@ impl TidbService {
         match result {
             Ok(body) => reply(cid, frame, kind, &body),
             Err(Error::InvalidRequest(_)) => wire_error(cid, frame, ErrorCode::InvalidArgument),
-            Err(Error::FriendNotFound | Error::GroupMemberNotFound) => {
-                wire_error(cid, frame, ErrorCode::NotFound)
-            }
-            Err(Error::FriendChanged | Error::GroupMemberContextChanged) => {
-                wire_error(cid, frame, ErrorCode::ContextChanged)
-            }
             Err(
-                Error::FriendKeyConflict | Error::GroupKeyConflict | Error::UserBlockKeyConflict,
+                Error::FriendNotFound | Error::GroupMemberNotFound | Error::GroupInviteNotFound,
+            ) => wire_error(cid, frame, ErrorCode::NotFound),
+            Err(
+                Error::FriendChanged | Error::GroupMemberContextChanged | Error::GroupInviteExpired,
+            ) => wire_error(cid, frame, ErrorCode::ContextChanged),
+            Err(
+                Error::FriendKeyConflict
+                | Error::GroupKeyConflict
+                | Error::UserBlockKeyConflict
+                | Error::GroupInviteKeyConflict,
             ) => wire_error(cid, frame, ErrorCode::IdempotencyConflict),
-            Err(Error::FriendInProgress) => wire_error(cid, frame, ErrorCode::InProgress),
+            Err(Error::FriendInProgress | Error::GroupInviteInProgress) => {
+                wire_error(cid, frame, ErrorCode::InProgress)
+            }
+            Err(Error::GroupFull) => wire_error(cid, frame, ErrorCode::ResourceLimit),
             Err(Error::PermissionDenied) => wire_error(cid, frame, ErrorCode::PermissionDenied),
             Err(Error::Unauthenticated) => protocol_error(
                 None,
@@ -719,6 +768,17 @@ impl TidbService {
 
 fn request_id128(bytes: Option<&[u8]>) -> Option<Id128> {
     bytes.and_then(|bytes| validate_id128(bytes).ok())
+}
+
+fn group_invite_ack(result: GroupInviteOutcome) -> GroupInviteResultAck {
+    use group_invite_result_ack::Value;
+    GroupInviteResultAck {
+        value: Some(match result {
+            GroupInviteOutcome::Pending => Value::Pending(Empty {}),
+            GroupInviteOutcome::Accepted(id) => Value::ConversationId(id),
+            GroupInviteOutcome::Rejected => Value::Rejected(Empty {}),
+        }),
+    }
 }
 
 fn friend_attempt_ack(result: FriendAttempt) -> FriendAttemptAck {

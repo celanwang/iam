@@ -14,6 +14,9 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Small-group invitations with a paged recipient inbox, explicit decisions,
+  durable retries, and membership limits shared with trusted access changes.
+
 - Directional user blocks with durable block and unblock results. Either
   direction prevents new direct sends, friend acceptance, and group admission
   involving the creator while preserving existing history and group access.

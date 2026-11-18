@@ -34,6 +34,8 @@ cargo run -p iam-gateway
 
 应用用 `Client::create_group` 提交预先保存的 UUIDv7 和其他初始成员的用户 ID。调用同样经新连接认证。所有初始成员的 `Client::run` 通过账号同步发现群，`Client::list_conversations` 返回持久化的 `Group` 类型。
 
+活跃群主通过 `Client::invite_group_member` 发送带持久 UUIDv7 的群邀请。收件人用 `Client::group_invite_inbox` 分页查询，再以原邀请 ID 调用 `Client::decide_group_invite`。接受后，原账号同步和会话同步链路负责发现群及读取保留历史。
+
 在 Unix 上，更新证书链、私钥和设备凭证文件后，向实际运行的 `iam-gateway` 进程发送 `SIGHUP`。网关校验整批配置，成功后新握手使用新证书。凭证删除、轮换或修改到期时间会关闭对应设备的连接并作废旧恢复票据。凭证相同的设备继续使用当前连接。空凭证文件撤销所有设备。文件读取、解析或证书与私钥配对失败时，网关记下错误并继续使用上一次配置。
 
 嵌入应用可调用 `Gateway::reload` 更新配置，或调用 `Gateway::revoke_device` 立即关闭指定设备的连接并禁用当前进程内的凭证。跨重启撤销由部署方从凭证文件删除旧凭证。

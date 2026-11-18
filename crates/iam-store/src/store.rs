@@ -45,11 +45,17 @@ mod friend_removal;
 #[cfg(test)]
 #[path = "friend_removal_tests.rs"]
 mod friend_removal_tests;
+#[cfg(test)]
+#[path = "group_invite_tests.rs"]
+mod group_invite_tests;
+#[path = "group_invites.rs"]
+mod group_invites;
 #[path = "group_members.rs"]
 mod group_members;
 #[cfg(test)]
 #[path = "group_tests.rs"]
 mod group_tests;
+pub(crate) use group_invites::GroupInviteOutcome;
 #[path = "groups.rs"]
 mod groups;
 #[cfg(test)]
@@ -73,7 +79,7 @@ const CONTROL: &str = "SELECT store_id, token_key, max_observed_now_ms, closed_t
 
 const INITIAL_ACCESS: u64 = 1;
 const STORAGE_SCHEMA_VERSION: u8 = 5;
-const TABLES: [&str; 16] = [
+const TABLES: [&str; 17] = [
     "store_control",
     "conversations",
     "messages",
@@ -86,6 +92,7 @@ const TABLES: [&str; 16] = [
     "friend_requests",
     "friend_attempts",
     "group_creations",
+    "group_invites",
     "friend_removals",
     "direct_send_blocks",
     "user_blocks",
@@ -889,6 +896,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
             "SELECT tenant_id, to_user_id, from_user_id, request_id, outcome, conversation_id, legacy_slot, pending_slot FROM friend_attempts FORCE INDEX (legacy_inbox) LIMIT 0",
             "SELECT kind FROM conversations LIMIT 0",
             "SELECT tenant_id, creator_id, request_id, member_set, conversation_id FROM group_creations LIMIT 0",
+            "SELECT tenant_id, inviter_id, request_id, conversation_id, recipient_id, outcome, pending_slot FROM group_invites LIMIT 0",
             "SELECT tenant_id, user_low, user_high, generation, conversation_id FROM friend_removals LIMIT 0",
             "SELECT tenant_id, conversation_id, user_low, user_high FROM direct_send_blocks FORCE INDEX (blocked_pair) LIMIT 0",
             "SELECT tenant_id, actor_id, peer_id FROM user_blocks LIMIT 0",
@@ -899,7 +907,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
     }
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT table_name, index_name, column_name FROM information_schema.statistics \
-         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests', 'friend_attempts', 'group_creations', 'friend_removals', 'direct_send_blocks', 'user_blocks', 'user_block_changes') \
+         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests', 'friend_attempts', 'group_creations', 'group_invites', 'friend_removals', 'direct_send_blocks', 'user_blocks', 'user_block_changes') \
          AND non_unique = 0 ORDER BY table_name, index_name, seq_in_index",
     )
     .fetch_all(pool)
@@ -915,6 +923,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
                     | "friend_requests"
                     | "friend_attempts"
                     | "group_creations"
+                    | "group_invites"
                     | "friend_removals"
                     | "direct_send_blocks"
                     | "user_blocks"
@@ -932,7 +941,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
         "conversation_id",
         "client_msg_id",
     ];
-    let expected: [(&str, &str, &[&str]); 23] = [
+    let expected: [(&str, &str, &[&str]); 26] = [
         ("store_control", "PRIMARY", &["singleton"]),
         (
             "conversations",
@@ -1015,6 +1024,26 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
             "group_creations",
             "created_group",
             &["tenant_id", "conversation_id"],
+        ),
+        (
+            "group_invites",
+            "PRIMARY",
+            &["tenant_id", "inviter_id", "request_id"],
+        ),
+        (
+            "group_invites",
+            "recipient_invite",
+            &["tenant_id", "recipient_id", "conversation_id", "request_id"],
+        ),
+        (
+            "group_invites",
+            "pending_invite",
+            &[
+                "tenant_id",
+                "recipient_id",
+                "pending_slot",
+                "conversation_id",
+            ],
         ),
         (
             "friend_removals",

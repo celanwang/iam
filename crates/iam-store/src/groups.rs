@@ -52,7 +52,7 @@ impl TidbStore {
                 "expected 2 to 31 other group members",
             ));
         }
-        require_friends(&mut tx, owner, &peers).await?;
+        require_group_friends(&mut tx, owner.tenant_id, owner.user_id, &peers).await?;
         let conversation = allocate_conversation(&mut tx, owner.tenant_id).await?;
         admit(true)?;
 
@@ -81,15 +81,18 @@ impl TidbStore {
     }
 }
 
-async fn require_friends(db: &mut MySqlConnection, creator: Identity, peers: &[u64]) -> Result<()> {
-    let pairs = peers
-        .iter()
-        .map(|&peer| ordered_pair(creator.user_id, peer));
+pub(super) async fn require_group_friends(
+    db: &mut MySqlConnection,
+    tenant: u64,
+    owner: u64,
+    peers: &[u64],
+) -> Result<()> {
+    let pairs = peers.iter().map(|&peer| ordered_pair(owner, peer));
     let mut query = sqlx::QueryBuilder::<MySql>::new(
         "SELECT 1 FROM direct_pairs p WHERE p.friends = TRUE AND p.tenant_id = ",
     );
     query
-        .push_bind(creator.tenant_id)
+        .push_bind(tenant)
         .push(" AND (p.user_low, p.user_high) IN ");
     query.push_tuples(pairs, |mut values, [low, high]| {
         values.push_bind(low).push_bind(high);

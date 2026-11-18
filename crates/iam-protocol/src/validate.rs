@@ -72,18 +72,35 @@ pub(crate) fn validate_response(body: &crate::DecodedBody) -> Result<()> {
             return invalid("zero read position");
         }
         B::FriendListAck(page) => {
-            validate_friend_page(page.from_user_ids.iter().copied(), page.next_after_user_id)?;
+            validate_inbox_page(
+                page.from_user_ids.iter().copied(),
+                page.next_after_user_id,
+                crate::MAX_FRIEND_REQUESTS,
+            )?;
         }
-        B::FriendInboxAck(page) => validate_friend_page(
+        B::FriendInboxAck(page) => validate_inbox_page(
             page.requests
                 .iter()
                 .map(|request| request.from_user_id.unwrap()),
             page.next_after_user_id,
+            crate::MAX_FRIEND_REQUESTS,
         )?,
         B::FriendDecideAck(ack)
             if matches!(ack.value, Some(friend_attempt_ack::Value::Pending(_))) =>
         {
             return invalid("friend decision must be final");
+        }
+        B::GroupInviteInboxAck(page) => validate_inbox_page(
+            page.invitations
+                .iter()
+                .map(|row| row.conversation_id.unwrap()),
+            page.next_after_conversation_id,
+            crate::MAX_GROUP_INVITES,
+        )?,
+        B::GroupInviteDecideAck(ack)
+            if matches!(ack.value, Some(group_invite_result_ack::Value::Pending(_))) =>
+        {
+            return invalid("group invitation decision must be final");
         }
         B::AuthAck(r) => {
             if let Some(auth_response::Value::Session(s)) = &r.value {
@@ -186,19 +203,21 @@ fn invalid<T>(reason: &'static str) -> Result<T> {
     Err(ProtocolErrorKind::InvalidArgument(reason))
 }
 
-fn validate_friend_page(ids: impl ExactSizeIterator<Item = u64>, next: Option<u64>) -> Result<()> {
+fn validate_inbox_page(
+    ids: impl ExactSizeIterator<Item = u64>,
+    next: Option<u64>,
+    limit: usize,
+) -> Result<()> {
     let len = ids.len();
     let mut last = 0;
     for id in ids {
         if id <= last {
-            return invalid("invalid friend request order");
+            return invalid("invalid inbox order");
         }
         last = id;
     }
-    if len > crate::MAX_FRIEND_REQUESTS
-        || next.is_some_and(|next| len != crate::MAX_FRIEND_REQUESTS || next != last)
-    {
-        return invalid("invalid friend request page");
+    if len > limit || next.is_some_and(|next| len != limit || next != last) {
+        return invalid("invalid inbox page");
     }
     Ok(())
 }

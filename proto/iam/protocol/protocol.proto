@@ -462,6 +462,41 @@ message UserBlockAck {
   optional bool blocked = 1;
 }
 
+message GroupInviteRequest {
+  optional uint64 conversation_id = 1;
+  optional uint64 target_user_id = 2;
+  optional bytes request_id = 3;
+}
+
+message GroupInviteInboxRequest {
+  optional uint64 after_conversation_id = 1;
+}
+
+message GroupInvitation {
+  optional uint64 conversation_id = 1;
+  optional uint64 inviter_user_id = 2;
+  optional bytes request_id = 3;
+}
+
+message GroupInviteInboxAck {
+  repeated GroupInvitation invitations = 1;
+  optional uint64 next_after_conversation_id = 2;
+}
+
+message GroupInviteDecideRequest {
+  optional uint64 conversation_id = 1;
+  optional bytes request_id = 2;
+  optional bool accept = 3;
+}
+
+message GroupInviteResultAck {
+  oneof value {
+    Empty pending = 1;
+    uint64 conversation_id = 2;
+    Empty rejected = 3;
+  }
+}
+
 message ProtocolError {
   optional uint32 ref_msg_type = 1;
   optional ErrorInfo error = 2;

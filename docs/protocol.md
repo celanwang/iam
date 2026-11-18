@@ -75,7 +75,7 @@ Head {
 
 需要应答的请求必须显式携带非 0 的 `req_id`，按实际写入连接的顺序严格递增，发送队列在确定写入顺序时分配请求号。响应可以乱序返回，但必须回显原请求号；重试使用新请求号，逻辑消息身份不变。`PUSH`、`PUSH_ACK` 和无法关联请求的连接错误使用 0，不更新请求号水位；只有这些场景允许 `head_len = 0`。
 
-`Body` 根据 `msg_type` 解码为唯一指定结构。`HEARTBEAT` 的 `body_len` 必须为 0。没有待接受申请时，`FRIEND_LIST_ACK` 和 `FRIEND_INBOX_ACK` 使用空消息体。当前范围尚无阅读位置时，`READ_POSITION_ACK` 使用空消息体。其他命令必须满足字段校验。线格式错误与业务错误分别按后文错误路由处理，不能仅凭解码成功就进入业务流程。
+`Body` 根据 `msg_type` 解码为唯一指定结构。`HEARTBEAT` 的 `body_len` 必须为 0。待处理列表为空时，`FRIEND_LIST_ACK`、`FRIEND_INBOX_ACK` 和 `GROUP_INVITE_INBOX_ACK` 使用空消息体。当前范围尚无阅读位置时，`READ_POSITION_ACK` 使用空消息体。其他命令必须满足字段校验。线格式错误与业务错误分别按后文错误路由处理，不能仅凭解码成功就进入业务流程。
 
 固定头的 `version` 用于校验帧与命令的兼容性，认证体不重复携带该信息。遇到不支持的版本或标志位时停止解码；可安全响应时返回协议错误，然后关闭连接。压缩扩展需要明确算法、压缩范围和解压后上限。
 
@@ -108,6 +108,9 @@ Head {
 42 USER_BLOCK     UserBlockRequest    -> 43 USER_BLOCK_ACK     UserBlockAck
 44 GROUP_MEMBERS  GroupMembersRequest  -> 45 GROUP_MEMBERS_ACK GroupMembersAck
 46 GROUP_MEMBER_REMOVE GroupMemberRemoveRequest -> 47 GROUP_MEMBER_REMOVE_ACK GroupMemberRemoveAck
+48 GROUP_INVITE   GroupInviteRequest  -> 49 GROUP_INVITE_ACK   GroupInviteResultAck
+50 GROUP_INVITE_INBOX GroupInviteInboxRequest -> 51 GROUP_INVITE_INBOX_ACK GroupInviteInboxAck
+52 GROUP_INVITE_DECIDE GroupInviteDecideRequest -> 53 GROUP_INVITE_DECIDE_ACK GroupInviteResultAck
 ```
 
 `PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友、拉黑、小群、阅读位置和未读数命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
@@ -693,7 +696,7 @@ HistoryResponse = oneof {
 
 `GROUP_CREATE_ACK` 的 `conversation_id`（字段 1）在事务提交后返回。已成功创建的 ID 在同租户、同创建者下绑定原成员集合，换设备或重连重试返回原会话 ID。这个结果独立于后来发生的访问权限变化。同键更改成员集合返回 `IDEMPOTENCY_CONFLICT`。创建 ID 缺失或格式错误、原始成员项超限，以及首次创建时成员集合不合法，返回 `INVALID_ARGUMENT`。提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`，客户端以新帧请求号和原创建 ID 重试。
 
-群成员在创建时获得初始授权，创建者是固定群主。退出和移除使用下列命令。邀请和群主转让留待后续版本。
+群成员在创建时获得初始授权，创建者是固定群主。使用下列命令管理成员和邀请。
 
 ## 小群名单、退出和移除
 
@@ -706,6 +709,16 @@ HistoryResponse = oneof {
 第三人、跨租户请求、单聊请求、普通成员操作他人和无权读取名单均返回 `PERMISSION_DENIED`。参数缺失或零值、非法 UUIDv7 返回 `INVALID_ARGUMENT`。提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`，重试须沿用历史代次和目标访问版本。
 
 撤权后，后续提交的新消息不再投递给原成员，原成员的新发送和会话 `SYNC`、`HISTORY` 失去权限。账户同步当中会移除本地会话与消息缓存。已提交的发送仍可按原键和原有期限查询。
+
+## 群邀请与决定
+
+`GROUP_INVITE` 接收群 `conversation_id`（字段 1）、`target_user_id`（字段 2）和调用方发送前保存的 UUIDv7 `request_id`（字段 3）。同一租户、群主和 UUID 绑定群及收件人，换群或目标返回 `IDEMPOTENCY_CONFLICT`。首次邀请须由当前仍在群内的创建者发起，对端须是同租户、双方均未拉黑的当前好友。新邀请的目标已是成员时，直接保存已接受结果，成员授权保持原样。
+
+`GROUP_INVITE_INBOX` 接收显式 `after_conversation_id`（字段 1），首页使用 0。只返回当前账号收到的待处理邀请，每群最多一条，按群 ID 升序，每页最多 100 条。响应的 `invitations`（字段 1）各含 `conversation_id`、`inviter_user_id`、`request_id`（字段 1、2、3）。续页使用响应的 `next_after_conversation_id`（字段 2）作为排他下界，空页可以为空消息体。已有待处理邀请时，另一 UUID 会得到持久的 `IN_PROGRESS / NONE`，以后重试该键仍返回同一结果。
+
+`GROUP_INVITE_DECIDE` 接收群 `conversation_id`、邀请 `request_id` 和显式 `accept`（字段 1、2、3），只允许对应收件人操作。两种写应答共用 `GroupInviteResultAck`，包含 `pending`、已接受的 `conversation_id` 或 `rejected`（分支 1、2、3）。决定只返回终态。接受须重新检查群主资格、好友与拉黑状态。首次授予权限时，群成员已满 32 人会返回 `RESOURCE_LIMIT / NONE`，邀请保持待处理。资格不满足时返回 `PERMISSION_DENIED`。无法在收件人的范围内找到邀请时返回 `NOT_FOUND`。
+
+并发决定由首次提交的结果胜出。提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`，客户端复用原 UUID。成员离开后，已接受回执仍可读回，再加入需要新的邀请。撤权时属于上个成员周期的待处理邀请结为 `CONTEXT_CHANGED`。加入后通过账号同步发现群，并可读取当前保留的群历史。每次实际加入发放新访问版本，离开时撤销该版本的读写权限。
 
 ## 阅读位置
 
