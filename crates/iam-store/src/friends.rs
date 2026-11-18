@@ -3,6 +3,7 @@ use super::membership::{
     allocate_conversation, create_conversation_in, direct_pair, insert_direct_pair, lock_authority,
     ordered_pair,
 };
+use super::user_blocks::pair_is_blocked;
 use super::*;
 use iam_protocol::{
     pb::{FriendApplicant, FriendInboxAck, FriendListAck},
@@ -79,6 +80,9 @@ impl TidbStore {
         }
 
         let pair = ordered_pair(direction.sender, direction.recipient);
+        if pair_is_blocked(&mut tx, direction.tenant, pair).await? {
+            return Err(Error::PermissionDenied);
+        }
         let existing = direct_pair(&mut *tx, direction.tenant, pair).await?;
         let established = existing
             .filter(|pair| pair.friends)
@@ -342,6 +346,9 @@ async fn establish_direct(
     admit: impl FnOnce(bool) -> Result<()>,
 ) -> Result<u64> {
     let pair = ordered_pair(key.sender, key.recipient);
+    if pair_is_blocked(tx, key.tenant, pair).await? {
+        return Err(Error::PermissionDenied);
+    }
     if let Some(existing) = direct_pair(&mut **tx, key.tenant, pair).await? {
         if existing.friends {
             admit(true)?;

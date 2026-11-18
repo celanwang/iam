@@ -423,6 +423,16 @@ message FriendRemoveAck {
   optional uint64 conversation_id = 1;
 }
 
+message UserBlockRequest {
+  optional uint64 peer_user_id = 1;
+  optional bytes request_id = 2;
+  optional bool blocked = 3;
+}
+
+message UserBlockAck {
+  optional bool blocked = 1;
+}
+
 message ProtocolError {
   optional uint32 ref_msg_type = 1;
   optional ErrorInfo error = 2;

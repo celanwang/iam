@@ -84,7 +84,7 @@ async fn create(socket: &mut TlsTransport, req: u64, key: Id128, members: &[u64]
     .await
 }
 
-fn group_id(reply: DecodedBody) -> u64 {
+pub(super) fn group_id(reply: DecodedBody) -> u64 {
     let DecodedBody::GroupCreateAck(ack) = reply else {
         panic!("expected GROUP_CREATE_ACK, got {reply:?}");
     };
@@ -96,7 +96,7 @@ async fn catalog_counts(db: &MySqlPool) -> (i64, i64, i64, i64) {
         .fetch_one(db).await.unwrap()
 }
 
-async fn assert_one_three_person_group(db: &MySqlPool, id: u64) {
+pub(super) async fn assert_one_three_person_group(db: &MySqlPool, id: u64) {
     assert_eq!(
         catalog_counts(db).await,
         (3, 7, 7, 1),

@@ -143,3 +143,19 @@ CREATE TABLE IF NOT EXISTS direct_send_blocks (
     PRIMARY KEY (tenant_id, conversation_id),
     KEY blocked_pair (tenant_id, user_low, user_high)
 );
+
+CREATE TABLE IF NOT EXISTS user_blocks (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    actor_id BIGINT UNSIGNED NOT NULL,
+    peer_id BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (tenant_id, actor_id, peer_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_block_changes (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    actor_id BIGINT UNSIGNED NOT NULL,
+    request_id BINARY(16) NOT NULL,
+    peer_id BIGINT UNSIGNED NOT NULL,
+    blocked BOOLEAN NOT NULL,
+    PRIMARY KEY (tenant_id, actor_id, request_id)
+);

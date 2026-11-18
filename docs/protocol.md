@@ -105,6 +105,7 @@ Head {
 36 FRIEND_STATUS  FriendStatusRequest -> 37 FRIEND_STATUS_ACK  FriendStatusAck
 38 FRIEND_REMOVE  FriendRemoveRequest -> 39 FRIEND_REMOVE_ACK  FriendRemoveAck
 40 UNREAD_COUNT   UnreadCountRequest   -> 41 UNREAD_COUNT_ACK UnreadCountAck
+42 USER_BLOCK     UserBlockRequest    -> 43 USER_BLOCK_ACK     UserBlockAck
 ```
 
 `PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友、群创建、阅读位置和未读数命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
@@ -672,7 +673,15 @@ HistoryResponse = oneof {
 
 解除后，该对账号的所有 Direct 都拒绝尚未结算的新 `SEND`，包括旧库已有的重复单聊。此前已确认的发送结果继续按原窗口查询。已有单聊的可访问历史、账号和会话游标及现有群权限保留，已解除的关系不能作为创建小群的准入依据。
 
-再次成为好友需要新的带 ID 申请以及收件人接受。成功后复用 canonical 单聊并发布新代次，在各单聊仍有独立访问权的成员可恢复发送。已结算的发送拒绝保持原结果。历史申请或决定的成功回执仅说明原操作的结果，当前关系以 `FRIEND_STATUS` 为准。定向拉黑和解封由后续流程提供。
+再次成为好友需要新的带 ID 申请以及收件人接受。成功后复用 canonical 单聊并发布新代次，在各单聊仍有独立访问权的成员可恢复发送。已结算的发送拒绝保持原结果。历史申请或决定的成功回执仅说明原操作的结果，当前关系以 `FRIEND_STATUS` 为准。
+
+### 定向拉黑与解封
+
+`USER_BLOCK` 的 `peer_user_id`（字段 1）指定同一认证租户内的对端。省略 `request_id`（字段 2）和 `blocked`（字段 3）时，查询调用方对该对端的单向拉黑状态。变更时同时提供 UUIDv7 和显式布尔值，`true` 拉黑，`false` 解封。新变更需要已知同租户对端，已有自己的拉黑记录可以在对端凭证撤下后解封。缺少必要字段、对端为自己、ID 无效时返回 `INVALID_ARGUMENT`，需要校验的未知对端返回 `NOT_FOUND`。
+
+`USER_BLOCK_ACK` 返回 `blocked`（字段 1）。查询返回当前自己的状态，变更及其重放返回该次操作原先保存的结果。按租户、调用者和 UUIDv7 去重，同键更换对端或布尔值会返回 `IDEMPOTENCY_CONFLICT`。提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`，以原 UUIDv7 重试。其他账号及其他租户拥有各自的变更键空间。
+
+任一方向存在拉黑时，该对账号的所有 Direct（含旧重复单聊）都会拒绝新发送，双方也不能新申请或接受好友，或作为创建者选对方加入新小群。新操作统一返回 `PERMISSION_DENIED`，响应不携带拉黑方向。待处理申请保留，可查询或拒绝，解封后仍须显式接受。已确认发送、好友申请和群创建重放继续返回各自已保存的结果。已有好友代次、可访问历史、阅读位置及共同群权限保留。解除单向拉黑后，另一方向的拉黑、已解除的好友关系及可信成员撤权仍各自生效。
 
 ## 创建小群
 

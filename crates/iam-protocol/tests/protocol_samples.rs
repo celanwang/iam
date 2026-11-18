@@ -359,6 +359,50 @@ fn friend_removal_wire_requires_a_valid_status_generation() {
 }
 
 #[test]
+fn user_block_wire_preserves_an_explicit_unblock() {
+    use iam_protocol::pb::*;
+    use iam_protocol::{encode_frame, DecodedBody};
+
+    let request = UserBlockRequest {
+        peer_user_id: Some(42),
+        request_id: Some(
+            hex::decode("018bcfe5680070008000000000000001")
+                .unwrap()
+                .into(),
+        ),
+        blocked: Some(false),
+    };
+    let bytes = encode_frame(MsgType::UserBlock, &Head { req_id: Some(1) }, &request).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        "012a000000000002000000160801082a1210018bcfe56800700080000000000000011800"
+    );
+    let mut decoder = FrameDecoder::new();
+    decoder.push(&bytes);
+    let frame = decoder.next_frame().unwrap().unwrap();
+    assert!(
+        matches!(decode_frame(&frame).unwrap().body, DecodedBody::UserBlock(value) if value == request)
+    );
+    assert!(matches!(
+        raw_body(MsgType::UserBlock, &[8, 42]).unwrap(),
+        DecodedBody::UserBlock(UserBlockRequest {
+            request_id: None,
+            blocked: None,
+            ..
+        })
+    ));
+    assert!(matches!(
+        raw_body(MsgType::UserBlockAck, &[8, 0]).unwrap(),
+        DecodedBody::UserBlockAck(UserBlockAck {
+            blocked: Some(false)
+        })
+    ));
+    assert!(raw_body(MsgType::UserBlockAck, &[]).is_err());
+    assert!(raw_body(MsgType::UserBlockAck, &[8, 2]).is_err());
+    assert!(raw_body(MsgType::UserBlock, &[8, 42, 24, 0, 24, 1]).is_err());
+}
+
+#[test]
 fn recursive_wire_validation_rejects_duplicates_and_multiple_branches() {
     // Duplicate SendRequest.key and nested MessageKey.conversation_id.
     for body in [&[0x0a, 0, 0x0a, 0][..], &[0x0a, 4, 8, 1, 8, 1][..]] {

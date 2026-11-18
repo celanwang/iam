@@ -231,7 +231,8 @@ impl Engine {
             | DecodedBody::FriendDecide(_)
             | DecodedBody::GroupCreate(_)
             | DecodedBody::FriendStatus(_)
-            | DecodedBody::FriendRemove(_) => {
+            | DecodedBody::FriendRemove(_)
+            | DecodedBody::UserBlock(_) => {
                 match self.prepare_storage_request(connection_id, frame)? {
                     StorageRequest::Ready(cid) => self.wire_error(
                         frame,

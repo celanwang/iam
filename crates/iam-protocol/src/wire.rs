@@ -8,7 +8,8 @@ use crate::pb::{
     FriendStatusAck, FriendStatusRequest, GroupCreateAck, GroupCreateRequest, Head, HeartbeatAck,
     HeartbeatRequest, HistoryRequest, HistoryResponse, ProtocolError, Push, PushAck,
     ReconnectRequest, ReconnectResponse, SendRequest, SendResponse, SendStatusRequest,
-    SendStatusResponse, SnapshotRequest, SnapshotResponse, SyncRequest, SyncResponse,
+    SendStatusResponse, SnapshotRequest, SnapshotResponse, SyncRequest, SyncResponse, UserBlockAck,
+    UserBlockRequest,
 };
 use crate::pb::{ReadPositionAck, ReadPositionRequest};
 use crate::pb::{UnreadCountAck, UnreadCountRequest};
@@ -58,6 +59,8 @@ pub enum DecodedBody {
     FriendStatusAck(FriendStatusAck),
     FriendRemove(FriendRemoveRequest),
     FriendRemoveAck(FriendRemoveAck),
+    UserBlock(UserBlockRequest),
+    UserBlockAck(UserBlockAck),
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +209,8 @@ fn decode_body_counted(msg_type: MsgType, body: &[u8], fields: &mut usize) -> Re
         MsgType::FriendStatusAck => DecodedBody::FriendStatusAck(decode_pb(body, fields)?),
         MsgType::FriendRemove => DecodedBody::FriendRemove(decode_pb(body, fields)?),
         MsgType::FriendRemoveAck => DecodedBody::FriendRemoveAck(decode_pb(body, fields)?),
+        MsgType::UserBlock => DecodedBody::UserBlock(decode_pb(body, fields)?),
+        MsgType::UserBlockAck => DecodedBody::UserBlockAck(decode_pb(body, fields)?),
     };
     crate::validate::validate_response(&decoded)?;
     Ok(decoded)

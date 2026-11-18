@@ -43,6 +43,8 @@ pub enum Error {
     MembershipUnavailable,
     #[error("the group creation ID is bound to a different member set")]
     GroupKeyConflict,
+    #[error("the user block change ID is bound to a different target or state")]
+    UserBlockKeyConflict,
     #[error("invalid request: {0}")]
     InvalidRequest(&'static str),
     #[error("conversation sequence exhausted")]

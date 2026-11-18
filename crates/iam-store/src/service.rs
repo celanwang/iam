@@ -7,7 +7,7 @@ use iam_protocol::pb::{
     send_outcome, Change, Empty, ErrorCode, FriendAcceptAck, FriendAttemptAck, FriendRelationship,
     FriendRemoveAck, FriendRequestAck, FriendStatusAck, GroupCreateAck, HistoryResponse,
     MessageContent, MessageKey, RetryAction, SendOutcome, SendResponse, SendStatusResponse,
-    SnapshotResponse, SyncResponse,
+    SnapshotResponse, SyncResponse, UserBlockAck,
 };
 use iam_protocol::{
     decode_frame, encode_frame, encode_protocol_error, validate_id128, DecodedBody, DecodedFrame,
@@ -513,6 +513,33 @@ impl TidbService {
                     });
                 self.membership_reply(cid, &decoded, MsgType::FriendRemoveAck, result)
             }
+            DecodedBody::UserBlock(req) => {
+                let Some(peer) = req.peer_user_id else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = match (req.request_id.as_deref(), req.blocked) {
+                    (None, None) => self.database.user_block_status(identity, peer).await,
+                    (Some(bytes), Some(blocked)) => {
+                        let Ok(id) = validate_id128(bytes) else {
+                            return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                        };
+                        self.database
+                            .set_user_block(identity, peer, id, blocked, |write, target| {
+                                self.admit_membership(cid, write, target)
+                            })
+                            .await
+                    }
+                    _ => return wire_error(cid, &decoded, ErrorCode::InvalidArgument),
+                };
+                self.membership_reply(
+                    cid,
+                    &decoded,
+                    MsgType::UserBlockAck,
+                    result.map(|blocked| UserBlockAck {
+                        blocked: Some(blocked),
+                    }),
+                )
+            }
             _ => wire_error(cid, &decoded, ErrorCode::UnsupportedCommand),
         }
     }
@@ -548,9 +575,9 @@ impl TidbService {
             Err(Error::InvalidRequest(_)) => wire_error(cid, frame, ErrorCode::InvalidArgument),
             Err(Error::FriendNotFound) => wire_error(cid, frame, ErrorCode::NotFound),
             Err(Error::FriendChanged) => wire_error(cid, frame, ErrorCode::ContextChanged),
-            Err(Error::FriendKeyConflict | Error::GroupKeyConflict) => {
-                wire_error(cid, frame, ErrorCode::IdempotencyConflict)
-            }
+            Err(
+                Error::FriendKeyConflict | Error::GroupKeyConflict | Error::UserBlockKeyConflict,
+            ) => wire_error(cid, frame, ErrorCode::IdempotencyConflict),
             Err(Error::FriendInProgress) => wire_error(cid, frame, ErrorCode::InProgress),
             Err(Error::PermissionDenied) => wire_error(cid, frame, ErrorCode::PermissionDenied),
             Err(Error::Unauthenticated) => protocol_error(

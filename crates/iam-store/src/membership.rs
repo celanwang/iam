@@ -1,5 +1,6 @@
 use super::friend_removal::backfill_friend_generations;
 use super::friends::migrate_friend_attempts;
+use super::user_blocks::pair_is_blocked;
 use super::*;
 
 impl TidbStore {
@@ -22,6 +23,8 @@ impl TidbStore {
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS group_creations ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_removals ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS direct_send_blocks ")
+                || statement.starts_with("CREATE TABLE IF NOT EXISTS user_blocks ")
+                || statement.starts_with("CREATE TABLE IF NOT EXISTS user_block_changes ")
             {
                 sqlx::query(statement).execute(&pool).await?;
             }
@@ -42,7 +45,8 @@ impl TidbStore {
         check_schema(&pool, false).await?;
         let mut tx = pool.begin().await?;
         lock_authority(&mut tx, id).await?;
-        match schema_version(&mut tx).await? {
+        let version = schema_version(&mut tx).await?;
+        match version {
             STORAGE_SCHEMA_VERSION => return finish(tx, Ok(())).await,
             0 => {
                 backfill_account_events(&mut tx).await?;
@@ -50,10 +54,12 @@ impl TidbStore {
                 migrate_friend_attempts(&mut tx).await?;
             }
             1 => migrate_friend_attempts(&mut tx).await?,
-            2 | 3 => {}
+            2..=4 => {}
             _ => return Err(Error::Configuration("unrecognized storage schema version")),
         }
-        backfill_friend_generations(&mut tx).await?;
+        if version < 4 {
+            backfill_friend_generations(&mut tx).await?;
+        }
         mark_schema_ready(&mut tx).await?;
         finish(tx, Ok(())).await
     }
@@ -90,6 +96,9 @@ impl TidbStore {
         )
         .await?;
         insert_direct_pair(&mut tx, tenant, pair, conversation, None).await?;
+        if pair_is_blocked(&mut tx, tenant, pair).await? {
+            pause_direct_sends(&mut tx, tenant, pair).await?;
+        }
         finish(tx, Ok(())).await
     }
 
@@ -174,6 +183,49 @@ pub(super) async fn lock_authority(tx: &mut Transaction<'_, MySql>, id: Id128) -
 
 pub(super) fn ordered_pair(a: u64, b: u64) -> [u64; 2] {
     [a.min(b), a.max(b)]
+}
+
+pub(super) async fn pause_direct_sends(
+    db: &mut MySqlConnection,
+    tenant: u64,
+    [low, high]: [u64; 2],
+) -> Result<()> {
+    // Account events retain original participants even after independent access revocation.
+    // This also finds non-canonical Directs from older stores.
+    sqlx::query(
+        "INSERT INTO direct_send_blocks (tenant_id, conversation_id, user_low, user_high)
+         SELECT DISTINCT a.tenant_id, a.conversation_id, ?, ?
+         FROM account_events a
+         JOIN conversations c ON c.tenant_id = a.tenant_id AND c.conversation_id = a.conversation_id
+         WHERE a.tenant_id = ? AND a.user_id = ? AND c.kind = 1
+           AND EXISTS (SELECT 1 FROM account_events b WHERE b.tenant_id = a.tenant_id
+                       AND b.user_id = ? AND b.conversation_id = a.conversation_id)
+         ON DUPLICATE KEY UPDATE conversation_id = VALUES(conversation_id)",
+    )
+    .bind(low)
+    .bind(high)
+    .bind(tenant)
+    .bind(low)
+    .bind(high)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn resume_direct_sends(
+    db: &mut MySqlConnection,
+    tenant: u64,
+    [low, high]: [u64; 2],
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM direct_send_blocks WHERE tenant_id = ? AND user_low = ? AND user_high = ?",
+    )
+    .bind(tenant)
+    .bind(low)
+    .bind(high)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

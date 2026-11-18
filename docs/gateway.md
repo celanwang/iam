@@ -30,6 +30,8 @@ cargo run -p iam-gateway
 
 应用用 `Client::friend_status` 取得当前好友代次，再调用 `Client::remove_friend` 解除。重试使用首次解除时保存的代次。现有会话和可访问历史仍保留在账号同步中。
 
+应用通过 `Client::user_block_status` 查询当前账号对指定对端的拉黑状态。调用 `Client::set_user_block` 进行变更前保存 UUIDv7，重试复用该 ID 和原状态值。
+
 应用用 `Client::create_group` 提交预先保存的 UUIDv7 和其他初始成员的用户 ID。调用同样经新连接认证。所有初始成员的 `Client::run` 通过账号同步发现群，`Client::list_conversations` 返回持久化的 `Group` 类型。
 
 在 Unix 上，更新证书链、私钥和设备凭证文件后，向实际运行的 `iam-gateway` 进程发送 `SIGHUP`。网关校验整批配置，成功后新握手使用新证书。凭证删除、轮换或修改到期时间会关闭对应设备的连接并作废旧恢复票据。凭证相同的设备继续使用当前连接。空凭证文件撤销所有设备。文件读取、解析或证书与私钥配对失败时，网关记下错误并继续使用上一次配置。
