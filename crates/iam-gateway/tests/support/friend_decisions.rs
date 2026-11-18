@@ -215,37 +215,12 @@ async fn tidb_tls_decisions_concurrent_accept_and_reject_return_one_durable_outc
     };
     let yes = decide(true);
     let no = decide(false);
-    let mut blocker = db.acquire().await.unwrap();
-    sqlx::query("SET SESSION tidb_txn_mode = 'pessimistic'")
-        .execute(&mut *blocker)
-        .await
-        .unwrap();
-    let mut lock = blocker.begin().await.unwrap();
-    sqlx::query("SELECT singleton FROM store_control WHERE singleton = 1 FOR UPDATE")
-        .fetch_one(&mut *lock)
-        .await
-        .unwrap();
-    let release = async {
-        // Verify overlap at TiDB before allowing either decision to commit.
-        timeout(WAIT, async {
-            loop {
-                let waiting: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM information_schema.processlist
-                     WHERE DB = DATABASE() AND ID <> CONNECTION_ID() AND INFO LIKE 'SELECT store_id, token_key,%'",
-                ).fetch_one(&db).await.unwrap();
-                if waiting == 2 {
-                    break;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        }).await.expect("both decisions must reach the authority lock");
-        lock.rollback().await.unwrap();
-    };
-    let (yes, no, ()) = tokio::join!(
+    let (yes, no) = competing_requests(
+        &db,
         request(&mut phone, 2, MsgType::FriendDecide, &yes),
         request(&mut desktop, 2, MsgType::FriendDecide, &no),
-        release,
-    );
+    )
+    .await;
     let (DecodedBody::FriendDecideAck(yes), DecodedBody::FriendDecideAck(no)) = (yes, no) else {
         panic!("both calls must return the durable terminal result");
     };

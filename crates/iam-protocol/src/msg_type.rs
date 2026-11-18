@@ -32,6 +32,8 @@ pub enum MsgType {
     FriendInboxAck = 29,
     FriendDecide = 30,
     FriendDecideAck = 31,
+    GroupCreate = 32,
+    GroupCreateAck = 33,
 }
 
 impl MsgType {
@@ -68,6 +70,8 @@ impl MsgType {
             29 => Self::FriendInboxAck,
             30 => Self::FriendDecide,
             31 => Self::FriendDecideAck,
+            32 => Self::GroupCreate,
+            33 => Self::GroupCreateAck,
             _ => return None,
         })
     }
@@ -101,6 +105,7 @@ impl MsgType {
                 | Self::FriendApply
                 | Self::FriendInbox
                 | Self::FriendDecide
+                | Self::GroupCreate
         )
     }
 }

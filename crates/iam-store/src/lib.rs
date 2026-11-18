@@ -35,8 +35,10 @@ pub enum Error {
     FriendKeyConflict,
     #[error("another request was pending when this friend request ID was used")]
     FriendInProgress,
-    #[error("friend mutations are paused")]
-    FriendUnavailable,
+    #[error("membership mutations are paused")]
+    MembershipUnavailable,
+    #[error("the group creation ID is bound to a different member set")]
+    GroupKeyConflict,
     #[error("invalid request: {0}")]
     InvalidRequest(&'static str),
     #[error("conversation sequence exhausted")]

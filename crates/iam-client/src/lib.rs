@@ -1,6 +1,7 @@
 //! A durable, single-device text client. The caller supplies transport and credentials.
 
 mod friends;
+mod groups;
 mod history;
 mod storage;
 mod sync;

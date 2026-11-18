@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     conversation_id BIGINT UNSIGNED NOT NULL,
     history_id BINARY(16) NOT NULL,
     next_sequence BIGINT UNSIGNED NOT NULL,
+    kind TINYINT UNSIGNED NOT NULL DEFAULT 1,
     PRIMARY KEY (tenant_id, conversation_id)
 );
 
@@ -102,4 +103,14 @@ CREATE TABLE IF NOT EXISTS friend_attempts (
     UNIQUE KEY pending_attempt (tenant_id, to_user_id, pending_slot, from_user_id),
     UNIQUE KEY legacy_attempt (tenant_id, to_user_id, from_user_id, legacy_slot),
     KEY legacy_inbox (tenant_id, to_user_id, legacy_slot, pending_slot, from_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS group_creations (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    creator_id BIGINT UNSIGNED NOT NULL,
+    request_id BINARY(16) NOT NULL,
+    member_set VARBINARY(248) NOT NULL,
+    conversation_id BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (tenant_id, creator_id, request_id),
+    UNIQUE KEY created_group (tenant_id, conversation_id)
 );

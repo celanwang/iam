@@ -1,5 +1,6 @@
 use super::membership::{
-    create_direct_in, direct_pair, insert_direct_pair, lock_authority, ordered_pair,
+    allocate_conversation, create_conversation_in, direct_pair, insert_direct_pair, lock_authority,
+    ordered_pair,
 };
 use super::*;
 use iam_protocol::{
@@ -7,7 +8,6 @@ use iam_protocol::{
     MAX_FRIEND_REQUESTS,
 };
 
-pub(super) const FRIEND_SCHEMA_VERSION: u8 = 2;
 const PENDING: u8 = 1;
 const ACCEPTED: u8 = 2;
 const REJECTED: u8 = 3;
@@ -360,7 +360,15 @@ async fn establish_direct(
     } else {
         let conversation = allocate_conversation(tx, key.tenant).await?;
         admit(true)?;
-        create_direct_in(tx, key.tenant, conversation, generate_id128(), pair).await?;
+        create_conversation_in(
+            tx,
+            key.tenant,
+            conversation,
+            generate_id128(),
+            ConversationKind::Direct,
+            &pair,
+        )
+        .await?;
         insert_direct_pair(tx, key.tenant, pair, conversation, true).await?;
         Ok(conversation)
     }
@@ -399,27 +407,4 @@ pub(super) async fn migrate_friend_attempts(tx: &mut Transaction<'_, MySql>) -> 
     .execute(&mut **tx)
     .await?;
     Ok(())
-}
-
-async fn allocate_conversation(db: &mut MySqlConnection, tenant: u64) -> Result<u64> {
-    // The caller holds the authority lock shared with trusted conversation creation.
-    loop {
-        let mut bytes = [0u8; 8];
-        getrandom::fill(&mut bytes)
-            .map_err(|_| Error::Configuration("cannot generate conversation ID"))?;
-        let id = u64::from_be_bytes(bytes);
-        if id == 0 {
-            continue;
-        }
-        let used: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM conversations WHERE tenant_id = ? AND conversation_id = ? FOR UPDATE",
-        )
-        .bind(tenant)
-        .bind(id)
-        .fetch_optional(&mut *db)
-        .await?;
-        if used.is_none() {
-            return Ok(id);
-        }
-    }
 }

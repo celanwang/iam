@@ -63,6 +63,7 @@ async fn tidb_single_schema_supports_unsigned_ids_and_ordered_pages() {
             "direct_pairs",
             "friend_attempts",
             "friend_requests",
+            "group_creations",
             "members",
             "messages",
             "rejections",

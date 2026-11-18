@@ -27,3 +27,7 @@ pub mod pb {
 }
 /// Maximum number of pending applicants returned by one FRIEND_LIST request.
 pub const MAX_FRIEND_REQUESTS: usize = 100;
+/// Maximum number of distinct initial members of a small group, including its creator.
+pub const MAX_GROUP_MEMBERS: usize = 32;
+/// Maximum number of raw member IDs in a GROUP_CREATE request.
+pub const MAX_GROUP_MEMBER_IDS: usize = 64;
