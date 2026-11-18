@@ -223,7 +223,9 @@ fn visit(
                         }
                     } else if response && f.r#type() == Type::Bytes {
                         let field_name = f.name.as_deref().unwrap();
-                        if field_name.ends_with("_id") || field_name == "epoch" {
+                        if field_name.ends_with("_id")
+                            || matches!(field_name, "epoch" | "generation")
+                        {
                             crate::validate_id128(value)?;
                         } else if value.is_empty() || len > 4096 {
                             return Err(E::InvalidArgument("token length"));

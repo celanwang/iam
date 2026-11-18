@@ -1,3 +1,4 @@
+use super::friend_removal::restart_friendship;
 use super::membership::{
     allocate_conversation, create_conversation_in, direct_pair, insert_direct_pair, lock_authority,
     ordered_pair,
@@ -78,14 +79,18 @@ impl TidbStore {
         }
 
         let pair = ordered_pair(direction.sender, direction.recipient);
-        let established = direct_pair(&mut tx, direction.tenant, pair)
-            .await?
-            .and_then(|(conversation, friends)| friends.then_some(conversation));
+        let existing = direct_pair(&mut *tx, direction.tenant, pair).await?;
+        let established = existing
+            .filter(|pair| pair.friends)
+            .map(|pair| pair.conversation_id);
         let legacy = request_id.is_none();
         if legacy {
             if let Some(existing) = established {
                 admit(false)?;
                 return finish(tx, Ok(FriendAttempt::Accepted(existing))).await;
+            }
+            if existing.is_some_and(|pair| pair.generation.is_some()) {
+                return Err(Error::FriendChanged);
             }
             // A peer-only key gets a single lifetime slot. It cannot open a later round.
             let history: Option<i32> = sqlx::query_scalar(
@@ -264,7 +269,7 @@ impl TidbStore {
     }
 }
 
-fn validate_peer(owner: Identity, peer: u64) -> Result<()> {
+pub(super) fn validate_peer(owner: Identity, peer: u64) -> Result<()> {
     if peer == 0 || peer == owner.user_id {
         return Err(Error::InvalidRequest("invalid friend account ID"));
     }
@@ -337,14 +342,19 @@ async fn establish_direct(
     admit: impl FnOnce(bool) -> Result<()>,
 ) -> Result<u64> {
     let pair = ordered_pair(key.sender, key.recipient);
-    if let Some((conversation, friends)) = direct_pair(tx, key.tenant, pair).await? {
-        if !friends {
+    if let Some(existing) = direct_pair(&mut **tx, key.tenant, pair).await? {
+        if existing.friends {
+            admit(true)?;
+            return Ok(existing.conversation_id);
+        }
+        let reopening = existing.generation.is_some();
+        if !reopening {
             let active: Vec<u64> = sqlx::query_scalar(
                 "SELECT user_id FROM members WHERE tenant_id = ? AND conversation_id = ?
                  ORDER BY user_id FOR UPDATE",
             )
             .bind(key.tenant)
-            .bind(conversation)
+            .bind(existing.conversation_id)
             .fetch_all(&mut **tx)
             .await?;
             if active != pair {
@@ -352,11 +362,14 @@ async fn establish_direct(
             }
         }
         admit(true)?;
-        if !friends {
-            sqlx::query("UPDATE direct_pairs SET friends = TRUE WHERE tenant_id = ? AND user_low = ? AND user_high = ?")
-                .bind(key.tenant).bind(pair[0]).bind(pair[1]).execute(&mut **tx).await?;
-        }
-        Ok(conversation)
+        let generation = if reopening {
+            restart_friendship(tx, key.tenant, pair).await?
+        } else {
+            generate_id128()
+        };
+        sqlx::query("UPDATE direct_pairs SET friends = TRUE, generation = ? WHERE tenant_id = ? AND user_low = ? AND user_high = ?")
+            .bind(generation.as_slice()).bind(key.tenant).bind(pair[0]).bind(pair[1]).execute(&mut **tx).await?;
+        Ok(existing.conversation_id)
     } else {
         let conversation = allocate_conversation(tx, key.tenant).await?;
         admit(true)?;
@@ -369,7 +382,7 @@ async fn establish_direct(
             &pair,
         )
         .await?;
-        insert_direct_pair(tx, key.tenant, pair, conversation, true).await?;
+        insert_direct_pair(tx, key.tenant, pair, conversation, Some(generate_id128())).await?;
         Ok(conversation)
     }
 }

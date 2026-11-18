@@ -297,7 +297,7 @@ async fn tidb_tls_decisions_only_the_recipient_in_the_originating_tenant_can_dec
 
 // A stopped PR #18 store with existing friends (100, 200) and crossed pending requests (200, 300).
 // A frozen schema keeps this fixture independent of the current migration code.
-async fn old_friend_store(fixture: &Fixture, db: &MySqlPool) {
+pub(super) async fn old_friend_store(fixture: &Fixture, db: &MySqlPool) {
     for ddl in include_str!("friends-v1.sql")
         .split(';')
         .map(str::trim)

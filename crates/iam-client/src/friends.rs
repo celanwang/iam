@@ -1,13 +1,69 @@
 use crate::{wire::Wire, Client, Error, Options, Result, Transport};
 use iam_protocol::pb::{
-    friend_request_ack, FriendAcceptRequest, FriendApplyRequest, FriendAttemptAck,
-    FriendDecideRequest, FriendInboxAck, FriendInboxRequest, FriendListAck, FriendListRequest,
-    FriendRequest,
+    friend_request_ack, friend_status_ack, FriendAcceptRequest, FriendApplyRequest,
+    FriendAttemptAck, FriendDecideRequest, FriendInboxAck, FriendInboxRequest, FriendListAck,
+    FriendListRequest, FriendRelationship, FriendRemoveRequest, FriendRequest, FriendStatusRequest,
 };
 use iam_protocol::{validate_id128, DecodedBody, Id128, MsgType};
 use prost::Message;
 
 impl Client {
+    /// Returns the active friendship and its generation, if any.
+    pub async fn friend_status(
+        &self,
+        transport: &mut impl Transport,
+        access_token: &[u8],
+        peer_user_id: u64,
+    ) -> Result<Option<FriendRelationship>> {
+        let response = self
+            .friend_call(
+                transport,
+                access_token,
+                MsgType::FriendStatus,
+                &FriendStatusRequest {
+                    peer_user_id: Some(peer_user_id),
+                },
+            )
+            .await?;
+        let DecodedBody::FriendStatusAck(ack) = response else {
+            return Err(Error::Invalid("expected FRIEND_STATUS_ACK"));
+        };
+        match ack.value {
+            Some(friend_status_ack::Value::Relationship(relationship)) => Ok(Some(relationship)),
+            Some(friend_status_ack::Value::NotFriends(_)) => Ok(None),
+            None => Err(Error::Invalid("missing friend status")),
+        }
+    }
+
+    /// Removes the given friendship generation and returns its original conversation ID.
+    /// Reuse the same generation on retry, including after the relationship is restored.
+    pub async fn remove_friend(
+        &self,
+        transport: &mut impl Transport,
+        access_token: &[u8],
+        peer_user_id: u64,
+        generation: Id128,
+    ) -> Result<u64> {
+        validate_id128(&generation)?;
+        match self
+            .friend_call(
+                transport,
+                access_token,
+                MsgType::FriendRemove,
+                &FriendRemoveRequest {
+                    peer_user_id: Some(peer_user_id),
+                    generation: Some(generation.to_vec().into()),
+                },
+            )
+            .await?
+        {
+            DecodedBody::FriendRemoveAck(ack) => ack
+                .conversation_id
+                .ok_or(Error::Invalid("missing removed conversation ID")),
+            _ => Err(Error::Invalid("expected FRIEND_REMOVE_ACK")),
+        }
+    }
+
     /// Applies with a caller-owned UUIDv7. Persist this ID before sending and reuse it on retry.
     /// An intentional reapplication after rejection uses a fresh ID.
     pub async fn apply_friend(

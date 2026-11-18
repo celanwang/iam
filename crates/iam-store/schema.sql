@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS direct_pairs (
     user_high BIGINT UNSIGNED NOT NULL,
     conversation_id BIGINT UNSIGNED NOT NULL,
     friends BOOLEAN NOT NULL,
+    generation BINARY(16) NULL,
     PRIMARY KEY (tenant_id, user_low, user_high),
     UNIQUE KEY direct_conversation (tenant_id, conversation_id)
 );
@@ -123,4 +124,22 @@ CREATE TABLE IF NOT EXISTS group_creations (
     conversation_id BIGINT UNSIGNED NOT NULL,
     PRIMARY KEY (tenant_id, creator_id, request_id),
     UNIQUE KEY created_group (tenant_id, conversation_id)
+);
+
+CREATE TABLE IF NOT EXISTS friend_removals (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    user_low BIGINT UNSIGNED NOT NULL,
+    user_high BIGINT UNSIGNED NOT NULL,
+    generation BINARY(16) NOT NULL,
+    conversation_id BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (tenant_id, user_low, user_high, generation)
+);
+
+CREATE TABLE IF NOT EXISTS direct_send_blocks (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    conversation_id BIGINT UNSIGNED NOT NULL,
+    user_low BIGINT UNSIGNED NOT NULL,
+    user_high BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (tenant_id, conversation_id),
+    KEY blocked_pair (tenant_id, user_low, user_high)
 );

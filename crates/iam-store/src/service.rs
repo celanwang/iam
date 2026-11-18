@@ -3,10 +3,11 @@ use crate::store::{unresolved, Decision, FriendAttempt, Scope, SendKey, TidbStor
 use crate::{ConversationInfo, Error, Identity, Result, TextPage};
 use iam_core::{CoreError, DeviceCredential, Engine, EngineOutput, EngineReply, StorageRequest};
 use iam_protocol::pb::{
-    change, friend_attempt_ack, friend_request_ack, message_content, send_outcome, Change, Empty,
-    ErrorCode, FriendAcceptAck, FriendAttemptAck, FriendRequestAck, GroupCreateAck,
-    HistoryResponse, MessageContent, MessageKey, RetryAction, SendOutcome, SendResponse,
-    SendStatusResponse, SnapshotResponse, SyncResponse,
+    change, friend_attempt_ack, friend_request_ack, friend_status_ack, message_content,
+    send_outcome, Change, Empty, ErrorCode, FriendAcceptAck, FriendAttemptAck, FriendRelationship,
+    FriendRemoveAck, FriendRequestAck, FriendStatusAck, GroupCreateAck, HistoryResponse,
+    MessageContent, MessageKey, RetryAction, SendOutcome, SendResponse, SendStatusResponse,
+    SnapshotResponse, SyncResponse,
 };
 use iam_protocol::{
     decode_frame, encode_frame, encode_protocol_error, validate_id128, DecodedBody, DecodedFrame,
@@ -470,6 +471,46 @@ impl TidbService {
                         conversation_id: Some(conversation_id),
                     });
                 self.membership_reply(cid, &decoded, MsgType::GroupCreateAck, result)
+            }
+            DecodedBody::FriendStatus(req) => {
+                let Some(peer) = req.peer_user_id else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self
+                    .database
+                    .friend_status(identity, peer)
+                    .await
+                    .map(|state| {
+                        let value = match state {
+                            Some((generation, conversation_id)) => {
+                                friend_status_ack::Value::Relationship(FriendRelationship {
+                                    generation: Some(generation.to_vec().into()),
+                                    conversation_id: Some(conversation_id),
+                                })
+                            }
+                            None => friend_status_ack::Value::NotFriends(Empty {}),
+                        };
+                        FriendStatusAck { value: Some(value) }
+                    });
+                self.membership_reply(cid, &decoded, MsgType::FriendStatusAck, result)
+            }
+            DecodedBody::FriendRemove(req) => {
+                let Some((peer, generation)) = req
+                    .peer_user_id
+                    .zip(request_id128(req.generation.as_deref()))
+                else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self
+                    .database
+                    .remove_friend(identity, peer, generation, |write| {
+                        self.admit_membership(cid, write, None)
+                    })
+                    .await
+                    .map(|conversation_id| FriendRemoveAck {
+                        conversation_id: Some(conversation_id),
+                    });
+                self.membership_reply(cid, &decoded, MsgType::FriendRemoveAck, result)
             }
             _ => wire_error(cid, &decoded, ErrorCode::UnsupportedCommand),
         }
