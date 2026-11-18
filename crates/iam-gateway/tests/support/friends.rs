@@ -7,6 +7,8 @@ mod groups;
 #[path = "friend_removal.rs"]
 mod removal;
 
+mod local_release;
+
 use super::*;
 use iam_protocol::pb::{
     friend_request_ack, sync_response, sync_target, FriendAcceptRequest, FriendListRequest,
