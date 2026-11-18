@@ -2,7 +2,8 @@ use crate::error::{ProtocolErrorKind, Result};
 use crate::frame::{FixedHeader, Frame, HEADER_LEN};
 use crate::msg_type::MsgType;
 use crate::pb::{
-    AuthRequest, AuthResponse, FriendAcceptAck, FriendAcceptRequest, FriendListAck,
+    AuthRequest, AuthResponse, FriendAcceptAck, FriendAcceptRequest, FriendApplyRequest,
+    FriendAttemptAck, FriendDecideRequest, FriendInboxAck, FriendInboxRequest, FriendListAck,
     FriendListRequest, FriendRequest, FriendRequestAck, Head, HeartbeatAck, HeartbeatRequest,
     HistoryRequest, HistoryResponse, ProtocolError, Push, PushAck, ReconnectRequest,
     ReconnectResponse, SendRequest, SendResponse, SendStatusRequest, SendStatusResponse,
@@ -38,6 +39,12 @@ pub enum DecodedBody {
     FriendListAck(FriendListAck),
     FriendAccept(FriendAcceptRequest),
     FriendAcceptAck(FriendAcceptAck),
+    FriendApply(FriendApplyRequest),
+    FriendApplyAck(FriendAttemptAck),
+    FriendInbox(FriendInboxRequest),
+    FriendInboxAck(FriendInboxAck),
+    FriendDecide(FriendDecideRequest),
+    FriendDecideAck(FriendAttemptAck),
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +177,12 @@ fn decode_body_counted(msg_type: MsgType, body: &[u8], fields: &mut usize) -> Re
         MsgType::FriendListAck => DecodedBody::FriendListAck(decode_pb(body, fields)?),
         MsgType::FriendAccept => DecodedBody::FriendAccept(decode_pb(body, fields)?),
         MsgType::FriendAcceptAck => DecodedBody::FriendAcceptAck(decode_pb(body, fields)?),
+        MsgType::FriendApply => DecodedBody::FriendApply(decode_pb(body, fields)?),
+        MsgType::FriendApplyAck => DecodedBody::FriendApplyAck(decode_pb(body, fields)?),
+        MsgType::FriendInbox => DecodedBody::FriendInbox(decode_pb(body, fields)?),
+        MsgType::FriendInboxAck => DecodedBody::FriendInboxAck(decode_pb(body, fields)?),
+        MsgType::FriendDecide => DecodedBody::FriendDecide(decode_pb(body, fields)?),
+        MsgType::FriendDecideAck => DecodedBody::FriendDecideAck(decode_pb(body, fields)?),
     };
     crate::validate::validate_response(&decoded)?;
     Ok(decoded)

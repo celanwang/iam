@@ -75,7 +75,7 @@ Head {
 
 需要应答的请求必须显式携带非 0 的 `req_id`，按实际写入连接的顺序严格递增，发送队列在确定写入顺序时分配请求号。响应可以乱序返回，但必须回显原请求号；重试使用新请求号，逻辑消息身份不变。`PUSH`、`PUSH_ACK` 和无法关联请求的连接错误使用 0，不更新请求号水位；只有这些场景允许 `head_len = 0`。
 
-`Body` 根据 `msg_type` 解码为唯一指定结构。`HEARTBEAT` 的 `body_len` 必须为 0。没有待接受申请时，`FRIEND_LIST_ACK` 也使用空消息体。其他命令必须满足字段校验。线格式错误与业务错误分别按后文错误路由处理，不能仅凭解码成功就进入业务流程。
+`Body` 根据 `msg_type` 解码为唯一指定结构。`HEARTBEAT` 的 `body_len` 必须为 0。没有待接受申请时，`FRIEND_LIST_ACK` 和 `FRIEND_INBOX_ACK` 也使用空消息体。其他命令必须满足字段校验。线格式错误与业务错误分别按后文错误路由处理，不能仅凭解码成功就进入业务流程。
 
 固定头的 `version` 用于校验帧与命令的兼容性，认证体不重复携带该信息。遇到不支持的版本或标志位时停止解码；可安全响应时返回协议错误，然后关闭连接。压缩扩展需要明确算法、压缩范围和解压后上限。
 
@@ -97,6 +97,9 @@ Head {
 20 FRIEND_REQUEST FriendRequest     -> 21 FRIEND_REQUEST_ACK FriendRequestAck
 22 FRIEND_LIST    FriendListRequest  -> 23 FRIEND_LIST_ACK    FriendListAck
 24 FRIEND_ACCEPT  FriendAcceptRequest -> 25 FRIEND_ACCEPT_ACK FriendAcceptAck
+26 FRIEND_APPLY   FriendApplyRequest  -> 27 FRIEND_APPLY_ACK  FriendAttemptAck
+28 FRIEND_INBOX   FriendInboxRequest  -> 29 FRIEND_INBOX_ACK  FriendInboxAck
+30 FRIEND_DECIDE  FriendDecideRequest -> 31 FRIEND_DECIDE_ACK FriendAttemptAck
 ```
 
 `PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
@@ -636,13 +639,25 @@ HistoryResponse = oneof {
 
 ## 好友申请与单聊
 
+### 带申请 ID 的命令
+
+- `FRIEND_APPLY` 按 `target_user_id` 申请。调用方生成并在发送前持久化 `request_id`（UUIDv7）。同租户同发件人重试使用同一 ID 和同一目标，换目标会得到 `IDEMPOTENCY_CONFLICT / NONE`。首次使用 ID 时，服务端验证同租户的目标账号。
+- `FRIEND_INBOX` 返回当前账号的待接受申请，每条含 `from_user_id` 和 `request_id`。首轮以 `after_user_id = 0` 开始。每页按申请人 ID 升序返回最多 100 条，同一方向至多有一条待接受申请。若有下一页，使用 `next_after_user_id` 作为排他下界。各页反映查询时的状态。
+- `FRIEND_DECIDE` 通过 `from_user_id` 和 `request_id` 操作自己收到的具体申请。`accept` 必须显式传值，`true` 接受，`false` 拒绝。申请一旦终结，后续提交任一决定都返回原终态。
+
+`FRIEND_APPLY_ACK` 与 `FRIEND_DECIDE_ACK` 使用同一个 `FriendAttemptAck`。结果为 `pending`、已接受的 `conversation_id` 或 `rejected`。决定只返回终态。同一方向已有待接受申请时，抢先使用另一 ID 会得到 `IN_PROGRESS / NONE`。该 ID 的结果会被保存，之后重放仍会返回相同错误。首次申请被拒绝后，发件人明确发起下一次申请时使用新的 UUIDv7。已建立好友关系时，使用新的 ID 申请会记录已有会话作为该 ID 的终态。
+
+接受和拒绝并发时，先提交的决定成为该申请终态。两人有交叉申请时，任一接受提交会让该对账号当时仍待定的申请共享已接受结果。此前已拒绝的申请继续返回拒绝。业务操作成功提交后才返回成功，结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`。新请求号用于帧关联，操作重试复用原申请 ID。首次接受复用已有的单聊，或原子建立单聊、授予两人访问权并写入双方的账号事件，随后由账号 `SYNC` 发现会话。预置单聊任一方已被可信应用撤权时，首次接受返回 `PERMISSION_DENIED`，申请保持待接受。
+
+目标或申请人 ID 缺失、为 0 或等于当前用户，或申请 UUIDv7 格式不合法时，返回 `INVALID_ARGUMENT`。首次申请未知目标、决定者没有对应的入站申请时，返回 `NOT_FOUND`。解除好友和拉黑属于后续流程。
+
+### 旧版按人命令
+
 - `FRIEND_REQUEST` 按 `target_user_id` 申请。服务端从认证会话取得租户、申请人身份，并在该租户账号目录里验证首次申请的目标。应答的 `pending` 表示已保存的待接受申请，`conversation_id` 表示已建立的好友单聊。
 - `FRIEND_LIST` 查询当前账号收到的待接受申请。首次将 `after_user_id` 显式设为 0。每页按申请人 ID 升序返回最多 100 条 `from_user_ids`，使用 Protobuf 非 packed 编码。有更多结果时，`next_after_user_id` 等于本页最后一个 ID，下一页以其为排他下界。各页反映查询时的状态，刷新列表从 0 开始。
 - `FRIEND_ACCEPT` 按 `from_user_id` 接受自己的入站申请。发送方和收件人身份均在认证租户范围内解析。交叉申请分别保存，在任一方明确接受后两条申请都退出待接受列表，任一合法方向后续重放返回同一个 `conversation_id`。
 
-首次成功接受使用已有的单聊，或原子建立单聊、授予两人访问权并写入各自的账号事件。双方用现有账号 `SYNC` 发现会话，随后按原规则 `SEND` 或同步会话。接受操作保留可信应用设置的撤权。预置单聊任一方已被撤权时，首次接受返回 `PERMISSION_DENIED`，申请保持待接受。
-
-目标或申请人 ID 缺失、为 0 或等于当前用户时，返回 `INVALID_ARGUMENT`。目标不是同租户的已知账号，或调用方没有该申请人的入站申请时，返回 `NOT_FOUND`。列表的 `after_user_id` 缺失时返回 `INVALID_ARGUMENT`。好友提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`。使用新的连接请求号和同一对端 ID 重试，从持久状态读取结果；申请重试在好友已建立时返回原单聊 ID。本轮每对账号只有一次申请周期，拒绝、解除或再次申请未开放。
+旧命令只绑定该有向账号对的首条兼容申请。新版收件人可在 `FRIEND_INBOX` 看到这条申请的 UUID。兼容申请已拒绝时，旧的申请和接受重放返回 `CONTEXT_CHANGED / NONE`。旧列表只显示仍待处理的兼容申请，旧按人接受在没有对应兼容申请时返回 `NOT_FOUND`。发起后续申请须使用带 ID 的命令。
 
 ## 错误路由与连接处理
 

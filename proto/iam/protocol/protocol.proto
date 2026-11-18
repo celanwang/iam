@@ -356,6 +356,39 @@ message FriendAcceptAck {
   optional uint64 conversation_id = 1;
 }
 
+message FriendApplyRequest {
+  optional uint64 target_user_id = 1;
+  optional bytes request_id = 2;
+}
+
+message FriendInboxRequest {
+  optional uint64 after_user_id = 1;
+}
+
+message FriendApplicant {
+  optional uint64 from_user_id = 1;
+  optional bytes request_id = 2;
+}
+
+message FriendInboxAck {
+  repeated FriendApplicant requests = 1;
+  optional uint64 next_after_user_id = 2;
+}
+
+message FriendDecideRequest {
+  optional uint64 from_user_id = 1;
+  optional bytes request_id = 2;
+  optional bool accept = 3;
+}
+
+message FriendAttemptAck {
+  oneof value {
+    Empty pending = 1;
+    uint64 conversation_id = 2;
+    Empty rejected = 3;
+  }
+}
+
 message ProtocolError {
   optional uint32 ref_msg_type = 1;
   optional ErrorInfo error = 2;

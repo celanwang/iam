@@ -223,7 +223,10 @@ impl Engine {
             DecodedBody::History(req) => self.handle_history(connection_id, req, frame),
             DecodedBody::FriendRequest(_)
             | DecodedBody::FriendList(_)
-            | DecodedBody::FriendAccept(_) => {
+            | DecodedBody::FriendAccept(_)
+            | DecodedBody::FriendApply(_)
+            | DecodedBody::FriendInbox(_)
+            | DecodedBody::FriendDecide(_) => {
                 match self.prepare_storage_request(connection_id, frame)? {
                     StorageRequest::Ready(cid) => self.wire_error(
                         frame,
