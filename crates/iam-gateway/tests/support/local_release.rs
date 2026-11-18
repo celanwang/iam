@@ -353,6 +353,34 @@ async fn tidb_tls_local_release_recovers_after_gateway_process_exit() {
         group,
     )
     .await;
+
+    let roster = bob.group_members(&mut bob_tls, BOB, group).await.unwrap();
+    assert_eq!(roster.owner_user_id, Some(alice_identity.user_id));
+    assert_eq!(roster.members.len(), 3);
+    bob.leave_group(&mut bob_tls, BOB, &group_state)
+        .await
+        .unwrap();
+    assert!(matches!(
+        bob.group_members(&mut bob_tls, BOB, group).await,
+        Err(iam_client::Error::Server(error)) if error.code() == ErrorCode::PermissionDenied
+    ));
+    let mut bob_wire = ObservedTls {
+        tls: config.transport(&address),
+        syncs: Vec::new(),
+    };
+    sync_through(&mut bob, &mut bob_wire, &mut bob_db, BOB, 0, 3).await;
+    assert!(bob.messages(group).await.unwrap().is_empty());
+    assert_eq!(
+        bob.list_conversations(0, 100)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| item.state.conversation_id.unwrap())
+            .collect::<Vec<_>>(),
+        [direct]
+    );
+    drop(bob_wire);
     resumed.kill().await.unwrap();
 }
 
