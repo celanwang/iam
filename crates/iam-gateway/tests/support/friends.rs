@@ -1,3 +1,6 @@
+#[path = "friend_decisions.rs"]
+mod decisions;
+
 use super::*;
 use iam_protocol::pb::{
     friend_request_ack, sync_response, sync_target, FriendAcceptRequest, FriendListRequest,
