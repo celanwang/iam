@@ -38,13 +38,21 @@ UUIDv7 可以由设备自行生成，重连后仍可用同一个 ID 指向原消
 
 ### 跨设备读取和提交阅读位置
 
-使用列表项的 `ConversationState` 调用 `Client::read_position`，查询当前账号在该会话的共享阅读位置。尚未保存时返回 `None`。应用确认用户已读到某条消息后，可以把该消息的 `create_seq` 传给 `Client::advance_read_position`。返回值是 TiDB 确认保存的位置，可能被另一台设备推进得更远。消息同步和缓存读取本身不会推进阅读位置。
-
-两个方法均使用调用方提供的传输和设备凭证建立新的认证连接。若同一设备正在运行 `Client::run`，先结束同步循环再调用，以免触发同设备会话接管。收到 `CONTEXT_CHANGED` 时先同步会话状态。收到结果暂不可用时可重试原位置。
+使用列表项的 `ConversationState` 查询当前账号在该会话的共享阅读位置。尚未保存时返回 `None`。应用确认用户已读到某条消息后，可以把该消息的 `create_seq` 传给 `advance_read_position`。返回值是 TiDB 确认保存的位置，可能被另一台设备推进得更远。消息同步和缓存读取本身不会推进阅读位置。收到 `CONTEXT_CHANGED` 时先同步会话状态。
 
 ### 查询会话未读数
 
-使用已同步的 `ConversationState` 调用 `Client::unread_count`，获取本人在一个单聊或小群的服务端未读数。计数只包含其他人发送且仍可见的消息，并以本人当前阅读位置为下界。计数反映服务端执行查询时的状态，本地会话预览可能尚未同步到这一进度。该方法采用与阅读位置方法相同的设备认证和范围校验。
+使用已同步的 `ConversationState` 调用 `unread_count`，获取本人在一个单聊或小群的服务端未读数。计数只包含其他人发送且仍可见的消息，并以本人当前阅读位置为下界。计数反映服务端执行查询时的状态，本地会话预览可能尚未同步到这一进度。该方法采用与阅读位置方法相同的设备认证和范围校验。
+
+### 在同步连接上操作读状态
+
+使用 `iam_client::command_channel(capacity)` 创建有界队列，把接收端交给 `Client::run_with_commands(transport, access_token, options, submissions, receiver)`。应用可把可克隆的 `CommandSender` 留在另一任务，使用从 `ClientView` 获取的 `ConversationState` 调用 `read_position`、`advance_read_position` 和 `unread_count`。命令和原有发送、同步及心跳共用该设备当前认证连接。
+
+未开始的命令按入队顺序等待认证、重连及正在执行的同步或发送任务。队列满时，调用等待空位。`Options::request_timeout` 从实际请求的交换开始计时，队列等待可能更长。取消尚未开始的调用会跳过该命令；请求一旦开始，客户端仍会收取匹配的响应，或在连接异常后重连并丢弃旧连接。
+
+业务拒绝返回给对应调用方。写阅读位置后若结果无法确认，返回 `Error::CommandOutcomeUnknown`，调用方可以用同一会话状态与单调位置显式重试。排队命令可等重连后继续运行，已开始的命令由调用方决定是否重试。收到 `SESSION_REPLACED` 时当前运行结束。
+
+`Submission` 通道关闭且耗尽后，本次运行结束并关闭命令队列。未开始的请求返回 `Error::CommandsClosed`，关闭所有命令发送端时消息同步仍可继续。仍可在同步循环之外使用 `Client` 上的三个同名方法；它们会为设备建立独立的新认证连接，同一设备应先结束正在运行的同步循环。
 
 ### 小群成员名单和撤权
 
