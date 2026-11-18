@@ -4,10 +4,10 @@ use crate::msg_type::MsgType;
 use crate::pb::{
     AuthRequest, AuthResponse, FriendAcceptAck, FriendAcceptRequest, FriendApplyRequest,
     FriendAttemptAck, FriendDecideRequest, FriendInboxAck, FriendInboxRequest, FriendListAck,
-    FriendListRequest, FriendRequest, FriendRequestAck, Head, HeartbeatAck, HeartbeatRequest,
-    HistoryRequest, HistoryResponse, ProtocolError, Push, PushAck, ReconnectRequest,
-    ReconnectResponse, SendRequest, SendResponse, SendStatusRequest, SendStatusResponse,
-    SnapshotRequest, SnapshotResponse, SyncRequest, SyncResponse,
+    FriendListRequest, FriendRequest, FriendRequestAck, GroupCreateAck, GroupCreateRequest, Head,
+    HeartbeatAck, HeartbeatRequest, HistoryRequest, HistoryResponse, ProtocolError, Push, PushAck,
+    ReconnectRequest, ReconnectResponse, SendRequest, SendResponse, SendStatusRequest,
+    SendStatusResponse, SnapshotRequest, SnapshotResponse, SyncRequest, SyncResponse,
 };
 use crate::validate::validate_head;
 use prost::Message;
@@ -45,6 +45,8 @@ pub enum DecodedBody {
     FriendInboxAck(FriendInboxAck),
     FriendDecide(FriendDecideRequest),
     FriendDecideAck(FriendAttemptAck),
+    GroupCreate(GroupCreateRequest),
+    GroupCreateAck(GroupCreateAck),
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +185,8 @@ fn decode_body_counted(msg_type: MsgType, body: &[u8], fields: &mut usize) -> Re
         MsgType::FriendInboxAck => DecodedBody::FriendInboxAck(decode_pb(body, fields)?),
         MsgType::FriendDecide => DecodedBody::FriendDecide(decode_pb(body, fields)?),
         MsgType::FriendDecideAck => DecodedBody::FriendDecideAck(decode_pb(body, fields)?),
+        MsgType::GroupCreate => DecodedBody::GroupCreate(decode_pb(body, fields)?),
+        MsgType::GroupCreateAck => DecodedBody::GroupCreateAck(decode_pb(body, fields)?),
     };
     crate::validate::validate_response(&decoded)?;
     Ok(decoded)

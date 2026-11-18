@@ -4,9 +4,9 @@ use crate::{ConversationInfo, Error, Identity, Result, TextPage};
 use iam_core::{CoreError, DeviceCredential, Engine, EngineOutput, EngineReply, StorageRequest};
 use iam_protocol::pb::{
     change, friend_attempt_ack, friend_request_ack, message_content, send_outcome, Change, Empty,
-    ErrorCode, FriendAcceptAck, FriendAttemptAck, FriendRequestAck, HistoryResponse,
-    MessageContent, MessageKey, RetryAction, SendOutcome, SendResponse, SendStatusResponse,
-    SnapshotResponse, SyncResponse,
+    ErrorCode, FriendAcceptAck, FriendAttemptAck, FriendRequestAck, GroupCreateAck,
+    HistoryResponse, MessageContent, MessageKey, RetryAction, SendOutcome, SendResponse,
+    SendStatusResponse, SnapshotResponse, SyncResponse,
 };
 use iam_protocol::{
     decode_frame, encode_frame, encode_protocol_error, validate_id128, DecodedBody, DecodedFrame,
@@ -58,7 +58,7 @@ impl TidbService {
             .await
     }
 
-    /// Trusted application operation for the original participants of a direct conversation.
+    /// Trusted application operation for the original participants of a conversation.
     pub async fn set_member_access(
         &self,
         tenant: u64,
@@ -377,7 +377,7 @@ impl TidbService {
                 let result = self
                     .database
                     .request_friend(identity, target, |write| {
-                        self.admit_friend(cid, write, Some(target))
+                        self.admit_membership(cid, write, Some(target))
                     })
                     .await
                     .map(|conversation| FriendRequestAck {
@@ -386,14 +386,14 @@ impl TidbService {
                             friend_request_ack::Value::ConversationId,
                         )),
                     });
-                self.friend_reply(cid, &decoded, MsgType::FriendRequestAck, result)
+                self.membership_reply(cid, &decoded, MsgType::FriendRequestAck, result)
             }
             DecodedBody::FriendList(req) => {
                 let Some(after) = req.after_user_id else {
                     return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
                 };
                 let result = self.database.incoming_friends(identity, after).await;
-                self.friend_reply(cid, &decoded, MsgType::FriendListAck, result)
+                self.membership_reply(cid, &decoded, MsgType::FriendListAck, result)
             }
             DecodedBody::FriendAccept(req) => {
                 let Some(sender) = req.from_user_id else {
@@ -402,40 +402,41 @@ impl TidbService {
                 let result = self
                     .database
                     .accept_friend(identity, sender, |write| {
-                        self.admit_friend(cid, write, None)
+                        self.admit_membership(cid, write, None)
                     })
                     .await
                     .map(|conversation| FriendAcceptAck {
                         conversation_id: Some(conversation),
                     });
-                self.friend_reply(cid, &decoded, MsgType::FriendAcceptAck, result)
+                self.membership_reply(cid, &decoded, MsgType::FriendAcceptAck, result)
             }
             DecodedBody::FriendApply(req) => {
-                let Some((target, id)) =
-                    req.target_user_id.zip(friend_id(req.request_id.as_deref()))
+                let Some((target, id)) = req
+                    .target_user_id
+                    .zip(request_id128(req.request_id.as_deref()))
                 else {
                     return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
                 };
                 let result = self
                     .database
                     .apply_friend(identity, target, Some(id), |write| {
-                        self.admit_friend(cid, write, Some(target))
+                        self.admit_membership(cid, write, Some(target))
                     })
                     .await
                     .map(friend_attempt_ack);
-                self.friend_reply(cid, &decoded, MsgType::FriendApplyAck, result)
+                self.membership_reply(cid, &decoded, MsgType::FriendApplyAck, result)
             }
             DecodedBody::FriendInbox(req) => {
                 let Some(after) = req.after_user_id else {
                     return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
                 };
                 let result = self.database.friend_inbox(identity, after, false).await;
-                self.friend_reply(cid, &decoded, MsgType::FriendInboxAck, result)
+                self.membership_reply(cid, &decoded, MsgType::FriendInboxAck, result)
             }
             DecodedBody::FriendDecide(req) => {
                 let Some(((sender, id), accept)) = req
                     .from_user_id
-                    .zip(friend_id(req.request_id.as_deref()))
+                    .zip(request_id128(req.request_id.as_deref()))
                     .zip(req.accept)
                 else {
                     return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
@@ -443,22 +444,37 @@ impl TidbService {
                 let result = self
                     .database
                     .decide_friend(identity, sender, Some(id), accept, |write| {
-                        self.admit_friend(cid, write, None)
+                        self.admit_membership(cid, write, None)
                     })
                     .await
                     .map(friend_attempt_ack);
-                self.friend_reply(cid, &decoded, MsgType::FriendDecideAck, result)
+                self.membership_reply(cid, &decoded, MsgType::FriendDecideAck, result)
+            }
+            DecodedBody::GroupCreate(req) => {
+                let Some(request_id) = request_id128(req.request_id.as_deref()) else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self
+                    .database
+                    .create_group(identity, request_id, &req.member_user_ids, |write| {
+                        self.admit_membership(cid, write, None)
+                    })
+                    .await
+                    .map(|conversation_id| GroupCreateAck {
+                        conversation_id: Some(conversation_id),
+                    });
+                self.membership_reply(cid, &decoded, MsgType::GroupCreateAck, result)
             }
             _ => wire_error(cid, &decoded, ErrorCode::UnsupportedCommand),
         }
     }
 
-    fn admit_friend(&self, cid: Id128, write: bool, new_target: Option<u64>) -> Result<()> {
+    fn admit_membership(&self, cid: Id128, write: bool, new_target: Option<u64>) -> Result<()> {
         let engine = self.engine.lock().unwrap();
         let identity = Self::identity(&engine, cid)?;
         if write {
             if !self.accepting.load(Ordering::Relaxed) {
-                return Err(Error::FriendUnavailable);
+                return Err(Error::MembershipUnavailable);
             }
             if new_target
                 .is_some_and(|target| !engine.store.has_account(identity.tenant_id, target))
@@ -469,7 +485,7 @@ impl TidbService {
         Ok(())
     }
 
-    fn friend_reply(
+    fn membership_reply(
         &self,
         cid: Id128,
         frame: &DecodedFrame,
@@ -484,7 +500,9 @@ impl TidbService {
             Err(Error::InvalidRequest(_)) => wire_error(cid, frame, ErrorCode::InvalidArgument),
             Err(Error::FriendNotFound) => wire_error(cid, frame, ErrorCode::NotFound),
             Err(Error::FriendChanged) => wire_error(cid, frame, ErrorCode::ContextChanged),
-            Err(Error::FriendKeyConflict) => wire_error(cid, frame, ErrorCode::IdempotencyConflict),
+            Err(Error::FriendKeyConflict | Error::GroupKeyConflict) => {
+                wire_error(cid, frame, ErrorCode::IdempotencyConflict)
+            }
             Err(Error::FriendInProgress) => wire_error(cid, frame, ErrorCode::InProgress),
             Err(Error::PermissionDenied) => wire_error(cid, frame, ErrorCode::PermissionDenied),
             Err(Error::Unauthenticated) => protocol_error(
@@ -604,7 +622,7 @@ impl TidbService {
     }
 }
 
-fn friend_id(bytes: Option<&[u8]>) -> Option<Id128> {
+fn request_id128(bytes: Option<&[u8]>) -> Option<Id128> {
     bytes.and_then(|bytes| validate_id128(bytes).ok())
 }
 

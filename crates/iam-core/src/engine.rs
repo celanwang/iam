@@ -226,7 +226,8 @@ impl Engine {
             | DecodedBody::FriendAccept(_)
             | DecodedBody::FriendApply(_)
             | DecodedBody::FriendInbox(_)
-            | DecodedBody::FriendDecide(_) => {
+            | DecodedBody::FriendDecide(_)
+            | DecodedBody::GroupCreate(_) => {
                 match self.prepare_storage_request(connection_id, frame)? {
                     StorageRequest::Ready(cid) => self.wire_error(
                         frame,

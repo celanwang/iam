@@ -277,6 +277,40 @@ fn friend_inbox_validates_and_preserves_request_identity() {
 }
 
 #[test]
+fn group_create_wire_round_trip_and_required_ack_id() {
+    use iam_protocol::pb::{GroupCreateAck, GroupCreateRequest};
+    use iam_protocol::{encode_frame, DecodedBody};
+
+    let id = hex::decode("018bcfe5680070008000000000000001").unwrap();
+    let request = GroupCreateRequest {
+        request_id: Some(id.into()),
+        member_user_ids: vec![7, 8],
+    };
+    let head = Head { req_id: Some(1) };
+    let bytes = encode_frame(MsgType::GroupCreate, &head, &request).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        "01200000000000020000001608010a10018bcfe568007000800000000000000110071008"
+    );
+    let mut decoder = FrameDecoder::new();
+    decoder.push(&bytes);
+    let frame = decoder.next_frame().unwrap().unwrap();
+    assert!(
+        matches!(decode_frame(&frame).unwrap().body, DecodedBody::GroupCreate(value) if value == request)
+    );
+    assert!(MsgType::GroupCreate.is_client_to_server());
+    assert!(!MsgType::GroupCreateAck.is_client_to_server());
+    assert!(matches!(
+        raw_body(MsgType::GroupCreateAck, &[8, 42]).unwrap(),
+        DecodedBody::GroupCreateAck(GroupCreateAck {
+            conversation_id: Some(42)
+        })
+    ));
+    assert!(raw_body(MsgType::GroupCreateAck, &[8, 0]).is_err());
+    assert!(raw_body(MsgType::GroupCreateAck, &[8, 42, 8, 43]).is_err());
+}
+
+#[test]
 fn recursive_wire_validation_rejects_duplicates_and_multiple_branches() {
     // Duplicate SendRequest.key and nested MessageKey.conversation_id.
     for body in [&[0x0a, 0, 0x0a, 0][..], &[0x0a, 4, 8, 1, 8, 1][..]] {

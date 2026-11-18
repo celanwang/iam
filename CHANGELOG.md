@@ -14,6 +14,8 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Idempotent creation of groups with up to 32 initial members, with group
+  discovery and reliable text delivery through the existing account and message streams.
 - UUIDv7 friend applications with explicit rejection and safe reapplication.
   Replayed decisions preserve their original result, including across upgrades.
 - Authenticated friend requests, paginated incoming requests, and acceptance

@@ -100,13 +100,14 @@ Head {
 26 FRIEND_APPLY   FriendApplyRequest  -> 27 FRIEND_APPLY_ACK  FriendAttemptAck
 28 FRIEND_INBOX   FriendInboxRequest  -> 29 FRIEND_INBOX_ACK  FriendInboxAck
 30 FRIEND_DECIDE  FriendDecideRequest -> 31 FRIEND_DECIDE_ACK FriendAttemptAck
+32 GROUP_CREATE   GroupCreateRequest  -> 33 GROUP_CREATE_ACK   GroupCreateAck
 ```
 
-`PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
+`PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友和群创建命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
 
 命令方向错误、请求号未递增或需要应答的请求号为 0，属于协议错误，返回错误后关闭连接。未认证的业务请求返回 `UNAUTHENTICATED`，不改变认证状态，也不构成该逻辑发送的最终拒绝。
 
-认证、同步、快照和历史响应使用 `oneof` 表达成功数据或错误。发送与发送查询使用专门的 `SendOutcome`。好友命令的应答携带成功结果，业务错误通过 `ERROR` 返回。
+认证、同步、快照和历史响应使用 `oneof` 表达成功数据或错误。发送与发送查询使用专门的 `SendOutcome`。好友和群创建的应答携带成功结果，业务错误通过 `ERROR` 返回。
 
 ## 公共结构
 
@@ -658,6 +659,16 @@ HistoryResponse = oneof {
 - `FRIEND_ACCEPT` 按 `from_user_id` 接受自己的入站申请。发送方和收件人身份均在认证租户范围内解析。交叉申请分别保存，在任一方明确接受后两条申请都退出待接受列表，任一合法方向后续重放返回同一个 `conversation_id`。
 
 旧命令只绑定该有向账号对的首条兼容申请。新版收件人可在 `FRIEND_INBOX` 看到这条申请的 UUID。兼容申请已拒绝时，旧的申请和接受重放返回 `CONTEXT_CHANGED / NONE`。旧列表只显示仍待处理的兼容申请，旧按人接受在没有对应兼容申请时返回 `NOT_FOUND`。发起后续申请须使用带 ID 的命令。
+
+## 创建小群
+
+`GROUP_CREATE` 包含 `request_id`（字段 1，UUIDv7）和 `member_user_ids`（字段 2，非 packed 编码的重复 uint64）。客户端发送前保存创建 ID，并在重试时复用。租户和创建者来自认证会话。字段最多传 64 项，成员列表不允许零值或创建者 ID。服务器按集合处理成员，折叠重复项并忽略顺序。去重后须有 2 至 31 位其他成员，全员含创建者最多 32 人。
+
+首次创建要求每位所选成员与创建者在认证租户内已有接受的好友关系。任何一位缺少该关系都返回 `PERMISSION_DENIED`。创建者和所选好友一次性获得初始访问权。各成员通过账号 `SYNC` 增量或 `SNAPSHOT` 发现 `kind = GROUP` 的会话，正文沿用 `SEND`、`SEND_STATUS`、`PUSH`、会话 `SYNC` 与 `HISTORY`。
+
+`GROUP_CREATE_ACK` 的 `conversation_id`（字段 1）在事务提交后返回。已成功创建的 ID 在同租户、同创建者下绑定原成员集合，换设备或重连重试返回原会话 ID。这个结果独立于后来发生的访问权限变化。同键更改成员集合返回 `IDEMPOTENCY_CONFLICT`。创建 ID 缺失或格式错误、原始成员项超限，以及首次创建时成员集合不合法，返回 `INVALID_ARGUMENT`。提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`，客户端以新帧请求号和原创建 ID 重试。
+
+本轮的群成员在创建时确定。后续版本处理邀请、群管理和群成员变更。
 
 ## 错误路由与连接处理
 

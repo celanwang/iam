@@ -389,6 +389,15 @@ message FriendAttemptAck {
   }
 }
 
+message GroupCreateRequest {
+  optional bytes request_id = 1;
+  repeated uint64 member_user_ids = 2 [packed = false];
+}
+
+message GroupCreateAck {
+  optional uint64 conversation_id = 1;
+}
+
 message ProtocolError {
   optional uint32 ref_msg_type = 1;
   optional ErrorInfo error = 2;

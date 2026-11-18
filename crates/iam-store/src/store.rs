@@ -35,9 +35,13 @@ mod friend_tests;
 #[path = "friends.rs"]
 mod friends;
 pub(crate) use friends::FriendAttempt;
-use friends::FRIEND_SCHEMA_VERSION;
+#[cfg(test)]
+#[path = "group_tests.rs"]
+mod group_tests;
+#[path = "groups.rs"]
+mod groups;
 use membership::{
-    backfill_direct_pairs, create_direct_in, friend_schema_version, mark_friends_ready,
+    backfill_direct_pairs, create_conversation_in, mark_schema_ready, schema_version,
 };
 
 const CLOCK_SQL: &str = "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)";
@@ -51,7 +55,8 @@ const CONTROL: &str = "SELECT store_id, token_key, max_observed_now_ms, closed_t
                        FROM store_control WHERE singleton = 1 FOR UPDATE";
 
 const INITIAL_ACCESS: u64 = 1;
-const TABLES: [&str; 10] = [
+const STORAGE_SCHEMA_VERSION: u8 = 3;
+const TABLES: [&str; 11] = [
     "store_control",
     "conversations",
     "messages",
@@ -62,6 +67,7 @@ const TABLES: [&str; 10] = [
     "direct_pairs",
     "friend_requests",
     "friend_attempts",
+    "group_creations",
 ];
 
 struct DecisionClock {
@@ -194,9 +200,9 @@ impl TidbStore {
             .try_into()
             .map_err(|_| Error::Integrity("invalid token key"))?;
         control_clock(&row)?;
-        if friend_schema_version(&mut transaction).await? != FRIEND_SCHEMA_VERSION {
+        if schema_version(&mut transaction).await? != STORAGE_SCHEMA_VERSION {
             return Err(Error::Configuration(
-                "run the offline friends schema upgrade",
+                "run the offline storage schema upgrade",
             ));
         }
         let missing_event: Option<i32> = sqlx::query_scalar(
@@ -592,9 +598,10 @@ impl TidbStore {
         let changes = match scope {
             Scope::Account => {
                 let rows = sqlx::query(
-                    "SELECT account_sequence, conversation_id, history_id, access_version FROM account_events
-                     WHERE tenant_id = ? AND user_id = ? AND account_sequence > ? AND account_sequence <= ?
-                     ORDER BY account_sequence LIMIT ?",
+                    "SELECT e.account_sequence, e.conversation_id, e.history_id, e.access_version, c.kind
+                     FROM account_events e JOIN conversations c USING (tenant_id, conversation_id)
+                     WHERE e.tenant_id = ? AND e.user_id = ? AND e.account_sequence > ? AND e.account_sequence <= ?
+                     ORDER BY e.account_sequence LIMIT ?",
                 )
                 .bind(identity.tenant_id).bind(identity.user_id).bind(after).bind(through).bind(expected)
                 .fetch_all(db).await?;
@@ -654,7 +661,7 @@ impl TidbStore {
         limit: usize,
     ) -> Result<Vec<ConversationState>> {
         let rows = sqlx::query(
-            "SELECT m.conversation_id, c.history_id, e.access_version FROM members m
+            "SELECT m.conversation_id, c.history_id, e.access_version, c.kind FROM members m
              JOIN account_events e USING (tenant_id, user_id, account_sequence)
              JOIN conversations c ON c.tenant_id = m.tenant_id AND c.conversation_id = m.conversation_id
              WHERE m.tenant_id = ? AND m.user_id = ? ORDER BY m.conversation_id LIMIT ? OFFSET ?",
@@ -731,9 +738,16 @@ impl TidbStore {
 }
 
 fn conversation_state(row: &MySqlRow) -> Result<ConversationState> {
+    let kind = i32::from(row.try_get::<u8, _>("kind")?);
+    if !matches!(
+        ConversationKind::try_from(kind),
+        Ok(ConversationKind::Direct | ConversationKind::Group)
+    ) {
+        return Err(Error::Integrity("invalid conversation kind"));
+    }
     Ok(ConversationState {
         conversation_id: Some(row.try_get("conversation_id")?),
-        kind: Some(ConversationKind::Direct as i32),
+        kind: Some(kind),
         history_id: Some(id_column(row, "history_id")?.to_vec().into()),
         access_version: Some(row.try_get("access_version")?),
     })
@@ -848,13 +862,15 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
             "SELECT tenant_id, user_low, user_high, conversation_id, friends FROM direct_pairs LIMIT 0",
             "SELECT tenant_id, to_user_id, from_user_id, pending FROM friend_requests FORCE INDEX (pending_incoming) LIMIT 0",
             "SELECT tenant_id, to_user_id, from_user_id, request_id, outcome, conversation_id, legacy_slot, pending_slot FROM friend_attempts FORCE INDEX (legacy_inbox) LIMIT 0",
+            "SELECT kind FROM conversations LIMIT 0",
+            "SELECT tenant_id, creator_id, request_id, member_set, conversation_id FROM group_creations LIMIT 0",
         ] {
             sqlx::query(query).execute(pool).await?;
         }
     }
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT table_name, index_name, column_name FROM information_schema.statistics \
-         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests', 'friend_attempts') \
+         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests', 'friend_attempts', 'group_creations') \
          AND non_unique = 0 ORDER BY table_name, index_name, seq_in_index",
     )
     .fetch_all(pool)
@@ -869,6 +885,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
                     | "direct_pairs"
                     | "friend_requests"
                     | "friend_attempts"
+                    | "group_creations"
             )
         {
             continue;
@@ -882,7 +899,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
         "conversation_id",
         "client_msg_id",
     ];
-    let expected: [(&str, &str, &[&str]); 17] = [
+    let expected: [(&str, &str, &[&str]); 19] = [
         ("store_control", "PRIMARY", &["singleton"]),
         (
             "conversations",
@@ -955,6 +972,16 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
             "friend_attempts",
             "legacy_attempt",
             &["tenant_id", "to_user_id", "from_user_id", "legacy_slot"],
+        ),
+        (
+            "group_creations",
+            "PRIMARY",
+            &["tenant_id", "creator_id", "request_id"],
+        ),
+        (
+            "group_creations",
+            "created_group",
+            &["tenant_id", "conversation_id"],
         ),
     ];
     let expected = if legacy_only {
@@ -1118,15 +1145,16 @@ async fn initialize(
         let mut members = conv.members.iter().copied();
         let a = members.next().unwrap();
         let b = members.next().unwrap();
-        create_direct_in(
+        create_conversation_in(
             tx,
             conv.tenant_id,
             conv.conversation_id,
             conv.history_id,
-            [a, b],
+            ConversationKind::Direct,
+            &[a, b],
         )
         .await?;
     }
     backfill_direct_pairs(tx).await?;
-    mark_friends_ready(tx).await
+    mark_schema_ready(tx).await
 }
