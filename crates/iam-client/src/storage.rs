@@ -1,4 +1,6 @@
-use crate::{Error, HistoryRange, Identity, Recovery, Result};
+use crate::{
+    ConversationPage, ConversationSummary, Error, HistoryRange, Identity, Recovery, Result,
+};
 use iam_protocol::pb::{
     change, Change, ConversationState, MessageKey, MessageView, ResetReason, SendOutcome,
     SendRequest, StreamContext,
@@ -176,6 +178,40 @@ impl Storage {
         ids.into_iter().map(|id| number(&id)).collect()
     }
 
+    pub async fn list_conversations(&mut self, after: u64, limit: u32) -> Result<ConversationPage> {
+        type ConversationRow = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+        let mut rows: Vec<ConversationRow> = sqlx::query_as(
+            "SELECT c.id, c.state, (
+                 SELECT view FROM messages WHERE conversation = c.id
+                 ORDER BY sequence DESC LIMIT 1
+             )
+             FROM conversations AS c WHERE c.id > ? ORDER BY c.id LIMIT ?",
+        )
+        .bind(bytes(after).to_vec())
+        .bind(i64::from(limit) + 1)
+        .fetch_all(&mut self.db)
+        .await?;
+        let next_after = if rows.len() > limit as usize {
+            rows.pop();
+            rows.last().map(|(id, _, _)| number(id)).transpose()?
+        } else {
+            None
+        };
+        let items = rows
+            .into_iter()
+            .map(|(_, state, preview)| {
+                Ok(ConversationSummary {
+                    state: ConversationState::decode(state.as_slice())?,
+                    latest_cached_message: preview
+                        .as_deref()
+                        .map(MessageView::decode)
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(ConversationPage { items, next_after })
+    }
+
     pub async fn messages(&mut self, target: u64) -> Result<Vec<MessageView>> {
         let rows: Vec<Vec<u8>> = sqlx::query_scalar(
             "SELECT view FROM messages WHERE conversation = ? ORDER BY sequence, id",
@@ -246,17 +282,21 @@ impl Storage {
                 .bind(bytes(target).to_vec())
                 .execute(&mut *tx)
                 .await?;
-            let state = ConversationState {
-                conversation_id: Some(target),
-                kind: Some(iam_protocol::pb::ConversationKind::Direct as i32),
-                history_id: progress.context.epoch.clone(),
-                access_version: progress.context.access_version,
-            };
-            sqlx::query("UPDATE conversations SET state = ? WHERE id = ?")
-                .bind(state.encode_to_vec())
-                .bind(bytes(target).to_vec())
-                .execute(&mut *tx)
-                .await?;
+            let state: Option<Vec<u8>> =
+                sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?")
+                    .bind(bytes(target).to_vec())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(state) = state {
+                let mut state = ConversationState::decode(state.as_slice())?;
+                state.history_id.clone_from(&progress.context.epoch);
+                state.access_version = progress.context.access_version;
+                sqlx::query("UPDATE conversations SET state = ? WHERE id = ?")
+                    .bind(state.encode_to_vec())
+                    .bind(bytes(target).to_vec())
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         Self::stage_page(&mut tx, target, changes, Some(progress)).await?;
         if let Some((first, last)) = gap {
@@ -598,13 +638,117 @@ fn number(value: &[u8]) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Client;
     use iam_protocol::generate_id128;
-    use iam_protocol::pb::{sync_target, MessagePosition, MessageRef, SyncTarget};
+    use iam_protocol::pb::{
+        sync_target, ConversationKind, MessagePosition, MessageRef, SyncTarget,
+    };
     use std::process::Stdio;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     const CHILD_DB: &str = "IAM_CLIENT_PAGE_CRASH_DB";
+
+    #[tokio::test]
+    async fn conversation_list_pages_across_unsigned_id_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = Identity {
+            tenant_id: 1,
+            user_id: 2,
+            device_id: generate_id128(),
+        };
+        let mut client = Client::open(directory.path().join("device.db"), identity)
+            .await
+            .unwrap();
+        let ids = [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX];
+        let upserts = ids
+            .into_iter()
+            .rev()
+            .map(|id| Change {
+                event_seq: None,
+                payload: Some(change::Payload::ConversationUpsert(ConversationState {
+                    conversation_id: Some(id),
+                    kind: Some(ConversationKind::Direct as i32),
+                    history_id: Some(generate_id128().to_vec().into()),
+                    access_version: Some(1),
+                })),
+            })
+            .collect();
+        client.storage.apply(0, upserts, None).await.unwrap();
+
+        for limit in [0, 101, u32::MAX] {
+            assert!(matches!(
+                client.list_conversations(0, limit).await,
+                Err(Error::Invalid("conversation page size"))
+            ));
+        }
+        let first = client.list_conversations(0, 2).await.unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.state.conversation_id.unwrap())
+                .collect::<Vec<_>>(),
+            ids[..2]
+        );
+        assert_eq!(first.next_after, Some(ids[1]));
+        let last = client
+            .list_conversations(first.next_after.unwrap(), 1)
+            .await
+            .unwrap();
+        assert_eq!(last.items.len(), 1);
+        assert_eq!(last.items[0].state.conversation_id, Some(u64::MAX));
+        assert_eq!(last.next_after, None);
+        let exhausted = client.list_conversations(u64::MAX, 100).await.unwrap();
+        assert!(exhausted.items.is_empty());
+        assert_eq!(exhausted.next_after, None);
+    }
+
+    #[tokio::test]
+    async fn conversation_snapshot_preserves_the_account_conversation_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = Identity {
+            tenant_id: 1,
+            user_id: 2,
+            device_id: generate_id128(),
+        };
+        let mut client = Client::open(directory.path().join("device.db"), identity)
+            .await
+            .unwrap();
+        let mut state = ConversationState {
+            conversation_id: Some(1),
+            kind: Some(ConversationKind::Group as i32),
+            history_id: Some(generate_id128().to_vec().into()),
+            access_version: Some(1),
+        };
+        let change = Change {
+            event_seq: Some(1),
+            payload: Some(change::Payload::ConversationUpsert(state.clone())),
+        };
+        client.storage.apply(0, vec![change], None).await.unwrap();
+
+        let progress = Progress {
+            context: StreamContext {
+                target: Some(SyncTarget {
+                    value: Some(sync_target::Value::Conversation(1)),
+                }),
+                epoch: Some(generate_id128().to_vec().into()),
+                access_version: Some(2),
+            },
+            covered: 0,
+            cursor: vec![1],
+        };
+        client
+            .storage
+            .apply_snapshot(1, vec![], &progress, None)
+            .await
+            .unwrap();
+        state.history_id = progress.context.epoch;
+        state.access_version = progress.context.access_version;
+        let page = client.list_conversations(0, 1).await.unwrap();
+        assert_eq!(page.items[0].state, state);
+        assert!(page.items[0].latest_cached_message.is_none());
+    }
 
     #[tokio::test]
     async fn page_and_cursor_survive_process_crash_together() {

@@ -689,6 +689,11 @@ async fn tidb_client_applies_duplicate_and_out_of_order_pushes_without_advancing
     let (mut client, wire) = bob.stop().await;
     assert_eq!(wire.syncs.len(), 2, "the periodic sync has not run");
     assert_eq!(message_texts(&mut client, 1).await, ["second", "third"]);
+    let page = client.list_conversations(0, 1).await.unwrap();
+    assert_eq!(
+        page.items[0].latest_cached_message.as_ref().map(text),
+        Some("third")
+    );
 
     let mut bob = Running::start(client, &server, b"bob", options(LONG_INTERVAL), None);
     bob.wait_for_sync_through(3).await;
@@ -739,6 +744,7 @@ async fn tidb_client_recovers_conversations_while_the_account_cursor_is_expired(
     let database = support::isolated_database().await;
     let mut engine = seeded();
     engine.store.seed_direct(1, 2, 100, 200);
+    engine.store.seed_direct(1, 3, 200, 300);
     let server = open_server(
         database.as_str(),
         generate_id128(),
@@ -748,6 +754,10 @@ async fn tidb_client_recovers_conversations_while_the_account_cursor_is_expired(
     .await;
     let mut sender = sender(&server).await;
     sender.send_text("old history").await;
+    let (mut other_device, _) = authenticate(&server, b"bob", generate_id128()).await;
+    other_device
+        .send_in(3, generate_id128(), "revoked history")
+        .await;
 
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("bob.db");
@@ -758,6 +768,12 @@ async fn tidb_client_recovers_conversations_while_the_account_cursor_is_expired(
     bob.wait_for_idle().await;
     let (mut client, _) = bob.stop().await;
     assert_eq!(message_texts(&mut client, 1).await, ["old history"]);
+    let page = client.list_conversations(2, 1).await.unwrap();
+    assert_eq!(page.items[0].state.conversation_id, Some(3));
+    assert_eq!(
+        page.items[0].latest_cached_message.as_ref().map(text),
+        Some("revoked history")
+    );
     drop(client);
 
     let pool = MySqlPool::connect(database.as_str()).await.unwrap();
@@ -794,6 +810,13 @@ async fn tidb_client_recovers_conversations_while_the_account_cursor_is_expired(
         .unwrap();
     local.close().await.unwrap();
 
+    server
+        .lock()
+        .await
+        .set_member_access(1, 3, 200, false)
+        .await
+        .unwrap();
+
     // Simulate a TiDB restore with a new conversation history and a lower upper bound.
     let mut tx = pool.begin().await.unwrap();
     sqlx::query("DELETE FROM messages WHERE tenant_id = 1 AND conversation_id = 1")
@@ -829,6 +852,13 @@ async fn tidb_client_recovers_conversations_while_the_account_cursor_is_expired(
     );
     assert!(calls[1].cursor.is_none());
     assert!(message_texts(&mut client, 1).await.is_empty());
+    assert!(message_texts(&mut client, 3).await.is_empty());
+    assert!(client
+        .list_conversations(2, 1)
+        .await
+        .unwrap()
+        .items
+        .is_empty());
     assert!(matches!(
         client.outcome(&queued).await.unwrap().unwrap().value,
         Some(send_outcome::Value::Committed(_))
@@ -1220,9 +1250,14 @@ async fn tidb_client_discovers_a_new_conversation_and_applies_membership_changes
     let mut alice = sender(&service).await;
     let dir = tempfile::tempdir().unwrap();
     let device = identity(200);
-    let client = Client::open(dir.path().join("bob.db"), device)
+    let path = dir.path().join("bob.db");
+    let mut client = Client::open(&path, device).await.unwrap();
+    assert!(client
+        .list_conversations(0, 100)
         .await
-        .unwrap();
+        .unwrap()
+        .items
+        .is_empty());
     let mut bob = Running::start(
         client,
         &service,
@@ -1255,8 +1290,33 @@ async fn tidb_client_discovers_a_new_conversation_and_applies_membership_changes
     let (mut client, wire) = bob.stop().await;
     assert_eq!(wire.connections, 1);
     assert_eq!(message_texts(&mut client, 2).await, ["first"]);
+    let first = client.list_conversations(0, 1).await.unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].state.conversation_id, Some(1));
+    assert_eq!(
+        first.items[0].state.kind(),
+        iam_protocol::pb::ConversationKind::Direct
+    );
+    assert!(first.items[0].latest_cached_message.is_none());
+    assert_eq!(first.next_after, Some(1));
+    let second = client
+        .list_conversations(first.next_after.unwrap(), 1)
+        .await
+        .unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].state.conversation_id, Some(2));
+    assert_eq!(
+        second.items[0].latest_cached_message.as_ref().map(text),
+        Some("first")
+    );
+    assert_eq!(second.next_after, None);
 
+    // The server now has a newer message. The preview persists at the last local write.
     alice.send_in(2, generate_id128(), "second").await;
+    drop(client);
+    let mut client = Client::open(&path, device).await.unwrap();
+    assert_eq!(client.list_conversations(0, 1).await.unwrap(), first);
+    assert_eq!(client.list_conversations(1, 1).await.unwrap(), second);
     let (mut reader, _) = authenticate(&service, b"bob", generate_id128()).await;
     let mut request = HistoryRequest {
         context: Some(old_context.clone()),
@@ -1304,6 +1364,12 @@ async fn tidb_client_discovers_a_new_conversation_and_applies_membership_changes
     bob.wait_for_idle().await;
     let (mut client, _) = bob.stop().await;
     assert!(message_texts(&mut client, 2).await.is_empty());
+    let remaining = client.list_conversations(0, 1).await.unwrap();
+    assert_eq!(remaining.items, first.items);
+    assert_eq!(remaining.next_after, None);
+    drop(client);
+    let mut client = Client::open(&path, device).await.unwrap();
+    assert_eq!(client.list_conversations(0, 1).await.unwrap(), remaining);
 
     service
         .lock()
@@ -1334,6 +1400,18 @@ async fn tidb_client_discovers_a_new_conversation_and_applies_membership_changes
     assert_eq!(
         message_texts(&mut client, 2).await,
         ["second", "while revoked"]
+    );
+    let restored_page = client.list_conversations(1, 1).await.unwrap();
+    assert_eq!(
+        restored_page.items[0].state.access_version,
+        restored_context.access_version
+    );
+    assert_eq!(
+        restored_page.items[0]
+            .latest_cached_message
+            .as_ref()
+            .map(text),
+        Some("while revoked")
     );
 }
 
