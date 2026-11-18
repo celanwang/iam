@@ -165,15 +165,63 @@ async fn establish(
     }
 }
 
+async fn send_from_local_queue(
+    client: &mut Client,
+    path: &Path,
+    mut transport: TlsTransport,
+    token: &[u8],
+    conversation: u64,
+) {
+    let key = client
+        .enqueue(conversation, "group remains available".to_owned())
+        .await
+        .unwrap();
+    let mut db = observer(path).await;
+    let (stop, mut submissions) = mpsc::channel(1);
+    let saved = async {
+        loop {
+            let done: bool = sqlx::query_scalar(
+                "SELECT outcome IS NOT NULL FROM outbox WHERE conversation = ? AND client_id = ?",
+            )
+            .bind(conversation.to_be_bytes().to_vec())
+            .bind(key.client_msg_id.as_deref().unwrap())
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+            if done {
+                drop(stop);
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let (result, ()) = timeout(WAIT, async {
+        tokio::join!(
+            client.run(&mut transport, token, Options::default(), &mut submissions),
+            saved
+        )
+    })
+    .await
+    .expect("queued message did not reach a saved result");
+    result.unwrap();
+    assert!(matches!(
+        client
+            .outcome(&key)
+            .await
+            .unwrap()
+            .and_then(|outcome| outcome.value),
+        Some(send_outcome::Value::Committed(_))
+    ));
+}
+
 #[tokio::test]
 #[ignore = "requires real local TiDB and starts the gateway binary"]
 async fn tidb_tls_local_release_recovers_after_gateway_process_exit() {
     let config = ProcessConfig::new().await;
     let [alice_identity, bob_identity, charlie_identity] = config.users;
     let (mut gateway, address) = config.start("fresh", "127.0.0.1:0").await;
-    let alice = Client::open(config.file("alice.db"), alice_identity)
-        .await
-        .unwrap();
+    let alice_path = config.file("alice.db");
+    let mut alice = Client::open(&alice_path, alice_identity).await.unwrap();
     let bob_path = config.file("bob.db");
     let mut bob = Client::open(&bob_path, bob_identity).await.unwrap();
     let charlie = Client::open(config.file("charlie.db"), charlie_identity)
@@ -296,11 +344,13 @@ async fn tidb_tls_local_release_recovers_after_gateway_process_exit() {
         blocked.outcome.and_then(|outcome| outcome.value),
         Some(send_outcome::Value::RejectedFinal(error)) if error.code() == ErrorCode::PermissionDenied
     ));
-    send(
-        &mut sender,
-        4,
-        message_key(group),
-        "group remains available",
+    drop(sender);
+    send_from_local_queue(
+        &mut alice,
+        &alice_path,
+        config.transport(&address),
+        ALICE,
+        group,
     )
     .await;
     resumed.kill().await.unwrap();
