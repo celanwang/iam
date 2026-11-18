@@ -5,6 +5,23 @@ use prost::Message;
 use std::time::Duration;
 use tokio::time::{timeout, Instant};
 
+pub(crate) type RequestResult<T> = std::result::Result<T, RequestFailure>;
+
+pub(crate) struct RequestFailure {
+    pub error: Error,
+    pub close_connection: bool,
+}
+
+impl From<Error> for RequestFailure {
+    fn from(error: Error) -> Self {
+        // An incomplete exchange or an invalid reply leaves framing unconfirmed.
+        Self {
+            error,
+            close_connection: true,
+        }
+    }
+}
+
 pub(crate) struct Wire<'a, T> {
     pub transport: &'a mut T,
     timeout: Duration,
@@ -85,6 +102,16 @@ impl<'a, T: Transport> Wire<'a, T> {
     }
 
     pub async fn request(&mut self, kind: MsgType, body: &impl Message) -> Result<DecodedBody> {
+        self.request_detailed(kind, body)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub async fn request_detailed(
+        &mut self,
+        kind: MsgType,
+        body: &impl Message,
+    ) -> RequestResult<DecodedBody> {
         self.req_id = self
             .req_id
             .checked_add(1)
@@ -92,18 +119,21 @@ impl<'a, T: Transport> Wire<'a, T> {
         let head = Head {
             req_id: Some(self.req_id),
         };
-        let request = encode_frame(kind, &head, body)?;
+        let request = encode_frame(kind, &head, body).map_err(Error::from)?;
         let bytes = timeout(self.timeout, self.transport.exchange(request))
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(Error::Transport)?;
         let response = decode(&bytes)?;
         if response.head != head && !is_connection_error(&response) {
-            return Err(Error::Invalid("response request ID"));
+            return Err(Error::Invalid("response request ID").into());
         }
         self.heartbeat_at = Instant::now() + self.heartbeat_interval;
         match response.body {
-            DecodedBody::Error(error) => Err(server_error(error)),
+            DecodedBody::Error(error) => Err(RequestFailure {
+                close_connection: error.close_connection == Some(true),
+                error: server_error(error),
+            }),
             body => Ok(body),
         }
     }

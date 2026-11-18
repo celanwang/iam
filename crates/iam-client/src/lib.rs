@@ -1,5 +1,6 @@
 //! A durable, single-device text client. The caller supplies transport and credentials.
 
+mod commands;
 mod friends;
 mod group_invites;
 mod group_members;
@@ -12,6 +13,7 @@ mod tls;
 mod user_blocks;
 mod wire;
 
+pub use commands::{command_channel, CommandReceiver, CommandSender};
 pub use storage::ClientView;
 pub use tls::TlsTransport;
 
@@ -49,6 +51,10 @@ pub enum Error {
     Transport(#[source] io::Error),
     #[error("transport request timed out")]
     Timeout,
+    #[error("the running client no longer accepts commands")]
+    CommandsClosed,
+    #[error("the online write may have committed without a confirmed result: {0}")]
+    CommandOutcomeUnknown(#[source] Box<Error>),
     #[error("local database operation failed")]
     Storage(#[from] sqlx::Error),
     #[error(transparent)]
@@ -258,6 +264,39 @@ impl Client {
         options: Options,
         submissions: &mut mpsc::Receiver<Submission>,
     ) -> Result<()> {
+        self.run_inner(transport, access_token, options, submissions, None)
+            .await
+    }
+
+    /// Runs the usual sync and send loop with a bounded read-state command queue.
+    /// Commands wait for authentication, and dropping the command sender leaves syncing active.
+    /// Closing and draining submissions stops the run and closes the command queue.
+    pub async fn run_with_commands(
+        &mut self,
+        transport: &mut impl Transport,
+        access_token: &[u8],
+        options: Options,
+        submissions: &mut mpsc::Receiver<Submission>,
+        commands: CommandReceiver,
+    ) -> Result<()> {
+        self.run_inner(
+            transport,
+            access_token,
+            options,
+            submissions,
+            Some(commands),
+        )
+        .await
+    }
+
+    async fn run_inner(
+        &mut self,
+        transport: &mut impl Transport,
+        access_token: &[u8],
+        options: Options,
+        submissions: &mut mpsc::Receiver<Submission>,
+        mut commands: Option<CommandReceiver>,
+    ) -> Result<()> {
         if options.sync_interval.is_zero()
             || options.retry_min.is_zero()
             || options.retry_max < options.retry_min
@@ -289,10 +328,25 @@ impl Client {
             } else {
                 connect_at
             };
-            let result = tokio::select! {
+            let accept_commands = online && commands.is_some();
+            let input = tokio::select! {
                 biased;
                 // Keep the timer independent of a busy push stream.
-                _ = sleep_until(due) => {
+                _ = sleep_until(due) => RunInput::Timer,
+                input = async {
+                    // Rotate ready inputs. A busy source should not starve the others.
+                    tokio::select! {
+                        submission = submissions.recv() => RunInput::Submission(submission),
+                        inbound = wire.transport.receive(), if online => RunInput::Inbound(inbound),
+                        command = async { commands.as_mut().unwrap().0.recv().await }, if accept_commands => {
+                            RunInput::Command(command)
+                        }
+                    }
+                } => input,
+            };
+            let mut reconnect_for_command = false;
+            let result = match input {
+                RunInput::Timer => {
                     if !online {
                         let result = wire.authenticate(self.identity, access_token).await;
                         if result.is_ok() {
@@ -335,7 +389,11 @@ impl Client {
                                 Ok(())
                             }
                             Err(error) if retryable(&error) => {
-                                history_at = Some(backoff(&mut history_delay, options.retry_max, Some(&error)));
+                                history_at = Some(backoff(
+                                    &mut history_delay,
+                                    options.retry_max,
+                                    Some(&error),
+                                ));
                                 Ok(())
                             }
                             Err(error) => Err(error),
@@ -364,35 +422,62 @@ impl Client {
                         }
                     }
                 }
-                submission = submissions.recv() => {
-                    let Some(submission) = submission else { return Ok(()); };
-                    let saved = self.enqueue(submission.conversation_id, submission.text).await;
+                RunInput::Submission(submission) => {
+                    let Some(submission) = submission else {
+                        return Ok(());
+                    };
+                    let saved = self
+                        .enqueue(submission.conversation_id, submission.text)
+                        .await;
                     if saved.is_ok() {
                         send_at = Instant::now();
                     }
                     let _ = submission.saved.send(saved);
                     Ok(())
                 }
-                inbound = wire.transport.receive(), if online => {
-                    match inbound {
-                        Ok(bytes) => self.handle_inbound(&bytes).await,
-                        Err(error) => Err(Error::Transport(error)),
+                RunInput::Inbound(inbound) => match inbound {
+                    Ok(bytes) => self.handle_inbound(&bytes).await,
+                    Err(error) => Err(Error::Transport(error)),
+                },
+                RunInput::Command(Some(command)) => {
+                    if submissions.is_closed() && submissions.is_empty() {
+                        return Ok(());
                     }
+                    command.execute(&mut wire).await.map(|reconnect| {
+                        reconnect_for_command = reconnect;
+                    })
+                }
+                RunInput::Command(None) => {
+                    commands = None;
+                    Ok(())
                 }
             };
-            match result {
-                Ok(()) => {}
+            let reconnect_error = match result {
+                Ok(()) if reconnect_for_command => None,
+                Ok(()) => continue,
                 Err(error)
                     if (online && disconnected(&error))
                         || (!online && (transport_failed(&error) || retryable(&error))) =>
                 {
-                    online = false;
-                    connect_at = backoff(&mut reconnect_delay, options.retry_max, Some(&error));
+                    Some(error)
                 }
                 Err(error) => return Err(error),
-            }
+            };
+            online = false;
+            connect_at = backoff(
+                &mut reconnect_delay,
+                options.retry_max,
+                reconnect_error.as_ref(),
+            );
         }
     }
+}
+
+enum RunInput {
+    Timer,
+    Submission(Option<Submission>),
+    Inbound(io::Result<Vec<u8>>),
+    Command(Option<commands::Command>),
 }
 
 impl Client {

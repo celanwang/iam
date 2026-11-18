@@ -14,6 +14,9 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Bounded typed client commands for reading and advancing read positions and
+  querying unread counts over the active sync connection.
+
 - Small-group invitations with a paged recipient inbox, explicit decisions,
   durable retries, and membership limits shared with trusted access changes.
 
