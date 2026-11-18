@@ -238,6 +238,12 @@ async fn tidb_tls_groups_discovered_by_account_sync_and_recover_offline_messages
         .state;
     let mut read_socket = resumed.client();
     assert_eq!(
+        bob.unread_count(&mut read_socket, BOB, &group_state)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
         bob.read_position(&mut read_socket, BOB, &group_state)
             .await
             .unwrap(),
@@ -248,6 +254,12 @@ async fn tidb_tls_groups_discovered_by_account_sync_and_recover_offline_messages
             .await
             .unwrap(),
         2
+    );
+    assert_eq!(
+        bob.unread_count(&mut read_socket, BOB, &group_state)
+            .await
+            .unwrap(),
+        0
     );
     drop(read_socket);
 
@@ -277,6 +289,10 @@ async fn tidb_tls_groups_discovered_by_account_sync_and_recover_offline_messages
     assert!(bob.messages(group).await.unwrap().is_empty());
     assert!(matches!(
         bob.read_position(&mut resumed.client(), BOB, &group_state).await,
+        Err(iam_client::Error::Server(error)) if error.code() == ErrorCode::PermissionDenied
+    ));
+    assert!(matches!(
+        bob.unread_count(&mut resumed.client(), BOB, &group_state).await,
         Err(iam_client::Error::Server(error)) if error.code() == ErrorCode::PermissionDenied
     ));
     resumed.stop().await;

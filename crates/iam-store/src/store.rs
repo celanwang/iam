@@ -31,6 +31,8 @@ mod membership;
 
 #[path = "read_position.rs"]
 mod read_position;
+#[path = "unread_count.rs"]
+mod unread_count;
 
 #[cfg(test)]
 #[path = "friend_tests.rs"]

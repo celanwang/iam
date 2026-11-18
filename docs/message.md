@@ -42,6 +42,10 @@ UUIDv7 可以由设备自行生成，重连后仍可用同一个 ID 指向原消
 
 两个方法均使用调用方提供的传输和设备凭证建立新的认证连接。若同一设备正在运行 `Client::run`，先结束同步循环再调用，以免触发同设备会话接管。收到 `CONTEXT_CHANGED` 时先同步会话状态。收到结果暂不可用时可重试原位置。
 
+### 查询会话未读数
+
+使用已同步的 `ConversationState` 调用 `Client::unread_count`，获取本人在一个单聊或小群的服务端未读数。计数只包含其他人发送且仍可见的消息，并以本人当前阅读位置为下界。计数反映服务端执行查询时的状态，本地会话预览可能尚未同步到这一进度。该方法采用与阅读位置方法相同的设备认证和范围校验。
+
 ## 最后一条推送丢了
 
 设备已同步到 40，消息 41 已保存，但推送丢了，之后也没有新消息。即使连接一直在线，设备也会到点用原游标发起 `SYNC`，补回 41。真实 TiDB 验收已覆盖这条路径。
@@ -92,6 +96,13 @@ cargo test -p iam-store --test client_reliability tidb_client_view_tracks_sync_w
 IAM_TIDB_TEST_URL='mysql://root@127.0.0.1:4000/iam_test' \
 IAM_TIDB_ALLOW_TEST_WRITES=1 \
 cargo test -p iam-gateway --test tls read_position -- --ignored --test-threads=1
+```
+
+未读数验收使用同一组 TiDB 环境变量。单聊覆盖排除本人消息、保留下界、跨设备推进和重新授权。小群覆盖多位发送人、推进阅读位置及撤权。
+
+```sh
+cargo test -p iam-gateway --test tls tidb_tls_unread_count_respects_sender_retention_and_member_period -- --ignored
+cargo test -p iam-gateway --test tls tidb_tls_groups_discovered_by_account_sync_and_recover_offline_messages -- --ignored
 ```
 
 [消息协议](./protocol.md) · [存储设计](./storage.md)

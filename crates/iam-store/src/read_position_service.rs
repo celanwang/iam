@@ -1,5 +1,5 @@
 use super::*;
-use iam_protocol::pb::{ReadPositionAck, ReadPositionRequest};
+use iam_protocol::pb::{ReadPositionAck, ReadPositionRequest, UnreadCountAck, UnreadCountRequest};
 
 impl TidbService {
     pub(super) async fn read_position(
@@ -18,17 +18,38 @@ impl TidbService {
                 }
                 Ok(())
             })
-            .await;
+            .await
+            .map(|read_through| ReadPositionAck { read_through });
+        self.position_reply(cid, frame, MsgType::ReadPositionAck, result)
+    }
+
+    pub(super) async fn unread_count(
+        &self,
+        cid: Id128,
+        identity: Identity,
+        frame: &DecodedFrame,
+        request: &UnreadCountRequest,
+    ) -> Result<EngineReply> {
+        let result = self
+            .database
+            .unread_count(identity, request)
+            .await
+            .map(|count| UnreadCountAck { count: Some(count) });
+        self.position_reply(cid, frame, MsgType::UnreadCountAck, result)
+    }
+
+    fn position_reply(
+        &self,
+        cid: Id128,
+        frame: &DecodedFrame,
+        kind: MsgType,
+        result: Result<impl Message>,
+    ) -> Result<EngineReply> {
         if let Some(error) = self.check_read_session(cid, frame)? {
             return Ok(error);
         }
         match result {
-            Ok(read_through) => reply(
-                cid,
-                frame,
-                MsgType::ReadPositionAck,
-                &ReadPositionAck { read_through },
-            ),
+            Ok(body) => reply(cid, frame, kind, &body),
             Err(Error::InvalidRequest(_)) => wire_error(cid, frame, ErrorCode::InvalidArgument),
             Err(Error::PermissionDenied) => wire_error(cid, frame, ErrorCode::PermissionDenied),
             Err(Error::ReadPositionContextChanged) => protocol_error(

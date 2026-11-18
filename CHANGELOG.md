@@ -31,6 +31,7 @@ a dated version section when cutting a release.
   conversations and previews of the latest locally saved messages.
 - Read-only client views for cached conversations and messages while sync runs.
 - Durable conversation read positions shared across devices for the same user.
+- Exact unread counts for the current user's visible conversation history.
 - Durable account changes for direct conversations and access changes, with
   a local schema upgrade that preserves existing cursors and send receipts.
 - Real TiDB acceptance tests for reordered and duplicate pushes, expired

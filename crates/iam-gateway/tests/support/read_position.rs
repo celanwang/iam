@@ -347,3 +347,86 @@ async fn tidb_tls_read_position_retries_after_losing_commit_reply() {
     );
     gateway.stop().await;
 }
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_tls_unread_count_respects_sender_retention_and_member_period() {
+    let fixture = Fixture::new().await;
+    let [alice_device, bob_device] = fixture.credentials();
+    let second_device = DeviceCredential {
+        device_id: generate_id128(),
+        token_sha256: Sha256::digest(BOB_SECOND).into(),
+        ..bob_device
+    };
+    let gateway = fixture
+        .start_with_credentials(
+            OpenMode::Initialize,
+            Limits::default(),
+            "127.0.0.1:0",
+            [alice_device, bob_device, second_device],
+        )
+        .await;
+    let mut alice = login(&gateway, fixture.alice, ALICE).await;
+    let mut bob_socket = login(&gateway, fixture.bob, BOB).await;
+    let initial = scope(&mut bob_socket).await;
+    let dir = tempfile::tempdir().unwrap();
+    let bob = device_client(dir.path(), "bob.db", bob_device).await;
+    let second = device_client(dir.path(), "second.db", second_device).await;
+    let mut wire = gateway.client();
+    assert_eq!(bob.unread_count(&mut wire, BOB, &initial).await.unwrap(), 0);
+
+    let mut second_socket = login(&gateway, second_device.device_id, BOB_SECOND).await;
+    send(&mut alice, 2, key(), "below retention floor").await;
+    send(
+        &mut second_socket,
+        2,
+        key(),
+        "written by the reader's other device",
+    )
+    .await;
+    send(&mut alice, 3, key(), "within retention floor").await;
+    send(&mut alice, 4, key(), "after reading").await;
+    assert_eq!(bob.unread_count(&mut wire, BOB, &initial).await.unwrap(), 3);
+    gateway.service.set_retention_floor(1, 1, 2).await.unwrap();
+    assert_eq!(bob.unread_count(&mut wire, BOB, &initial).await.unwrap(), 2);
+    assert_eq!(
+        second
+            .advance_read_position(&mut gateway.client(), BOB_SECOND, &initial, 3)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(bob.unread_count(&mut wire, BOB, &initial).await.unwrap(), 1);
+
+    let bad_history = ConversationState {
+        history_id: Some(generate_id128().to_vec().into()),
+        ..initial.clone()
+    };
+    assert_error(
+        bob.unread_count(&mut wire, BOB, &bad_history).await,
+        ErrorCode::ContextChanged,
+    );
+    gateway
+        .service
+        .set_member_access(1, 1, 200, false)
+        .await
+        .unwrap();
+    assert_error(
+        bob.unread_count(&mut wire, BOB, &initial).await,
+        ErrorCode::PermissionDenied,
+    );
+    gateway
+        .service
+        .set_member_access(1, 1, 200, true)
+        .await
+        .unwrap();
+    assert_error(
+        bob.unread_count(&mut wire, BOB, &initial).await,
+        ErrorCode::ContextChanged,
+    );
+
+    let renewed = scope(&mut login(&gateway, fixture.bob, BOB).await).await;
+    assert_ne!(initial.access_version, renewed.access_version);
+    assert_eq!(bob.unread_count(&mut wire, BOB, &renewed).await.unwrap(), 2);
+    gateway.stop().await;
+}
