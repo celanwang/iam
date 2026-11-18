@@ -1,5 +1,6 @@
 use super::friend_removal::backfill_friend_generations;
 use super::friends::migrate_friend_attempts;
+use super::group_invites::expire_pending_invite;
 use super::user_blocks::pair_is_blocked;
 use super::*;
 
@@ -21,6 +22,7 @@ impl TidbStore {
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_requests ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_attempts ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS group_creations ")
+                || statement.starts_with("CREATE TABLE IF NOT EXISTS group_invites ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_removals ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS direct_send_blocks ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS user_blocks ")
@@ -112,7 +114,7 @@ impl TidbStore {
         let mut tx = self.pool.begin().await?;
         lock_authority(&mut tx, self.id).await?;
         let conv = conversation_in(&mut tx, tenant, conversation).await?;
-        // Trusted access changes are limited to the original participants.
+        // Trusted access changes are limited to participants who already had access.
         let participant: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM account_events WHERE tenant_id = ? AND user_id = ? AND conversation_id = ? LIMIT 1 FOR UPDATE",
         )
@@ -396,6 +398,20 @@ pub(super) async fn set_access(
     allow: bool,
     initial: bool,
 ) -> Result<()> {
+    if allow && !initial {
+        let members: u64 = sqlx::query_scalar(
+            "SELECT CAST(COUNT(*) AS UNSIGNED)
+             FROM conversations c JOIN members m ON m.tenant_id = c.tenant_id AND m.conversation_id = c.conversation_id
+             WHERE c.tenant_id = ? AND c.conversation_id = ? AND c.kind = 2",
+        )
+        .bind(tenant)
+        .bind(conversation)
+        .fetch_one(&mut **tx)
+        .await?;
+        if members >= iam_protocol::MAX_GROUP_MEMBERS as u64 {
+            return Err(Error::GroupFull);
+        }
+    }
     let upper: Option<u64> = sqlx::query_scalar(
         "SELECT account_sequence FROM account_events WHERE tenant_id = ? AND user_id = ?
          ORDER BY account_sequence DESC LIMIT 1 FOR UPDATE",
@@ -422,6 +438,7 @@ pub(super) async fn set_access(
         .bind(user)
         .execute(&mut **tx)
         .await?;
+        expire_pending_invite(tx, tenant, conversation, user).await?;
     }
     Ok(())
 }

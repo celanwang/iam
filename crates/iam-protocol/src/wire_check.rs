@@ -176,6 +176,7 @@ fn visit(
                                 Some(
                                     "tenant_id"
                                         | "user_id"
+                                        | "inviter_user_id"
                                         | "conversation_id"
                                         | "conversation"
                                         | "sender_id"
@@ -279,6 +280,7 @@ fn optional(message: &str, field: &str) -> bool {
             | ("HistoryPage", "next_page_token")
             | ("ReadPositionAck", "read_through")
             | ("FriendListAck" | "FriendInboxAck", "next_after_user_id")
+            | ("GroupInviteInboxAck", "next_after_conversation_id")
             | ("ProtocolError", "ref_msg_type")
     )
 }

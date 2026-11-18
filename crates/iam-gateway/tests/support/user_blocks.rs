@@ -34,7 +34,7 @@ impl Peer {
         ack.blocked.unwrap()
     }
 
-    async fn set_block(&mut self, peer: u64, blocked: bool) {
+    pub(super) async fn set_block(&mut self, peer: u64, blocked: bool) {
         let reply = self.block_change(peer, generate_id128(), blocked).await;
         changed(reply, blocked);
     }

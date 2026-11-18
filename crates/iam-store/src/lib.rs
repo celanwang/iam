@@ -43,6 +43,16 @@ pub enum Error {
     MembershipUnavailable,
     #[error("the group creation ID is bound to a different member set")]
     GroupKeyConflict,
+    #[error("the group invitation ID is bound to a different conversation or recipient")]
+    GroupInviteKeyConflict,
+    #[error("group invitation not found for this recipient")]
+    GroupInviteNotFound,
+    #[error("another invitation was already pending for this group")]
+    GroupInviteInProgress,
+    #[error("the group invitation belongs to a previous access period")]
+    GroupInviteExpired,
+    #[error("the group has reached its member limit")]
+    GroupFull,
     #[error("the user block change ID is bound to a different target or state")]
     UserBlockKeyConflict,
     #[error("the requested group membership period does not match")]

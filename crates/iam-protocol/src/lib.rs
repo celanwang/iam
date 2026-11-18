@@ -31,3 +31,5 @@ pub const MAX_FRIEND_REQUESTS: usize = 100;
 pub const MAX_GROUP_MEMBERS: usize = 32;
 /// Maximum number of raw member IDs in a GROUP_CREATE request.
 pub const MAX_GROUP_MEMBER_IDS: usize = 64;
+/// Maximum number of invitations returned in one inbox page.
+pub const MAX_GROUP_INVITES: usize = 100;

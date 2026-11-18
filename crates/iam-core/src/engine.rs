@@ -234,7 +234,10 @@ impl Engine {
             | DecodedBody::GroupMemberRemove(_)
             | DecodedBody::FriendStatus(_)
             | DecodedBody::FriendRemove(_)
-            | DecodedBody::UserBlock(_) => {
+            | DecodedBody::UserBlock(_)
+            | DecodedBody::GroupInvite(_)
+            | DecodedBody::GroupInviteInbox(_)
+            | DecodedBody::GroupInviteDecide(_) => {
                 match self.prepare_storage_request(connection_id, frame)? {
                     StorageRequest::Ready(cid) => self.wire_error(
                         frame,

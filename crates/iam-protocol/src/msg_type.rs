@@ -48,6 +48,12 @@ pub enum MsgType {
     GroupMembersAck = 45,
     GroupMemberRemove = 46,
     GroupMemberRemoveAck = 47,
+    GroupInvite = 48,
+    GroupInviteAck = 49,
+    GroupInviteInbox = 50,
+    GroupInviteInboxAck = 51,
+    GroupInviteDecide = 52,
+    GroupInviteDecideAck = 53,
 }
 
 impl MsgType {
@@ -100,6 +106,12 @@ impl MsgType {
             45 => Self::GroupMembersAck,
             46 => Self::GroupMemberRemove,
             47 => Self::GroupMemberRemoveAck,
+            48 => Self::GroupInvite,
+            49 => Self::GroupInviteAck,
+            50 => Self::GroupInviteInbox,
+            51 => Self::GroupInviteInboxAck,
+            52 => Self::GroupInviteDecide,
+            53 => Self::GroupInviteDecideAck,
             _ => return None,
         })
     }
@@ -107,7 +119,11 @@ impl MsgType {
     pub fn allows_empty_body(self) -> bool {
         matches!(
             self,
-            Self::Heartbeat | Self::FriendListAck | Self::FriendInboxAck | Self::ReadPositionAck
+            Self::Heartbeat
+                | Self::FriendListAck
+                | Self::FriendInboxAck
+                | Self::ReadPositionAck
+                | Self::GroupInviteInboxAck
         )
     }
 
@@ -141,6 +157,9 @@ impl MsgType {
                 | Self::FriendStatus
                 | Self::FriendRemove
                 | Self::UserBlock
+                | Self::GroupInvite
+                | Self::GroupInviteInbox
+                | Self::GroupInviteDecide
         )
     }
 }

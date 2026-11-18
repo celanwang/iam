@@ -12,7 +12,9 @@ use crate::pb::{
     UserBlockRequest,
 };
 use crate::pb::{
-    GroupMemberRemoveAck, GroupMemberRemoveRequest, GroupMembersAck, GroupMembersRequest,
+    GroupInviteDecideRequest, GroupInviteInboxAck, GroupInviteInboxRequest, GroupInviteRequest,
+    GroupInviteResultAck, GroupMemberRemoveAck, GroupMemberRemoveRequest, GroupMembersAck,
+    GroupMembersRequest,
 };
 use crate::pb::{ReadPositionAck, ReadPositionRequest};
 use crate::pb::{UnreadCountAck, UnreadCountRequest};
@@ -68,6 +70,12 @@ pub enum DecodedBody {
     FriendRemoveAck(FriendRemoveAck),
     UserBlock(UserBlockRequest),
     UserBlockAck(UserBlockAck),
+    GroupInvite(GroupInviteRequest),
+    GroupInviteAck(GroupInviteResultAck),
+    GroupInviteInbox(GroupInviteInboxRequest),
+    GroupInviteInboxAck(GroupInviteInboxAck),
+    GroupInviteDecide(GroupInviteDecideRequest),
+    GroupInviteDecideAck(GroupInviteResultAck),
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +232,14 @@ fn decode_body_counted(msg_type: MsgType, body: &[u8], fields: &mut usize) -> Re
         MsgType::FriendRemoveAck => DecodedBody::FriendRemoveAck(decode_pb(body, fields)?),
         MsgType::UserBlock => DecodedBody::UserBlock(decode_pb(body, fields)?),
         MsgType::UserBlockAck => DecodedBody::UserBlockAck(decode_pb(body, fields)?),
+        MsgType::GroupInvite => DecodedBody::GroupInvite(decode_pb(body, fields)?),
+        MsgType::GroupInviteAck => DecodedBody::GroupInviteAck(decode_pb(body, fields)?),
+        MsgType::GroupInviteInbox => DecodedBody::GroupInviteInbox(decode_pb(body, fields)?),
+        MsgType::GroupInviteInboxAck => DecodedBody::GroupInviteInboxAck(decode_pb(body, fields)?),
+        MsgType::GroupInviteDecide => DecodedBody::GroupInviteDecide(decode_pb(body, fields)?),
+        MsgType::GroupInviteDecideAck => {
+            DecodedBody::GroupInviteDecideAck(decode_pb(body, fields)?)
+        }
     };
     crate::validate::validate_response(&decoded)?;
     Ok(decoded)
