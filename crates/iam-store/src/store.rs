@@ -12,11 +12,7 @@ use iam_protocol::{
 };
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow};
 use sqlx::{ConnectOptions, MySql, MySqlConnection, MySqlPool, Row, Transaction};
-use std::{
-    collections::{BTreeMap, HashMap},
-    str::FromStr,
-    time::Duration,
-};
+use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -32,7 +28,10 @@ pub(crate) mod perf;
 
 #[path = "membership.rs"]
 mod membership;
-use membership::write_account_event;
+
+#[path = "friends.rs"]
+mod friends;
+use membership::{create_direct_in, mark_friends_ready};
 
 const CLOCK_SQL: &str = "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)";
 
@@ -45,7 +44,7 @@ const CONTROL: &str = "SELECT store_id, token_key, max_observed_now_ms, closed_t
                        FROM store_control WHERE singleton = 1 FOR UPDATE";
 
 const INITIAL_ACCESS: u64 = 1;
-const TABLES: [&str; 7] = [
+const TABLES: [&str; 9] = [
     "store_control",
     "conversations",
     "messages",
@@ -53,6 +52,8 @@ const TABLES: [&str; 7] = [
     "members",
     "account_events",
     "conversation_retention",
+    "direct_pairs",
+    "friend_requests",
 ];
 
 struct DecisionClock {
@@ -185,6 +186,11 @@ impl TidbStore {
             .try_into()
             .map_err(|_| Error::Integrity("invalid token key"))?;
         control_clock(&row)?;
+        if !membership::friends_ready(&mut transaction).await? {
+            return Err(Error::Configuration(
+                "run the offline friends schema upgrade",
+            ));
+        }
         let missing_event: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM members m LEFT JOIN account_events e
              USING (tenant_id, user_id, account_sequence)
@@ -830,20 +836,28 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
         for query in [
             "SELECT tenant_id, user_id, account_sequence, conversation_id, history_id, access_version FROM account_events LIMIT 0",
             "SELECT tenant_id, conversation_id, floor_sequence FROM conversation_retention LIMIT 0",
+            "SELECT friends_ready FROM store_control LIMIT 0",
+            "SELECT tenant_id, user_low, user_high, conversation_id, friends FROM direct_pairs LIMIT 0",
+            "SELECT tenant_id, to_user_id, from_user_id, pending FROM friend_requests FORCE INDEX (pending_incoming) LIMIT 0",
         ] {
             sqlx::query(query).execute(pool).await?;
         }
     }
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT table_name, index_name, column_name FROM information_schema.statistics \
-         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention') \
+         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests') \
          AND non_unique = 0 ORDER BY table_name, index_name, seq_in_index",
     )
     .fetch_all(pool)
     .await?;
     let mut keys = BTreeMap::<_, Vec<_>>::new();
     for (table, index, column) in rows {
-        if legacy_only && matches!(table.as_str(), "account_events" | "conversation_retention") {
+        if legacy_only
+            && matches!(
+                table.as_str(),
+                "account_events" | "conversation_retention" | "direct_pairs" | "friend_requests"
+            )
+        {
             continue;
         }
         keys.entry((table, index)).or_default().push(column);
@@ -855,7 +869,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
         "conversation_id",
         "client_msg_id",
     ];
-    let expected: [(&str, &str, &[&str]); 10] = [
+    let expected: [(&str, &str, &[&str]); 13] = [
         ("store_control", "PRIMARY", &["singleton"]),
         (
             "conversations",
@@ -893,6 +907,21 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
             "conversation_retention",
             "PRIMARY",
             &["tenant_id", "conversation_id"],
+        ),
+        (
+            "direct_pairs",
+            "PRIMARY",
+            &["tenant_id", "user_low", "user_high"],
+        ),
+        (
+            "direct_pairs",
+            "direct_conversation",
+            &["tenant_id", "conversation_id"],
+        ),
+        (
+            "friend_requests",
+            "PRIMARY",
+            &["tenant_id", "to_user_id", "from_user_id"],
         ),
     ];
     let expected = if legacy_only {
@@ -1041,7 +1070,6 @@ async fn initialize(
     }
     let mut conversations = seeds.conversations.values().collect::<Vec<_>>();
     conversations.sort_by_key(|c| (c.tenant_id, c.conversation_id));
-    let mut positions = HashMap::<(u64, u64), u64>::new();
     for conv in conversations {
         if conv.tenant_id == 0
             || conv.conversation_id == 0
@@ -1054,39 +1082,17 @@ async fn initialize(
                 "expected nonzero direct conversation seeds",
             ));
         }
-        sqlx::query(
-            "INSERT INTO conversations (tenant_id, conversation_id, history_id, next_sequence) \
-                     VALUES (?, ?, ?, 1)",
+        let mut members = conv.members.iter().copied();
+        let a = members.next().unwrap();
+        let b = members.next().unwrap();
+        create_direct_in(
+            tx,
+            conv.tenant_id,
+            conv.conversation_id,
+            conv.history_id,
+            [a, b],
         )
-        .bind(conv.tenant_id)
-        .bind(conv.conversation_id)
-        .bind(conv.history_id.as_slice())
-        .execute(&mut **tx)
         .await?;
-        for &user in &conv.members {
-            let position = positions.entry((conv.tenant_id, user)).or_default();
-            *position += 1;
-            sqlx::query(
-                "INSERT INTO members (tenant_id, user_id, conversation_id, account_sequence) \
-                         VALUES (?, ?, ?, ?)",
-            )
-            .bind(conv.tenant_id)
-            .bind(user)
-            .bind(conv.conversation_id)
-            .bind(*position)
-            .execute(&mut **tx)
-            .await?;
-            write_account_event(
-                tx,
-                conv.tenant_id,
-                user,
-                *position,
-                conv.conversation_id,
-                conv.history_id,
-                Some(INITIAL_ACCESS),
-            )
-            .await?;
-        }
     }
-    Ok(())
+    mark_friends_ready(tx).await
 }

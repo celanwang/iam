@@ -1,25 +1,35 @@
 use super::*;
 
 impl TidbStore {
-    /// Upgrade a stopped pre-account-stream store, retaining all existing cursor positions.
+    /// Upgrade a stopped store, retaining all existing cursor positions.
     pub async fn upgrade(url: &str, id: Id128) -> Result<()> {
         let pool = connect_pool(url).await?;
         reject_legacy_names(&pool).await?;
         check_schema(&pool, true).await?;
         let mut tx = pool.begin().await?;
         lock_authority(&mut tx, id).await?;
-        tx.commit().await?;
+        finish(tx, Ok(())).await?;
 
         for statement in include_str!("../schema.sql").split(';').map(str::trim) {
             if statement.starts_with("CREATE TABLE IF NOT EXISTS account_events ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS conversation_retention ")
+                || statement.starts_with("CREATE TABLE IF NOT EXISTS direct_pairs ")
+                || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_requests ")
             {
                 sqlx::query(statement).execute(&pool).await?;
             }
         }
+        sqlx::query(
+            "ALTER TABLE store_control ADD COLUMN IF NOT EXISTS friends_ready TINYINT UNSIGNED NOT NULL DEFAULT 0",
+        )
+        .execute(&pool)
+        .await?;
         check_schema(&pool, false).await?;
         let mut tx = pool.begin().await?;
         lock_authority(&mut tx, id).await?;
+        if friends_ready(&mut tx).await? {
+            return finish(tx, Ok(())).await;
+        }
         sqlx::query(
             "INSERT INTO account_events
              (tenant_id, user_id, account_sequence, conversation_id, history_id, access_version)
@@ -32,6 +42,7 @@ impl TidbStore {
         )
         .execute(&mut *tx)
         .await?;
+        mark_friends_ready(&mut tx).await?;
         finish(tx, Ok(())).await
     }
 
@@ -47,16 +58,18 @@ impl TidbStore {
         }
         let mut tx = self.pool.begin().await?;
         lock_authority(&mut tx, self.id).await?;
-        let epoch = generate_id128();
-        sqlx::query("INSERT INTO conversations VALUES (?, ?, ?, 1)")
-            .bind(tenant)
-            .bind(conversation)
-            .bind(epoch.as_slice())
-            .execute(&mut *tx)
-            .await?;
-        for user in [a, b] {
-            set_access(&mut tx, tenant, conversation, user, epoch, true, true).await?;
+        let pair = ordered_pair(a, b);
+        if let Some((existing, _)) = direct_pair(&mut tx, tenant, pair).await? {
+            return if conversation == existing {
+                finish(tx, Ok(())).await
+            } else {
+                Err(Error::InvalidRequest(
+                    "pair already has a direct conversation",
+                ))
+            };
         }
+        create_direct_in(&mut tx, tenant, conversation, generate_id128(), pair).await?;
+        insert_direct_pair(&mut tx, tenant, pair, conversation, false).await?;
         finish(tx, Ok(())).await
     }
 
@@ -72,14 +85,14 @@ impl TidbStore {
         let conv = conversation_in(&mut tx, tenant, conversation).await?;
         // Only the original two participants may ever be granted access.
         let participant: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM account_events WHERE tenant_id = ? AND user_id = ? AND conversation_id = ? LIMIT 1",
+            "SELECT 1 FROM account_events WHERE tenant_id = ? AND user_id = ? AND conversation_id = ? LIMIT 1 FOR UPDATE",
         )
         .bind(tenant).bind(user).bind(conversation).fetch_optional(&mut *tx).await?;
         if participant.is_none() {
             return Err(Error::InvalidRequest("user is not a participant"));
         }
         let active: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM members WHERE tenant_id = ? AND conversation_id = ? AND user_id = ?",
+            "SELECT 1 FROM members WHERE tenant_id = ? AND conversation_id = ? AND user_id = ? FOR UPDATE",
         )
         .bind(tenant)
         .bind(conversation)
@@ -132,10 +145,103 @@ impl TidbStore {
     }
 }
 
-async fn lock_authority(tx: &mut Transaction<'_, MySql>, id: Id128) -> Result<()> {
+pub(super) async fn lock_authority(tx: &mut Transaction<'_, MySql>, id: Id128) -> Result<()> {
     let row = sqlx::query(CONTROL).fetch_one(&mut **tx).await?;
     check_store_id(&row, id)?;
     control_clock(&row)?;
+    Ok(())
+}
+
+pub(super) fn ordered_pair(a: u64, b: u64) -> [u64; 2] {
+    [a.min(b), a.max(b)]
+}
+
+pub(super) async fn direct_pair(
+    db: &mut MySqlConnection,
+    tenant: u64,
+    [low, high]: [u64; 2],
+) -> Result<Option<(u64, bool)>> {
+    Ok(sqlx::query_as(
+        "SELECT conversation_id, friends FROM direct_pairs WHERE tenant_id = ? AND user_low = ? AND user_high = ? FOR UPDATE",
+    )
+    .bind(tenant).bind(low).bind(high).fetch_optional(db).await?)
+}
+
+pub(super) async fn insert_direct_pair(
+    db: &mut MySqlConnection,
+    tenant: u64,
+    [low, high]: [u64; 2],
+    conversation: u64,
+    friends: bool,
+) -> Result<()> {
+    sqlx::query("INSERT INTO direct_pairs VALUES (?, ?, ?, ?, ?)")
+        .bind(tenant)
+        .bind(low)
+        .bind(high)
+        .bind(conversation)
+        .bind(friends)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn create_direct_in(
+    tx: &mut Transaction<'_, MySql>,
+    tenant: u64,
+    conversation: u64,
+    epoch: Id128,
+    participants: [u64; 2],
+) -> Result<()> {
+    sqlx::query("INSERT INTO conversations VALUES (?, ?, ?, 1)")
+        .bind(tenant)
+        .bind(conversation)
+        .bind(epoch.as_slice())
+        .execute(&mut **tx)
+        .await?;
+    for user in participants {
+        set_access(tx, tenant, conversation, user, epoch, true, true).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn friends_ready(db: &mut MySqlConnection) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar::<_, u8>("SELECT friends_ready FROM store_control WHERE singleton = 1")
+            .fetch_one(db)
+            .await?
+            == 1,
+    )
+}
+
+pub(super) async fn mark_friends_ready(tx: &mut Transaction<'_, MySql>) -> Result<()> {
+    let invalid: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM conversations c LEFT JOIN account_events e USING (tenant_id, conversation_id)
+         GROUP BY c.tenant_id, c.conversation_id
+         HAVING COUNT(DISTINCT e.user_id) <> 2 OR MIN(e.user_id) = 0 LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    if invalid.is_some() {
+        return Err(Error::Integrity(
+            "direct conversation must have two original participants",
+        ));
+    }
+    // Include revoked participants and select one canonical ID for legacy duplicate pairs.
+    sqlx::query(
+        "INSERT INTO direct_pairs (tenant_id, user_low, user_high, conversation_id, friends)
+         SELECT tenant_id, user_low, user_high, MIN(conversation_id), FALSE
+         FROM (
+             SELECT tenant_id, MIN(user_id) AS user_low, MAX(user_id) AS user_high, conversation_id
+             FROM account_events GROUP BY tenant_id, conversation_id
+         ) AS participants
+         JOIN conversations USING (tenant_id, conversation_id)
+         GROUP BY tenant_id, user_low, user_high",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE store_control SET friends_ready = 1 WHERE singleton = 1")
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -160,8 +266,16 @@ async fn set_access(
     allow: bool,
     initial: bool,
 ) -> Result<()> {
-    let position = account_upper(tx, tenant, user)
-        .await?
+    let upper: Option<u64> = sqlx::query_scalar(
+        "SELECT account_sequence FROM account_events WHERE tenant_id = ? AND user_id = ?
+         ORDER BY account_sequence DESC LIMIT 1 FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(user)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let position = upper
+        .unwrap_or(0)
         .checked_add(1)
         .ok_or(Error::SequenceExhausted)?;
     let version = allow.then_some(if initial { INITIAL_ACCESS } else { position });
@@ -182,7 +296,7 @@ async fn set_access(
     Ok(())
 }
 
-pub(super) async fn write_account_event(
+async fn write_account_event(
     tx: &mut Transaction<'_, MySql>,
     tenant: u64,
     user: u64,

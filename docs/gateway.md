@@ -22,7 +22,9 @@ IAM_STORE_ID=018bcfe5680070008000000000000002 IAM_TIDB_MODE=resume \
 cargo run -p iam-gateway
 ```
 
-`resume` 使用已初始化的同一 TiDB 库和存储 ID。新库用 `fresh` 初始化，部署方通过 `TidbService::create_direct` 预置会话，或接入已配置会话的本机库。客户端使用 `iam_client::TlsTransport` 并提供信任根和预期证书名称。外部身份提供方属于后续接入。
+`resume` 使用已初始化的同一 TiDB 库和存储 ID。新库用 `fresh` 初始化。已有库先执行[离线升级](./storage.md#持久状态)再启动新版网关。客户端使用 `iam_client::TlsTransport` 并提供信任根和预期证书名称。
+
+网关将当前设备凭证配置中的租户和用户作为账号目录。首次好友申请要求目标用户出现在同一租户的配置中，申请和接受重试以数据库中的持久状态为准。应用通过 `Client::request_friend`、`Client::incoming_friend_requests`、`Client::accept_friend` 完成申请、查询和接受。每个调用打开新连接并认证，同设备应串行调用，并在调用期间暂停同一设备的 `Client::run`，以免触发会话接管。接受后，`Client::run` 从账号同步发现单聊，并通过现有持久发送队列和消息同步收发文本。
 
 在 Unix 上，更新证书链、私钥和设备凭证文件后，向实际运行的 `iam-gateway` 进程发送 `SIGHUP`。网关校验整批配置，成功后新握手使用新证书。凭证删除、轮换或修改到期时间会关闭对应设备的连接并作废旧恢复票据。凭证相同的设备继续使用当前连接。空凭证文件撤销所有设备。文件读取、解析或证书与私钥配对失败时，网关记下错误并继续使用上一次配置。
 

@@ -20,6 +20,12 @@ pub enum MsgType {
     SnapshotAck = 17,
     History = 18,
     HistoryAck = 19,
+    FriendRequest = 20,
+    FriendRequestAck = 21,
+    FriendList = 22,
+    FriendListAck = 23,
+    FriendAccept = 24,
+    FriendAcceptAck = 25,
 }
 
 impl MsgType {
@@ -44,12 +50,18 @@ impl MsgType {
             17 => Self::SnapshotAck,
             18 => Self::History,
             19 => Self::HistoryAck,
+            20 => Self::FriendRequest,
+            21 => Self::FriendRequestAck,
+            22 => Self::FriendList,
+            23 => Self::FriendListAck,
+            24 => Self::FriendAccept,
+            25 => Self::FriendAcceptAck,
             _ => return None,
         })
     }
 
     pub fn allows_empty_body(self) -> bool {
-        matches!(self, Self::Heartbeat)
+        matches!(self, Self::Heartbeat | Self::FriendListAck)
     }
 
     pub fn allows_zero_req_id(self) -> bool {
@@ -68,6 +80,9 @@ impl MsgType {
                 | Self::SendStatus
                 | Self::Snapshot
                 | Self::History
+                | Self::FriendRequest
+                | Self::FriendList
+                | Self::FriendAccept
         )
     }
 }

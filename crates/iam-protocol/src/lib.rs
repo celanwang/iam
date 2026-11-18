@@ -25,3 +25,5 @@ pub use wire::{
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/iam.protocol.rs"));
 }
+/// Maximum number of pending applicants returned by one FRIEND_LIST request.
+pub const MAX_FRIEND_REQUESTS: usize = 100;

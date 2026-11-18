@@ -2,10 +2,11 @@ use crate::error::{ProtocolErrorKind, Result};
 use crate::frame::{FixedHeader, Frame, HEADER_LEN};
 use crate::msg_type::MsgType;
 use crate::pb::{
-    AuthRequest, AuthResponse, Head, HeartbeatAck, HeartbeatRequest, HistoryRequest,
-    HistoryResponse, ProtocolError, Push, PushAck, ReconnectRequest, ReconnectResponse,
-    SendRequest, SendResponse, SendStatusRequest, SendStatusResponse, SnapshotRequest,
-    SnapshotResponse, SyncRequest, SyncResponse,
+    AuthRequest, AuthResponse, FriendAcceptAck, FriendAcceptRequest, FriendListAck,
+    FriendListRequest, FriendRequest, FriendRequestAck, Head, HeartbeatAck, HeartbeatRequest,
+    HistoryRequest, HistoryResponse, ProtocolError, Push, PushAck, ReconnectRequest,
+    ReconnectResponse, SendRequest, SendResponse, SendStatusRequest, SendStatusResponse,
+    SnapshotRequest, SnapshotResponse, SyncRequest, SyncResponse,
 };
 use crate::validate::validate_head;
 use prost::Message;
@@ -31,6 +32,12 @@ pub enum DecodedBody {
     SnapshotAck(SnapshotResponse),
     History(HistoryRequest),
     HistoryAck(HistoryResponse),
+    FriendRequest(FriendRequest),
+    FriendRequestAck(FriendRequestAck),
+    FriendList(FriendListRequest),
+    FriendListAck(FriendListAck),
+    FriendAccept(FriendAcceptRequest),
+    FriendAcceptAck(FriendAcceptAck),
 }
 
 #[derive(Debug, Clone)]
@@ -134,10 +141,7 @@ pub fn decode_body(msg_type: MsgType, body: &[u8]) -> Result<DecodedBody> {
 }
 
 fn decode_body_counted(msg_type: MsgType, body: &[u8], fields: &mut usize) -> Result<DecodedBody> {
-    if body.is_empty() {
-        if msg_type.allows_empty_body() {
-            return Ok(DecodedBody::Heartbeat(HeartbeatRequest {}));
-        }
+    if body.is_empty() && !msg_type.allows_empty_body() {
         return Err(ProtocolErrorKind::InvalidArgument("empty body"));
     }
     let decoded = match msg_type {
@@ -160,6 +164,12 @@ fn decode_body_counted(msg_type: MsgType, body: &[u8], fields: &mut usize) -> Re
         MsgType::SnapshotAck => DecodedBody::SnapshotAck(decode_pb(body, fields)?),
         MsgType::History => DecodedBody::History(decode_pb(body, fields)?),
         MsgType::HistoryAck => DecodedBody::HistoryAck(decode_pb(body, fields)?),
+        MsgType::FriendRequest => DecodedBody::FriendRequest(decode_pb(body, fields)?),
+        MsgType::FriendRequestAck => DecodedBody::FriendRequestAck(decode_pb(body, fields)?),
+        MsgType::FriendList => DecodedBody::FriendList(decode_pb(body, fields)?),
+        MsgType::FriendListAck => DecodedBody::FriendListAck(decode_pb(body, fields)?),
+        MsgType::FriendAccept => DecodedBody::FriendAccept(decode_pb(body, fields)?),
+        MsgType::FriendAcceptAck => DecodedBody::FriendAcceptAck(decode_pb(body, fields)?),
     };
     crate::validate::validate_response(&decoded)?;
     Ok(decoded)
@@ -178,7 +188,7 @@ pub fn decode_frame(frame: &Frame) -> Result<DecodedFrame> {
     if frame.header.body_len == 0 && !msg_type.allows_empty_body() {
         return Err(ProtocolErrorKind::InvalidArgument("empty body"));
     }
-    if msg_type.allows_empty_body() && frame.header.body_len != 0 {
+    if msg_type == MsgType::Heartbeat && frame.header.body_len != 0 {
         return Err(ProtocolErrorKind::InvalidArgument(
             "heartbeat body must be empty",
         ));
@@ -210,7 +220,7 @@ pub fn encode_frame(msg_type: MsgType, head: &Head, body: &impl Message) -> Resu
         buf
     };
     let mut body_bytes = Vec::new();
-    if !msg_type.allows_empty_body() {
+    if msg_type != MsgType::Heartbeat {
         body.encode(&mut body_bytes)
             .map_err(|e| ProtocolErrorKind::Decode(e.to_string()))?;
     }

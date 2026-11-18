@@ -14,6 +14,11 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Authenticated friend requests, paginated incoming requests, and acceptance
+  over TCP + TLS, with durable retries and a shared direct conversation
+  discovered through account sync.
+- An offline TiDB upgrade that maps existing direct conversations to canonical
+  account pairs while preserving conversation IDs, access, and cursors.
 - TiDB-backed history pagination and durable client backfill after a sync
   cursor expires, including ranges below the retention floor.
 - Durable account changes for direct conversations and access changes, with

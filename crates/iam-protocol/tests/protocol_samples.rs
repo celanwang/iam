@@ -153,6 +153,70 @@ fn raw_body(kind: MsgType, body: &[u8]) -> iam_protocol::Result<iam_protocol::De
 }
 
 #[test]
+fn friend_wire_commands_and_empty_pending_list() {
+    use iam_protocol::pb::*;
+    use iam_protocol::{encode_frame, DecodedBody};
+
+    let head = Head { req_id: Some(1) };
+    let bytes = encode_frame(
+        MsgType::FriendRequest,
+        &head,
+        &FriendRequest {
+            target_user_id: Some(42),
+        },
+    )
+    .unwrap();
+    assert_eq!(hex::encode(bytes), "0114000000000002000000020801082a");
+
+    let page = FriendListAck {
+        from_user_ids: vec![],
+        next_after_user_id: None,
+    };
+    let bytes = encode_frame(MsgType::FriendListAck, &head, &page).unwrap();
+    assert_eq!(hex::encode(&bytes), "0117000000000002000000000801");
+    let mut decoder = FrameDecoder::new();
+    decoder.push(&bytes);
+    let frame = decoder.next_frame().unwrap().unwrap();
+    assert!(
+        matches!(decode_frame(&frame).unwrap().body, DecodedBody::FriendListAck(ack) if ack == page)
+    );
+    assert!(!MsgType::FriendListAck.is_client_to_server());
+
+    assert!(matches!(
+        raw_body(MsgType::FriendList, &[8, 0]).unwrap(),
+        DecodedBody::FriendList(FriendListRequest {
+            after_user_id: Some(0)
+        })
+    ));
+    assert!(matches!(
+        raw_body(MsgType::FriendRequestAck, &[10, 0]).unwrap(),
+        DecodedBody::FriendRequestAck(FriendRequestAck {
+            value: Some(friend_request_ack::Value::Pending(_)),
+        })
+    ));
+    assert!(matches!(
+        raw_body(MsgType::FriendAcceptAck, &[8, 42]).unwrap(),
+        DecodedBody::FriendAcceptAck(FriendAcceptAck {
+            conversation_id: Some(42)
+        })
+    ));
+}
+
+#[test]
+fn friend_wire_rejects_conflicting_fields_and_invalid_results() {
+    for (kind, body) in [
+        (MsgType::FriendRequest, &[8, 1, 8, 2][..]),
+        (MsgType::FriendRequestAck, &[10, 0, 16, 42]),
+        (MsgType::FriendRequestAck, &[16, 0]),
+        (MsgType::FriendListAck, &[8, 2, 8, 1]),
+        (MsgType::FriendListAck, &[8, 1, 16, 1]),
+        (MsgType::FriendAcceptAck, &[8, 0]),
+    ] {
+        assert!(raw_body(kind, body).is_err(), "{kind:?} {body:?}");
+    }
+}
+
+#[test]
 fn recursive_wire_validation_rejects_duplicates_and_multiple_branches() {
     // Duplicate SendRequest.key and nested MessageKey.conversation_id.
     for body in [&[0x0a, 0, 0x0a, 0][..], &[0x0a, 4, 8, 1, 8, 1][..]] {

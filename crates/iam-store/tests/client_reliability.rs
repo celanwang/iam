@@ -1205,7 +1205,18 @@ async fn tidb_client_recovers_long_offline_history_after_restart_and_token_expir
 #[tokio::test]
 #[ignore = "requires real local TiDB"]
 async fn tidb_client_discovers_a_new_conversation_and_applies_membership_changes() {
-    let service = server().await;
+    let database = support::isolated_database().await;
+    let mut engine = Engine::new(0);
+    engine.store.seed_user(1, 100, b"alice".to_vec());
+    engine.store.seed_user(1, 200, b"bob".to_vec());
+    engine.store.seed_direct(1, 1, 200, 300);
+    let service = open_server(
+        database.as_str(),
+        generate_id128(),
+        engine,
+        OpenMode::Initialize,
+    )
+    .await;
     let mut alice = sender(&service).await;
     let dir = tempfile::tempdir().unwrap();
     let device = identity(200);
