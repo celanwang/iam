@@ -19,8 +19,9 @@ tokio-rustls.workspace = true
 
 [dev-dependencies]
 iam-client = { path = "../iam-client" }
-rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 sha2.workspace = true
 sqlx = { version = "=0.8.6", default-features = false, features = ["mysql", "runtime-tokio-rustls"] }
 tempfile = "3"
+tokio = { version = "1", features = ["process"] }
 url = "2"
