@@ -109,6 +109,8 @@ cargo test -p iam-store --lib tidb_unread_count_uses_bounded_message_index -- --
 
 ## 本机控制台与验证
 
+冒烟和完整回归通过[统一真实 TiDB 验收入口](../CONTRIBUTING.md#checks)运行。每次启动独立的 TiDB、TiKV 和 PD，测试结束后清理。下面的本机控制台和 Cargo 命令可用于调试单个用例。
+
 [`iam-tidb-text`](../crates/iam-store/src/bin/iam-tidb-text.rs) 通过 `TidbService` 处理认证、发送和查询。会话在首次初始化时写入，`init` 查看现有会话位置。`page` 在检查成员权限后按创建序读取同一张消息表。
 
 组件只接受 loopback TCP URL，逐连接要求 `tidb_version()` 成功，不把 MySQL 兼容性当作 TiDB 验证。以下仅供全新本机试验库使用：

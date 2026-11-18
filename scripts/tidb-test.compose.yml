@@ -1,0 +1,50 @@
+services:
+  pd:
+    image: pingcap/pd:v8.5.7
+    configs:
+      - source: pd
+        target: /etc/pd/pd.toml
+    command:
+      - --name=pd
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://pd:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+      - --data-dir=/data/pd
+      - --config=/etc/pd/pd.toml
+
+  tikv:
+    image: pingcap/tikv:v8.5.7
+    depends_on: [pd]
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --data-dir=/data/tikv
+      - --pd=pd:2379
+
+  tidb:
+    image: pingcap/tidb:v8.5.7
+    depends_on: [tikv]
+    ports: ["127.0.0.1::4000"]
+    command:
+      - --store=tikv
+      - --path=pd:2379
+      - --host=0.0.0.0
+      - --advertise-address=tidb
+
+  bootstrap:
+    image: mysql:8.0.40
+    entrypoint: [timeout, "120", /bin/sh, -ec]
+    command:
+      - |
+        until timeout 4 mysql --protocol=TCP --host=tidb --port=4000 --user=root --batch \
+          --execute='SELECT tidb_version(); CREATE DATABASE IF NOT EXISTS iam_test'; do
+          sleep 1
+        done
+
+configs:
+  pd:
+    content: |
+      [replication]
+      max-replicas = 1
