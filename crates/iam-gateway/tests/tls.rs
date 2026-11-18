@@ -5,6 +5,8 @@ mod capacity;
 mod commit_proxy;
 #[path = "support/friends.rs"]
 mod friends;
+#[path = "support/read_position.rs"]
+mod read_position;
 #[path = "../../iam-store/tests/support/mod.rs"]
 mod support;
 

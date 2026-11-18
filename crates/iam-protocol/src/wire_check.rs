@@ -40,7 +40,7 @@ pub(crate) fn check(name: &str, bytes: &[u8], total: &mut usize) -> Result<()> {
         bytes,
         1,
         total,
-        name.ends_with(".SendRequest"),
+        name.ends_with(".SendRequest") || name.ends_with(".ReadPositionRequest"),
         response,
     )
 }
@@ -273,6 +273,7 @@ fn optional(message: &str, field: &str) -> bool {
                 "history_window" | "next_page_token" | "resume_cursor"
             )
             | ("HistoryPage", "next_page_token")
+            | ("ReadPositionAck", "read_through")
             | ("FriendListAck" | "FriendInboxAck", "next_after_user_id")
             | ("ProtocolError", "ref_msg_type")
     )

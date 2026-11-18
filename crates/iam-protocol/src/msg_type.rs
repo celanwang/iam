@@ -34,6 +34,8 @@ pub enum MsgType {
     FriendDecideAck = 31,
     GroupCreate = 32,
     GroupCreateAck = 33,
+    ReadPosition = 34,
+    ReadPositionAck = 35,
 }
 
 impl MsgType {
@@ -72,6 +74,8 @@ impl MsgType {
             31 => Self::FriendDecideAck,
             32 => Self::GroupCreate,
             33 => Self::GroupCreateAck,
+            34 => Self::ReadPosition,
+            35 => Self::ReadPositionAck,
             _ => return None,
         })
     }
@@ -79,7 +83,7 @@ impl MsgType {
     pub fn allows_empty_body(self) -> bool {
         matches!(
             self,
-            Self::Heartbeat | Self::FriendListAck | Self::FriendInboxAck
+            Self::Heartbeat | Self::FriendListAck | Self::FriendInboxAck | Self::ReadPositionAck
         )
     }
 
@@ -99,6 +103,7 @@ impl MsgType {
                 | Self::SendStatus
                 | Self::Snapshot
                 | Self::History
+                | Self::ReadPosition
                 | Self::FriendRequest
                 | Self::FriendList
                 | Self::FriendAccept

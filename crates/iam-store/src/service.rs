@@ -19,6 +19,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[path = "read_position_service.rs"]
+mod read_position;
+
 #[derive(Clone, Copy, Debug)]
 pub enum OpenMode {
     /// Creates a fresh authority using the Engine's seeded conversations.
@@ -369,6 +372,9 @@ impl TidbService {
                     MsgType::HistoryAck,
                     &HistoryResponse { value: Some(value) },
                 )
+            }
+            DecodedBody::ReadPosition(req) => {
+                self.read_position(cid, identity, &decoded, req).await
             }
             DecodedBody::FriendRequest(req) => {
                 let Some(target) = req.target_user_id else {

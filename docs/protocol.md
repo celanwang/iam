@@ -75,7 +75,7 @@ Head {
 
 需要应答的请求必须显式携带非 0 的 `req_id`，按实际写入连接的顺序严格递增，发送队列在确定写入顺序时分配请求号。响应可以乱序返回，但必须回显原请求号；重试使用新请求号，逻辑消息身份不变。`PUSH`、`PUSH_ACK` 和无法关联请求的连接错误使用 0，不更新请求号水位；只有这些场景允许 `head_len = 0`。
 
-`Body` 根据 `msg_type` 解码为唯一指定结构。`HEARTBEAT` 的 `body_len` 必须为 0。没有待接受申请时，`FRIEND_LIST_ACK` 和 `FRIEND_INBOX_ACK` 也使用空消息体。其他命令必须满足字段校验。线格式错误与业务错误分别按后文错误路由处理，不能仅凭解码成功就进入业务流程。
+`Body` 根据 `msg_type` 解码为唯一指定结构。`HEARTBEAT` 的 `body_len` 必须为 0。没有待接受申请时，`FRIEND_LIST_ACK` 和 `FRIEND_INBOX_ACK` 使用空消息体。当前范围尚无阅读位置时，`READ_POSITION_ACK` 使用空消息体。其他命令必须满足字段校验。线格式错误与业务错误分别按后文错误路由处理，不能仅凭解码成功就进入业务流程。
 
 固定头的 `version` 用于校验帧与命令的兼容性，认证体不重复携带该信息。遇到不支持的版本或标志位时停止解码；可安全响应时返回协议错误，然后关闭连接。压缩扩展需要明确算法、压缩范围和解压后上限。
 
@@ -101,9 +101,10 @@ Head {
 28 FRIEND_INBOX   FriendInboxRequest  -> 29 FRIEND_INBOX_ACK  FriendInboxAck
 30 FRIEND_DECIDE  FriendDecideRequest -> 31 FRIEND_DECIDE_ACK FriendAttemptAck
 32 GROUP_CREATE   GroupCreateRequest  -> 33 GROUP_CREATE_ACK   GroupCreateAck
+34 READ_POSITION  ReadPositionRequest -> 35 READ_POSITION_ACK ReadPositionAck
 ```
 
-`PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友和群创建命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
+`PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友、群创建和阅读位置命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
 
 命令方向错误、请求号未递增或需要应答的请求号为 0，属于协议错误，返回错误后关闭连接。未认证的业务请求返回 `UNAUTHENTICATED`，不改变认证状态，也不构成该逻辑发送的最终拒绝。
 
@@ -669,6 +670,27 @@ HistoryResponse = oneof {
 `GROUP_CREATE_ACK` 的 `conversation_id`（字段 1）在事务提交后返回。已成功创建的 ID 在同租户、同创建者下绑定原成员集合，换设备或重连重试返回原会话 ID。这个结果独立于后来发生的访问权限变化。同键更改成员集合返回 `IDEMPOTENCY_CONFLICT`。创建 ID 缺失或格式错误、原始成员项超限，以及首次创建时成员集合不合法，返回 `INVALID_ARGUMENT`。提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`，客户端以新帧请求号和原创建 ID 重试。
 
 本轮的群成员在创建时确定。后续版本处理邀请、群管理和群成员变更。
+
+## 阅读位置
+
+```text
+ReadPositionRequest {
+  conversation_id: uint64 = 1
+  history_id: bytes[16] = 2
+  access_version: uint64 = 3
+  read_through: uint64? = 4
+}
+
+ReadPositionAck {
+  read_through: uint64? = 1
+}
+```
+
+`READ_POSITION` 在 TiDB 服务中处理，按认证会话的租户和用户定位自己的阅读位置。请求使用已同步的会话 ID、UUIDv7 历史代次和访问版本。省略 `read_through` 时查询当前位置，本成员周期和历史内尚无位置时返回空应答体。提交必须提供正的消息创建序，且不能超过该会话已提交的最大创建序。
+
+同一用户的设备共享本成员周期和历史内的位置。提交后返回原位置与提交位置的较大值，旧位置重试不会回退。如果提交应答丢失，可以用相同会话状态和位置重新提交。服务端在 TiDB 提交完成后才返回成功应答。
+
+读写均检查当前成员权限。无权限返回 `ERROR / PERMISSION_DENIED / NONE`。当前成员的历史代次或访问版本不匹配时，返回 `CONTEXT_CHANGED / RESTART_SYNC`。再授权或历史换代后须同步新状态，新范围从空位置开始。无效字段或超过上界返回 `INVALID_ARGUMENT / NONE`，未知请求字段返回 `UNSUPPORTED_CONTENT / NONE`。无法确认结果时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`。
 
 ## 错误路由与连接处理
 

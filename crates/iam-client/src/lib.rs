@@ -3,6 +3,7 @@
 mod friends;
 mod groups;
 mod history;
+mod read_position;
 mod storage;
 mod sync;
 mod tls;

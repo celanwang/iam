@@ -57,6 +57,9 @@ pub(crate) fn validate_response(body: &crate::DecodedBody) -> Result<()> {
     use crate::pb::*;
     use crate::DecodedBody as B;
     match body {
+        B::ReadPositionAck(ack) if ack.read_through == Some(0) => {
+            return invalid("zero read position");
+        }
         B::FriendListAck(page) => {
             validate_friend_page(page.from_user_ids.iter().copied(), page.next_after_user_id)?;
         }
