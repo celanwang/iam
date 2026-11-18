@@ -788,3 +788,137 @@ async fn tidb_tls_group_invites_pending_key_cannot_grant_access_after_an_interve
     );
     gateway.stop().await;
 }
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_tls_group_invites_rejoin_after_public_leave_and_owner_removal() {
+    let f = InviteFixture::new().await;
+    let gateway = f.start(OpenMode::Initialize, &[]).await;
+    let db = f.db().await;
+    let (mut writer, _, group) = f.create(&gateway).await;
+    let prior = writer
+        .send(&message_key(group), "before all memberships")
+        .await;
+    committed(&prior, 1);
+    drop(writer);
+    let disk = tempfile::tempdir().unwrap();
+    let owner = open_client(&disk.path().join("owner.db"), f.group.base.credentials()[0]).await;
+    let guest = open_client(&disk.path().join("guest.db"), f.guest).await;
+    let mut saved_leave = None;
+    let mut saved_removal = None;
+    for version in [2, 4, 6] {
+        let key = generate_id128();
+        assert_eq!(
+            owner
+                .invite_group_member(&mut gateway.client(), ALICE, group, 400, key)
+                .await
+                .unwrap()
+                .value,
+            Some(PENDING)
+        );
+        assert_eq!(
+            guest
+                .decide_group_invite(&mut gateway.client(), GUEST, group, key, true)
+                .await
+                .unwrap()
+                .value,
+            Some(Outcome::ConversationId(group))
+        );
+        let roster = guest
+            .group_members(&mut gateway.client(), GUEST, group)
+            .await
+            .unwrap();
+        let member = *roster
+            .members
+            .iter()
+            .find(|m| m.user_id == Some(400))
+            .unwrap();
+        assert_eq!(member.access_version, Some(version));
+        if version == 6 {
+            break;
+        }
+        if version == 2 {
+            let path = disk.path().join("guest-tablet.db");
+            let mut tablet = open_client(&path, f.tablet).await;
+            let mut observer = observe(&path).await;
+            let mut wire = ObservedTls::new(&gateway);
+            sync_through(
+                &mut tablet,
+                &mut wire,
+                &mut observer,
+                SECOND_DEVICE,
+                group,
+                1,
+            )
+            .await;
+            drop(wire);
+            let state = tablet
+                .list_conversations(0, 10)
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|summary| summary.state.conversation_id == Some(group))
+                .unwrap()
+                .state;
+            assert_eq!(state.access_version, member.access_version);
+            tablet
+                .leave_group(&mut gateway.client(), SECOND_DEVICE, &state)
+                .await
+                .unwrap();
+            saved_leave = Some(state);
+        } else {
+            owner
+                .remove_group_member(&mut gateway.client(), ALICE, &roster, &member)
+                .await
+                .unwrap();
+            saved_removal = Some((roster, member));
+        }
+        assert_eq!(
+            guest
+                .decide_group_invite(&mut gateway.client(), GUEST, group, key, true)
+                .await
+                .unwrap()
+                .value,
+            Some(Outcome::ConversationId(group))
+        );
+        assert_eq!(
+            owner
+                .invite_group_member(&mut gateway.client(), ALICE, group, 400, key)
+                .await
+                .unwrap()
+                .value,
+            Some(Outcome::ConversationId(group))
+        );
+        assert!(membership(&db, group, 400).await.0.is_none());
+        let mut outside = Peer::open(&gateway, f.guest.device_id, GUEST).await;
+        denied(&outside.send(&message_key(group), "outside group").await);
+    }
+    // Both old commands replay their completed departure, including from another device.
+    guest
+        .leave_group(&mut gateway.client(), GUEST, &saved_leave.unwrap())
+        .await
+        .unwrap();
+    let (roster, member) = saved_removal.unwrap();
+    owner
+        .remove_group_member(&mut gateway.client(), ALICE, &roster, &member)
+        .await
+        .unwrap();
+    assert_eq!(
+        membership(&db, group, 400).await,
+        (Some(6), vec![Some(2), None, Some(4), None, Some(6)])
+    );
+    let mut reader = Peer::open(&gateway, f.guest.device_id, GUEST).await;
+    let mut writer = Peer::open(&gateway, f.group.base.alice, ALICE).await;
+    committed(&writer.send(&message_key(group), "after rejoin").await, 2);
+    let context = reader.push_context(group).await;
+    assert_eq!(context.access_version, Some(6));
+    let history = reader.history(&context).await;
+    assert_eq!(history.len(), 2);
+    let old = history
+        .into_iter()
+        .find(|view| view.position.as_ref().unwrap().create_seq == Some(1))
+        .unwrap();
+    super::super::removal::assert_only_message(&[old], &prior);
+    gateway.stop().await;
+}
