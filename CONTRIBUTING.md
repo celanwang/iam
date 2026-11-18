@@ -47,10 +47,8 @@ Avoid multi-paragraph messages, Chinese commit subjects, and stacking unrelated 
 
 ## Checks
 
-The [Workspace workflow](.github/workflows/workspace.yml) runs on pull requests
-and pushes to `main`. It checks formatting, runs Clippy for all targets and
-features, and runs the workspace tests with all features. Clippy and tests use
-`Cargo.lock`. To reproduce the checks locally, use the workflow's Rust version.
+Run formatting, Clippy, and workspace tests locally before merging. Clippy and
+tests use `Cargo.lock`.
 
 ```sh
 rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
@@ -59,19 +57,26 @@ cargo +1.99.1 clippy --locked --workspace --all-targets --all-features -- -D war
 cargo +1.99.1 test --locked --workspace --all-features
 ```
 
-Real TiDB tests are ignored by default. Use a dedicated loopback TiDB instance
-to run the relevant storage, client sync, and TCP + TLS suites locally. The test
-harness creates a separate `iam_test_*` database per case.
+Real TiDB tests run through the same entry point in two modes. Use the Rust
+version above and a local Docker daemon with Compose 2.23.1 or newer.
 
 ```sh
-export IAM_TIDB_TEST_URL='mysql://root@127.0.0.1:4000/iam_test'
-export IAM_TIDB_ALLOW_TEST_WRITES=1
-cargo test --locked -p iam-store tidb_ -- --ignored --skip perf:: --skip tidb_reliability_mixed_load --test-threads=1
-cargo test --locked -p iam-gateway --test tls -- --ignored --skip capacity:: --test-threads=1
+./scripts/test-tidb.sh smoke
+./scripts/test-tidb.sh full
 ```
 
-See the [local storage validation guide](docs/storage.md#本机控制台与验证) for setup
-and the [gateway performance guide](docs/gateway-perf.md) for capacity runs.
+`smoke` runs three TCP + TLS scenarios for recovering a committed send, the
+last dropped push, and a killed gateway process. `full` runs the storage, client
+recovery, and gateway regression suites, including those three scenarios.
+
+Each run starts a fresh TiDB, TiKV, and PD v8.5.7 stack with an automatically
+assigned loopback port. The script prints the tested commit, Rust and TiDB
+versions, and results. It prints container logs on failure and removes the
+test stack and its volumes when it exits.
+
+See the [local storage validation guide](docs/storage.md#本机控制台与验证) for
+running individual cases and the [gateway performance guide](docs/gateway-perf.md)
+for capacity runs.
 
 ## Changelog
 
