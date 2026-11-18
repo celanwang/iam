@@ -113,6 +113,21 @@ async fn observer(path: &Path) -> SqliteConnection {
         .unwrap()
 }
 
+async fn connect_as(
+    config: &ProcessConfig,
+    address: &str,
+    identity: Identity,
+    token: &[u8],
+) -> TlsTransport {
+    let mut transport = config.transport(address);
+    transport.reconnect().await.unwrap();
+    assert!(matches!(
+        auth(&mut transport, 1, identity.device_id, token).await,
+        auth_response::Value::Session(_)
+    ));
+    transport
+}
+
 async fn establish(
     config: &ProcessConfig,
     address: &str,
@@ -176,12 +191,7 @@ async fn tidb_tls_local_release_recovers_after_gateway_process_exit() {
         .await
         .unwrap();
 
-    let mut sender = config.transport(&address);
-    sender.reconnect().await.unwrap();
-    assert!(matches!(
-        auth(&mut sender, 1, alice_identity.device_id, ALICE).await,
-        auth_response::Value::Session(_)
-    ));
+    let mut sender = connect_as(&config, &address, alice_identity, ALICE).await;
     let first = message_key(direct);
     send(&mut sender, 2, first.clone(), "first direct").await;
     let mut bob_db = observer(&bob_path).await;
@@ -254,18 +264,45 @@ async fn tidb_tls_local_release_recovers_after_gateway_process_exit() {
         0
     );
 
-    let mut sender = config.transport(&address);
-    sender.reconnect().await.unwrap();
-    assert!(matches!(
-        auth(&mut sender, 1, alice_identity.device_id, ALICE).await,
-        auth_response::Value::Session(_)
-    ));
+    let mut sender = connect_as(&config, &address, alice_identity, ALICE).await;
     let DecodedBody::SendStatusAck(after) =
         request(&mut sender, 2, MsgType::SendStatus, &first_status).await
     else {
         panic!("expected SEND_STATUS_ACK after restart");
     };
     assert_eq!(after.outcome, before.outcome);
+    assert!(bob
+        .set_user_block(&mut bob_tls, BOB, 100, generate_id128(), true)
+        .await
+        .unwrap());
+    let DecodedBody::SendAck(blocked) = request(
+        &mut sender,
+        3,
+        MsgType::Send,
+        &SendRequest {
+            key: Some(message_key(direct)),
+            content: Some(MessageContent {
+                value: Some(message_content::Value::Text(TextContent {
+                    text: Some("blocked direct".to_owned()),
+                })),
+            }),
+        },
+    )
+    .await
+    else {
+        panic!("expected a send outcome after applying a block");
+    };
+    assert!(matches!(
+        blocked.outcome.and_then(|outcome| outcome.value),
+        Some(send_outcome::Value::RejectedFinal(error)) if error.code() == ErrorCode::PermissionDenied
+    ));
+    send(
+        &mut sender,
+        4,
+        message_key(group),
+        "group remains available",
+    )
+    .await;
     resumed.kill().await.unwrap();
 }
 
@@ -321,12 +358,7 @@ async fn tidb_tls_local_release_upgrades_old_store_and_recovers_receipt() {
     }
 
     let (mut gateway, address) = config.start("resume", "127.0.0.1:0").await;
-    let mut sender = config.transport(&address);
-    sender.reconnect().await.unwrap();
-    assert!(matches!(
-        auth(&mut sender, 1, alice.device_id, ALICE).await,
-        auth_response::Value::Session(_)
-    ));
+    let mut sender = connect_as(&config, &address, alice, ALICE).await;
     let DecodedBody::SendStatusAck(status) = request(
         &mut sender,
         2,
