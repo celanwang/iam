@@ -1,3 +1,4 @@
+use super::friend_removal::backfill_friend_generations;
 use super::friends::migrate_friend_attempts;
 use super::*;
 
@@ -19,6 +20,8 @@ impl TidbStore {
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_requests ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_attempts ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS group_creations ")
+                || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_removals ")
+                || statement.starts_with("CREATE TABLE IF NOT EXISTS direct_send_blocks ")
             {
                 sqlx::query(statement).execute(&pool).await?;
             }
@@ -33,6 +36,9 @@ impl TidbStore {
         )
         .execute(&pool)
         .await?;
+        sqlx::query("ALTER TABLE direct_pairs ADD COLUMN IF NOT EXISTS generation BINARY(16) NULL")
+            .execute(&pool)
+            .await?;
         check_schema(&pool, false).await?;
         let mut tx = pool.begin().await?;
         lock_authority(&mut tx, id).await?;
@@ -44,9 +50,10 @@ impl TidbStore {
                 migrate_friend_attempts(&mut tx).await?;
             }
             1 => migrate_friend_attempts(&mut tx).await?,
-            2 => {}
+            2 | 3 => {}
             _ => return Err(Error::Configuration("unrecognized storage schema version")),
         }
+        backfill_friend_generations(&mut tx).await?;
         mark_schema_ready(&mut tx).await?;
         finish(tx, Ok(())).await
     }
@@ -64,8 +71,8 @@ impl TidbStore {
         let mut tx = self.pool.begin().await?;
         lock_authority(&mut tx, self.id).await?;
         let pair = ordered_pair(a, b);
-        if let Some((existing, _)) = direct_pair(&mut tx, tenant, pair).await? {
-            return if conversation == existing {
+        if let Some(existing) = direct_pair(&mut *tx, tenant, pair).await? {
+            return if conversation == existing.conversation_id {
                 finish(tx, Ok(())).await
             } else {
                 Err(Error::InvalidRequest(
@@ -82,7 +89,7 @@ impl TidbStore {
             &pair,
         )
         .await?;
-        insert_direct_pair(&mut tx, tenant, pair, conversation, false).await?;
+        insert_direct_pair(&mut tx, tenant, pair, conversation, None).await?;
         finish(tx, Ok(())).await
     }
 
@@ -169,15 +176,45 @@ pub(super) fn ordered_pair(a: u64, b: u64) -> [u64; 2] {
     [a.min(b), a.max(b)]
 }
 
-pub(super) async fn direct_pair(
-    db: &mut MySqlConnection,
+#[derive(Clone, Copy)]
+pub(super) struct DirectPair {
+    pub(super) conversation_id: u64,
+    pub(super) friends: bool,
+    // Retained when a friendship is removed to distinguish it from a never-friended Direct.
+    pub(super) generation: Option<Id128>,
+}
+
+pub(super) async fn direct_pair<'a>(
+    db: impl sqlx::Executor<'a, Database = MySql>,
     tenant: u64,
     [low, high]: [u64; 2],
-) -> Result<Option<(u64, bool)>> {
-    Ok(sqlx::query_as(
-        "SELECT conversation_id, friends FROM direct_pairs WHERE tenant_id = ? AND user_low = ? AND user_high = ? FOR UPDATE",
+) -> Result<Option<DirectPair>> {
+    // Mutating callers hold the authority lock. Under READ COMMITTED this statement
+    // runs after the prior transaction has settled, without taking another lock.
+    let row = sqlx::query(
+        "SELECT conversation_id, friends, generation FROM direct_pairs WHERE tenant_id = ? AND user_low = ? AND user_high = ?",
     )
-    .bind(tenant).bind(low).bind(high).fetch_optional(db).await?)
+    .bind(tenant).bind(low).bind(high).fetch_optional(db).await?;
+    row.map(|row| {
+        let friends = row.try_get::<bool, _>("friends")?;
+        let generation = row
+            .try_get::<Option<Vec<u8>>, _>("generation")?
+            .map(|id| {
+                validate_id128(&id).map_err(|_| Error::Integrity("invalid friend generation"))
+            })
+            .transpose()?;
+        if friends && generation.is_none() {
+            return Err(Error::Integrity(
+                "active friendship is missing its generation",
+            ));
+        }
+        Ok(DirectPair {
+            conversation_id: row.try_get("conversation_id")?,
+            friends,
+            generation,
+        })
+    })
+    .transpose()
 }
 
 pub(super) async fn insert_direct_pair(
@@ -185,14 +222,15 @@ pub(super) async fn insert_direct_pair(
     tenant: u64,
     [low, high]: [u64; 2],
     conversation: u64,
-    friends: bool,
+    generation: Option<Id128>,
 ) -> Result<()> {
-    sqlx::query("INSERT INTO direct_pairs VALUES (?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO direct_pairs (tenant_id, user_low, user_high, conversation_id, friends, generation) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(tenant)
         .bind(low)
         .bind(high)
         .bind(conversation)
-        .bind(friends)
+        .bind(generation.is_some())
+        .bind(generation.as_ref().map(|id| id.as_slice()))
         .execute(db)
         .await?;
     Ok(())

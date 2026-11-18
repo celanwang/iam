@@ -4,8 +4,9 @@ use crate::msg_type::MsgType;
 use crate::pb::{
     AuthRequest, AuthResponse, FriendAcceptAck, FriendAcceptRequest, FriendApplyRequest,
     FriendAttemptAck, FriendDecideRequest, FriendInboxAck, FriendInboxRequest, FriendListAck,
-    FriendListRequest, FriendRequest, FriendRequestAck, GroupCreateAck, GroupCreateRequest, Head,
-    HeartbeatAck, HeartbeatRequest, HistoryRequest, HistoryResponse, ProtocolError, Push, PushAck,
+    FriendListRequest, FriendRemoveAck, FriendRemoveRequest, FriendRequest, FriendRequestAck,
+    FriendStatusAck, FriendStatusRequest, GroupCreateAck, GroupCreateRequest, Head, HeartbeatAck,
+    HeartbeatRequest, HistoryRequest, HistoryResponse, ProtocolError, Push, PushAck,
     ReconnectRequest, ReconnectResponse, SendRequest, SendResponse, SendStatusRequest,
     SendStatusResponse, SnapshotRequest, SnapshotResponse, SyncRequest, SyncResponse,
 };
@@ -50,6 +51,10 @@ pub enum DecodedBody {
     FriendDecideAck(FriendAttemptAck),
     GroupCreate(GroupCreateRequest),
     GroupCreateAck(GroupCreateAck),
+    FriendStatus(FriendStatusRequest),
+    FriendStatusAck(FriendStatusAck),
+    FriendRemove(FriendRemoveRequest),
+    FriendRemoveAck(FriendRemoveAck),
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +197,10 @@ fn decode_body_counted(msg_type: MsgType, body: &[u8], fields: &mut usize) -> Re
         MsgType::FriendDecideAck => DecodedBody::FriendDecideAck(decode_pb(body, fields)?),
         MsgType::GroupCreate => DecodedBody::GroupCreate(decode_pb(body, fields)?),
         MsgType::GroupCreateAck => DecodedBody::GroupCreateAck(decode_pb(body, fields)?),
+        MsgType::FriendStatus => DecodedBody::FriendStatus(decode_pb(body, fields)?),
+        MsgType::FriendStatusAck => DecodedBody::FriendStatusAck(decode_pb(body, fields)?),
+        MsgType::FriendRemove => DecodedBody::FriendRemove(decode_pb(body, fields)?),
+        MsgType::FriendRemoveAck => DecodedBody::FriendRemoveAck(decode_pb(body, fields)?),
     };
     crate::validate::validate_response(&decoded)?;
     Ok(decoded)

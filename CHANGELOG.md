@@ -14,6 +14,8 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Generation-scoped friend removal with durable retries and suspension of
+  new direct sends while preserving chat history and existing group access.
 - Idempotent creation of groups with up to 32 initial members, with group
   discovery and reliable text delivery through the existing account and message streams.
 - UUIDv7 friend applications with explicit rejection and safe reapplication.

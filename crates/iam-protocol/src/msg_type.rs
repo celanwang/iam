@@ -36,6 +36,10 @@ pub enum MsgType {
     GroupCreateAck = 33,
     ReadPosition = 34,
     ReadPositionAck = 35,
+    FriendStatus = 36,
+    FriendStatusAck = 37,
+    FriendRemove = 38,
+    FriendRemoveAck = 39,
 }
 
 impl MsgType {
@@ -76,6 +80,10 @@ impl MsgType {
             33 => Self::GroupCreateAck,
             34 => Self::ReadPosition,
             35 => Self::ReadPositionAck,
+            36 => Self::FriendStatus,
+            37 => Self::FriendStatusAck,
+            38 => Self::FriendRemove,
+            39 => Self::FriendRemoveAck,
             _ => return None,
         })
     }
@@ -111,6 +119,8 @@ impl MsgType {
                 | Self::FriendInbox
                 | Self::FriendDecide
                 | Self::GroupCreate
+                | Self::FriendStatus
+                | Self::FriendRemove
         )
     }
 }

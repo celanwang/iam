@@ -102,6 +102,8 @@ Head {
 30 FRIEND_DECIDE  FriendDecideRequest -> 31 FRIEND_DECIDE_ACK FriendAttemptAck
 32 GROUP_CREATE   GroupCreateRequest  -> 33 GROUP_CREATE_ACK   GroupCreateAck
 34 READ_POSITION  ReadPositionRequest -> 35 READ_POSITION_ACK ReadPositionAck
+36 FRIEND_STATUS  FriendStatusRequest -> 37 FRIEND_STATUS_ACK  FriendStatusAck
+38 FRIEND_REMOVE  FriendRemoveRequest -> 39 FRIEND_REMOVE_ACK  FriendRemoveAck
 ```
 
 `PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友、群创建和阅读位置命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
@@ -651,7 +653,7 @@ HistoryResponse = oneof {
 
 接受和拒绝并发时，先提交的决定成为该申请终态。两人有交叉申请时，任一接受提交会让该对账号当时仍待定的申请共享已接受结果。此前已拒绝的申请继续返回拒绝。业务操作成功提交后才返回成功，结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`。新请求号用于帧关联，操作重试复用原申请 ID。首次接受复用已有的单聊，或原子建立单聊、授予两人访问权并写入双方的账号事件，随后由账号 `SYNC` 发现会话。预置单聊任一方已被可信应用撤权时，首次接受返回 `PERMISSION_DENIED`，申请保持待接受。
 
-目标或申请人 ID 缺失、为 0 或等于当前用户，或申请 UUIDv7 格式不合法时，返回 `INVALID_ARGUMENT`。首次申请未知目标、决定者没有对应的入站申请时，返回 `NOT_FOUND`。解除好友和拉黑属于后续流程。
+目标或申请人 ID 缺失、为 0 或等于当前用户，或申请 UUIDv7 格式不合法时，返回 `INVALID_ARGUMENT`。首次申请未知目标、决定者没有对应的入站申请时，返回 `NOT_FOUND`。
 
 ### 旧版按人命令
 
@@ -660,6 +662,16 @@ HistoryResponse = oneof {
 - `FRIEND_ACCEPT` 按 `from_user_id` 接受自己的入站申请。发送方和收件人身份均在认证租户范围内解析。交叉申请分别保存，在任一方明确接受后两条申请都退出待接受列表，任一合法方向后续重放返回同一个 `conversation_id`。
 
 旧命令只绑定该有向账号对的首条兼容申请。新版收件人可在 `FRIEND_INBOX` 看到这条申请的 UUID。兼容申请已拒绝时，旧的申请和接受重放返回 `CONTEXT_CHANGED / NONE`。旧列表只显示仍待处理的兼容申请，旧按人接受在没有对应兼容申请时返回 `NOT_FOUND`。发起后续申请须使用带 ID 的命令。
+
+### 解除好友
+
+`FRIEND_STATUS` 接收 `peer_user_id`（字段 1），以认证租户和用户查询当前关系。`FRIEND_STATUS_ACK` 的 `not_friends`（分支 1）表示当前无好友关系，`relationship`（分支 2）包含 `generation`（字段 1，UUIDv7）与 canonical `conversation_id`（字段 2）。
+
+任一方可通过 `FRIEND_REMOVE` 携带 `peer_user_id`（字段 1）和从状态查询获得的 `generation`（字段 2）解除该代次。成功后 `FRIEND_REMOVE_ACK` 返回原 canonical `conversation_id`（字段 1）。同对账号重试已解除的代次会取得原结果，即使双方已经重新成为好友。代次不属于该对账号时返回 `NOT_FOUND`。缺字段、零值或指定自己、代次格式不合法时返回 `INVALID_ARGUMENT`。提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`，重试沿用原代次。
+
+解除后，该对账号的所有 Direct 都拒绝尚未结算的新 `SEND`，包括旧库已有的重复单聊。此前已确认的发送结果继续按原窗口查询。已有单聊的可访问历史、账号和会话游标及现有群权限保留，已解除的关系不能作为创建小群的准入依据。
+
+再次成为好友需要新的带 ID 申请以及收件人接受。成功后复用 canonical 单聊并发布新代次，在各单聊仍有独立访问权的成员可恢复发送。已结算的发送拒绝保持原结果。历史申请或决定的成功回执仅说明原操作的结果，当前关系以 `FRIEND_STATUS` 为准。定向拉黑和解封由后续流程提供。
 
 ## 创建小群
 

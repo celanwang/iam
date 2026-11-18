@@ -38,6 +38,11 @@ mod friend_tests;
 #[path = "friends.rs"]
 mod friends;
 pub(crate) use friends::FriendAttempt;
+#[path = "friend_removal.rs"]
+mod friend_removal;
+#[cfg(test)]
+#[path = "friend_removal_tests.rs"]
+mod friend_removal_tests;
 #[cfg(test)]
 #[path = "group_tests.rs"]
 mod group_tests;
@@ -58,8 +63,8 @@ const CONTROL: &str = "SELECT store_id, token_key, max_observed_now_ms, closed_t
                        FROM store_control WHERE singleton = 1 FOR UPDATE";
 
 const INITIAL_ACCESS: u64 = 1;
-const STORAGE_SCHEMA_VERSION: u8 = 3;
-const TABLES: [&str; 12] = [
+const STORAGE_SCHEMA_VERSION: u8 = 4;
+const TABLES: [&str; 14] = [
     "store_control",
     "conversations",
     "messages",
@@ -72,6 +77,8 @@ const TABLES: [&str; 12] = [
     "friend_requests",
     "friend_attempts",
     "group_creations",
+    "friend_removals",
+    "direct_send_blocks",
 ];
 
 struct DecisionClock {
@@ -326,7 +333,9 @@ impl TidbStore {
         let members: Vec<(u64, u64)> = sqlx::query_as(
             "SELECT m.user_id, e.access_version FROM members m JOIN account_events e
              USING (tenant_id, user_id, account_sequence)
-             WHERE m.tenant_id = ? AND m.conversation_id = ?",
+             WHERE m.tenant_id = ? AND m.conversation_id = ?
+               AND NOT EXISTS (SELECT 1 FROM direct_send_blocks b
+                               WHERE b.tenant_id = m.tenant_id AND b.conversation_id = m.conversation_id)",
         )
         .bind(key.owner.tenant_id)
         .bind(key.conversation)
@@ -864,18 +873,20 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
             "SELECT tenant_id, user_id, account_sequence, conversation_id, history_id, access_version FROM account_events LIMIT 0",
             "SELECT tenant_id, conversation_id, floor_sequence FROM conversation_retention LIMIT 0",
             "SELECT friends_ready FROM store_control LIMIT 0",
-            "SELECT tenant_id, user_low, user_high, conversation_id, friends FROM direct_pairs LIMIT 0",
+            "SELECT tenant_id, user_low, user_high, conversation_id, friends, generation FROM direct_pairs LIMIT 0",
             "SELECT tenant_id, to_user_id, from_user_id, pending FROM friend_requests FORCE INDEX (pending_incoming) LIMIT 0",
             "SELECT tenant_id, to_user_id, from_user_id, request_id, outcome, conversation_id, legacy_slot, pending_slot FROM friend_attempts FORCE INDEX (legacy_inbox) LIMIT 0",
             "SELECT kind FROM conversations LIMIT 0",
             "SELECT tenant_id, creator_id, request_id, member_set, conversation_id FROM group_creations LIMIT 0",
+            "SELECT tenant_id, user_low, user_high, generation, conversation_id FROM friend_removals LIMIT 0",
+            "SELECT tenant_id, conversation_id, user_low, user_high FROM direct_send_blocks FORCE INDEX (blocked_pair) LIMIT 0",
         ] {
             sqlx::query(query).execute(pool).await?;
         }
     }
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT table_name, index_name, column_name FROM information_schema.statistics \
-         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests', 'friend_attempts', 'group_creations') \
+         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests', 'friend_attempts', 'group_creations', 'friend_removals', 'direct_send_blocks') \
          AND non_unique = 0 ORDER BY table_name, index_name, seq_in_index",
     )
     .fetch_all(pool)
@@ -891,6 +902,8 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
                     | "friend_requests"
                     | "friend_attempts"
                     | "group_creations"
+                    | "friend_removals"
+                    | "direct_send_blocks"
             )
         {
             continue;
@@ -904,7 +917,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
         "conversation_id",
         "client_msg_id",
     ];
-    let expected: [(&str, &str, &[&str]); 19] = [
+    let expected: [(&str, &str, &[&str]); 21] = [
         ("store_control", "PRIMARY", &["singleton"]),
         (
             "conversations",
@@ -986,6 +999,16 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
         (
             "group_creations",
             "created_group",
+            &["tenant_id", "conversation_id"],
+        ),
+        (
+            "friend_removals",
+            "PRIMARY",
+            &["tenant_id", "user_low", "user_high", "generation"],
+        ),
+        (
+            "direct_send_blocks",
+            "PRIMARY",
             &["tenant_id", "conversation_id"],
         ),
     ];

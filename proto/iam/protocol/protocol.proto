@@ -398,6 +398,31 @@ message GroupCreateAck {
   optional uint64 conversation_id = 1;
 }
 
+message FriendStatusRequest {
+  optional uint64 peer_user_id = 1;
+}
+
+message FriendRelationship {
+  optional bytes generation = 1;
+  optional uint64 conversation_id = 2;
+}
+
+message FriendStatusAck {
+  oneof value {
+    Empty not_friends = 1;
+    FriendRelationship relationship = 2;
+  }
+}
+
+message FriendRemoveRequest {
+  optional uint64 peer_user_id = 1;
+  optional bytes generation = 2;
+}
+
+message FriendRemoveAck {
+  optional uint64 conversation_id = 1;
+}
+
 message ProtocolError {
   optional uint32 ref_msg_type = 1;
   optional ErrorInfo error = 2;

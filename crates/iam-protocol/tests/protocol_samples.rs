@@ -311,6 +311,54 @@ fn group_create_wire_round_trip_and_required_ack_id() {
 }
 
 #[test]
+fn friend_removal_wire_requires_a_valid_status_generation() {
+    use iam_protocol::pb::*;
+    use iam_protocol::{encode_frame, DecodedBody};
+
+    let generation = hex::decode("018bcfe5680070008000000000000001").unwrap();
+    let remove = FriendRemoveRequest {
+        peer_user_id: Some(42),
+        generation: Some(generation.clone().into()),
+    };
+    let bytes = encode_frame(MsgType::FriendRemove, &Head { req_id: Some(1) }, &remove).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        "0126000000000002000000140801082a1210018bcfe5680070008000000000000001"
+    );
+    let mut decoder = FrameDecoder::new();
+    decoder.push(&bytes);
+    let frame = decoder.next_frame().unwrap().unwrap();
+    assert!(
+        matches!(decode_frame(&frame).unwrap().body, DecodedBody::FriendRemove(value) if value == remove)
+    );
+    assert!(matches!(
+        raw_body(MsgType::FriendStatusAck, &[10, 0]).unwrap(),
+        DecodedBody::FriendStatusAck(FriendStatusAck {
+            value: Some(friend_status_ack::Value::NotFriends(_)),
+        })
+    ));
+
+    let status = |id: Option<Vec<u8>>| FriendStatusAck {
+        value: Some(friend_status_ack::Value::Relationship(FriendRelationship {
+            conversation_id: Some(42),
+            generation: id.map(Into::into),
+        })),
+    };
+    assert!(raw_body(
+        MsgType::FriendStatusAck,
+        &status(Some(generation)).encode_to_vec()
+    )
+    .is_ok());
+    assert!(raw_body(MsgType::FriendStatusAck, &status(None).encode_to_vec()).is_err());
+    assert!(raw_body(
+        MsgType::FriendStatusAck,
+        &status(Some(vec![0; 16])).encode_to_vec()
+    )
+    .is_err());
+    assert!(raw_body(MsgType::FriendRemoveAck, &[8, 0]).is_err());
+}
+
+#[test]
 fn recursive_wire_validation_rejects_duplicates_and_multiple_branches() {
     // Duplicate SendRequest.key and nested MessageKey.conversation_id.
     for body in [&[0x0a, 0, 0x0a, 0][..], &[0x0a, 4, 8, 1, 8, 1][..]] {
