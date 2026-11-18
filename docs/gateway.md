@@ -24,7 +24,9 @@ cargo run -p iam-gateway
 
 `resume` 使用已初始化的同一 TiDB 库和存储 ID。新库用 `fresh` 初始化。已有库先执行[离线升级](./storage.md#持久状态)再启动新版网关。客户端使用 `iam_client::TlsTransport` 并提供信任根和预期证书名称。
 
-网关将当前设备凭证配置中的租户和用户作为账号目录。首次好友申请要求目标用户出现在同一租户的配置中，申请和接受重试以数据库中的持久状态为准。应用通过 `Client::request_friend`、`Client::incoming_friend_requests`、`Client::accept_friend` 完成申请、查询和接受。每个调用打开新连接并认证，同设备应串行调用，并在调用期间暂停同一设备的 `Client::run`，以免触发会话接管。接受后，`Client::run` 从账号同步发现单聊，并通过现有持久发送队列和消息同步收发文本。
+网关将当前设备凭证配置中的租户和用户作为账号目录。首次好友申请要求目标用户出现在同一租户的配置中，重试以数据库中保存的结果为准。应用使用 `Client::apply_friend` 发起申请，调用前保存由 `iam_protocol::generate_id128` 生成的 ID。收件人通过 `Client::friend_inbox` 查看申请人和申请 ID，再通过 `Client::decide_friend` 接受或拒绝。重试复用原 ID，明确重新申请时生成新 ID。旧版客户端可继续使用 `request_friend`、`incoming_friend_requests` 和 `accept_friend` 处理首条兼容申请。
+
+每个好友调用打开新连接并认证，同设备应串行调用，并在调用期间暂停同一设备的 `Client::run`，以免触发会话接管。接受后，`Client::run` 从账号同步发现单聊，并通过现有持久发送队列和消息同步收发文本。
 
 在 Unix 上，更新证书链、私钥和设备凭证文件后，向实际运行的 `iam-gateway` 进程发送 `SIGHUP`。网关校验整批配置，成功后新握手使用新证书。凭证删除、轮换或修改到期时间会关闭对应设备的连接并作废旧恢复票据。凭证相同的设备继续使用当前连接。空凭证文件撤销所有设备。文件读取、解析或证书与私钥配对失败时，网关记下错误并继续使用上一次配置。
 

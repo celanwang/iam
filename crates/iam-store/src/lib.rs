@@ -29,6 +29,12 @@ pub enum Error {
     PermissionDenied,
     #[error("friend account or incoming request not found")]
     FriendNotFound,
+    #[error("the legacy friend request was closed or the pair uses explicit request IDs")]
+    FriendChanged,
+    #[error("the friend request ID is bound to a different target")]
+    FriendKeyConflict,
+    #[error("another request was pending when this friend request ID was used")]
+    FriendInProgress,
     #[error("friend mutations are paused")]
     FriendUnavailable,
     #[error("invalid request: {0}")]

@@ -61,6 +61,7 @@ async fn tidb_single_schema_supports_unsigned_ids_and_ordered_pages() {
             "conversation_retention",
             "conversations",
             "direct_pairs",
+            "friend_attempts",
             "friend_requests",
             "members",
             "messages",
@@ -437,12 +438,16 @@ async fn tidb_friend_lists_only_pending_requests_with_exclusive_paging() {
         .await
         .unwrap();
     let bob = friend_identity(1, u64::MAX);
-    let mut insert = sqlx::QueryBuilder::<MySql>::new("INSERT INTO friend_requests ");
+    let mut insert = sqlx::QueryBuilder::<MySql>::new(
+        "INSERT INTO friend_attempts (tenant_id, to_user_id, from_user_id, request_id, outcome, legacy_slot) ",
+    );
     insert.push_values(1_u64..=102, |mut row, sender| {
         row.push_bind(1_u64)
             .push_bind(bob.user_id)
             .push_bind(sender)
-            .push_bind(true);
+            .push_bind(generate_id128().to_vec())
+            .push_bind(1_u8)
+            .push_bind(1_u8);
     });
     insert.build().execute(&store.pool).await.unwrap();
     store.accept_friend(bob, 1, |_| Ok(())).await.unwrap();
@@ -472,6 +477,7 @@ fn friend_identity(tenant_id: u64, user_id: u64) -> Identity {
 
 async fn drop_friend_schema(pool: &MySqlPool) {
     for ddl in [
+        "DROP TABLE friend_attempts",
         "DROP TABLE friend_requests",
         "DROP TABLE direct_pairs",
         "ALTER TABLE store_control DROP COLUMN friends_ready",

@@ -29,9 +29,16 @@ pub(crate) mod perf;
 #[path = "membership.rs"]
 mod membership;
 
+#[cfg(test)]
+#[path = "friend_tests.rs"]
+mod friend_tests;
 #[path = "friends.rs"]
 mod friends;
-use membership::{create_direct_in, mark_friends_ready};
+pub(crate) use friends::FriendAttempt;
+use friends::FRIEND_SCHEMA_VERSION;
+use membership::{
+    backfill_direct_pairs, create_direct_in, friend_schema_version, mark_friends_ready,
+};
 
 const CLOCK_SQL: &str = "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)";
 
@@ -44,7 +51,7 @@ const CONTROL: &str = "SELECT store_id, token_key, max_observed_now_ms, closed_t
                        FROM store_control WHERE singleton = 1 FOR UPDATE";
 
 const INITIAL_ACCESS: u64 = 1;
-const TABLES: [&str; 9] = [
+const TABLES: [&str; 10] = [
     "store_control",
     "conversations",
     "messages",
@@ -54,6 +61,7 @@ const TABLES: [&str; 9] = [
     "conversation_retention",
     "direct_pairs",
     "friend_requests",
+    "friend_attempts",
 ];
 
 struct DecisionClock {
@@ -186,7 +194,7 @@ impl TidbStore {
             .try_into()
             .map_err(|_| Error::Integrity("invalid token key"))?;
         control_clock(&row)?;
-        if !membership::friends_ready(&mut transaction).await? {
+        if friend_schema_version(&mut transaction).await? != FRIEND_SCHEMA_VERSION {
             return Err(Error::Configuration(
                 "run the offline friends schema upgrade",
             ));
@@ -839,13 +847,14 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
             "SELECT friends_ready FROM store_control LIMIT 0",
             "SELECT tenant_id, user_low, user_high, conversation_id, friends FROM direct_pairs LIMIT 0",
             "SELECT tenant_id, to_user_id, from_user_id, pending FROM friend_requests FORCE INDEX (pending_incoming) LIMIT 0",
+            "SELECT tenant_id, to_user_id, from_user_id, request_id, outcome, conversation_id, legacy_slot, pending_slot FROM friend_attempts FORCE INDEX (legacy_inbox) LIMIT 0",
         ] {
             sqlx::query(query).execute(pool).await?;
         }
     }
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT table_name, index_name, column_name FROM information_schema.statistics \
-         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests') \
+         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests', 'friend_attempts') \
          AND non_unique = 0 ORDER BY table_name, index_name, seq_in_index",
     )
     .fetch_all(pool)
@@ -855,7 +864,11 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
         if legacy_only
             && matches!(
                 table.as_str(),
-                "account_events" | "conversation_retention" | "direct_pairs" | "friend_requests"
+                "account_events"
+                    | "conversation_retention"
+                    | "direct_pairs"
+                    | "friend_requests"
+                    | "friend_attempts"
             )
         {
             continue;
@@ -869,7 +882,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
         "conversation_id",
         "client_msg_id",
     ];
-    let expected: [(&str, &str, &[&str]); 13] = [
+    let expected: [(&str, &str, &[&str]); 17] = [
         ("store_control", "PRIMARY", &["singleton"]),
         (
             "conversations",
@@ -922,6 +935,26 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
             "friend_requests",
             "PRIMARY",
             &["tenant_id", "to_user_id", "from_user_id"],
+        ),
+        (
+            "friend_attempts",
+            "PRIMARY",
+            &["tenant_id", "to_user_id", "from_user_id", "request_id"],
+        ),
+        (
+            "friend_attempts",
+            "sender_request",
+            &["tenant_id", "from_user_id", "request_id"],
+        ),
+        (
+            "friend_attempts",
+            "pending_attempt",
+            &["tenant_id", "to_user_id", "pending_slot", "from_user_id"],
+        ),
+        (
+            "friend_attempts",
+            "legacy_attempt",
+            &["tenant_id", "to_user_id", "from_user_id", "legacy_slot"],
         ),
     ];
     let expected = if legacy_only {
@@ -1094,5 +1127,6 @@ async fn initialize(
         )
         .await?;
     }
+    backfill_direct_pairs(tx).await?;
     mark_friends_ready(tx).await
 }

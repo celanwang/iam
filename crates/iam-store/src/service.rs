@@ -1,11 +1,12 @@
 use crate::clock::ClockBatch;
-use crate::store::{unresolved, Decision, Scope, SendKey, TidbStore};
+use crate::store::{unresolved, Decision, FriendAttempt, Scope, SendKey, TidbStore};
 use crate::{ConversationInfo, Error, Identity, Result, TextPage};
 use iam_core::{CoreError, DeviceCredential, Engine, EngineOutput, EngineReply, StorageRequest};
 use iam_protocol::pb::{
-    change, friend_request_ack, message_content, send_outcome, Change, Empty, ErrorCode,
-    FriendAcceptAck, FriendRequestAck, HistoryResponse, MessageContent, MessageKey, RetryAction,
-    SendOutcome, SendResponse, SendStatusResponse, SnapshotResponse, SyncResponse,
+    change, friend_attempt_ack, friend_request_ack, message_content, send_outcome, Change, Empty,
+    ErrorCode, FriendAcceptAck, FriendAttemptAck, FriendRequestAck, HistoryResponse,
+    MessageContent, MessageKey, RetryAction, SendOutcome, SendResponse, SendStatusResponse,
+    SnapshotResponse, SyncResponse,
 };
 use iam_protocol::{
     decode_frame, encode_frame, encode_protocol_error, validate_id128, DecodedBody, DecodedFrame,
@@ -409,6 +410,45 @@ impl TidbService {
                     });
                 self.friend_reply(cid, &decoded, MsgType::FriendAcceptAck, result)
             }
+            DecodedBody::FriendApply(req) => {
+                let Some((target, id)) =
+                    req.target_user_id.zip(friend_id(req.request_id.as_deref()))
+                else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self
+                    .database
+                    .apply_friend(identity, target, Some(id), |write| {
+                        self.admit_friend(cid, write, Some(target))
+                    })
+                    .await
+                    .map(friend_attempt_ack);
+                self.friend_reply(cid, &decoded, MsgType::FriendApplyAck, result)
+            }
+            DecodedBody::FriendInbox(req) => {
+                let Some(after) = req.after_user_id else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self.database.friend_inbox(identity, after, false).await;
+                self.friend_reply(cid, &decoded, MsgType::FriendInboxAck, result)
+            }
+            DecodedBody::FriendDecide(req) => {
+                let Some(((sender, id), accept)) = req
+                    .from_user_id
+                    .zip(friend_id(req.request_id.as_deref()))
+                    .zip(req.accept)
+                else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self
+                    .database
+                    .decide_friend(identity, sender, Some(id), accept, |write| {
+                        self.admit_friend(cid, write, None)
+                    })
+                    .await
+                    .map(friend_attempt_ack);
+                self.friend_reply(cid, &decoded, MsgType::FriendDecideAck, result)
+            }
             _ => wire_error(cid, &decoded, ErrorCode::UnsupportedCommand),
         }
     }
@@ -443,6 +483,9 @@ impl TidbService {
             Ok(body) => reply(cid, frame, kind, &body),
             Err(Error::InvalidRequest(_)) => wire_error(cid, frame, ErrorCode::InvalidArgument),
             Err(Error::FriendNotFound) => wire_error(cid, frame, ErrorCode::NotFound),
+            Err(Error::FriendChanged) => wire_error(cid, frame, ErrorCode::ContextChanged),
+            Err(Error::FriendKeyConflict) => wire_error(cid, frame, ErrorCode::IdempotencyConflict),
+            Err(Error::FriendInProgress) => wire_error(cid, frame, ErrorCode::InProgress),
             Err(Error::PermissionDenied) => wire_error(cid, frame, ErrorCode::PermissionDenied),
             Err(Error::Unauthenticated) => protocol_error(
                 None,
@@ -558,6 +601,21 @@ impl TidbService {
             }
         }
         Ok((cid_out, output))
+    }
+}
+
+fn friend_id(bytes: Option<&[u8]>) -> Option<Id128> {
+    bytes.and_then(|bytes| validate_id128(bytes).ok())
+}
+
+fn friend_attempt_ack(result: FriendAttempt) -> FriendAttemptAck {
+    use friend_attempt_ack::Value;
+    FriendAttemptAck {
+        value: Some(match result {
+            FriendAttempt::Pending => Value::Pending(Empty {}),
+            FriendAttempt::Accepted(id) => Value::ConversationId(id),
+            FriendAttempt::Rejected => Value::Rejected(Empty {}),
+        }),
     }
 }
 

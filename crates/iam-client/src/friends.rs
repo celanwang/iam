@@ -1,11 +1,101 @@
 use crate::{wire::Wire, Client, Error, Options, Result, Transport};
 use iam_protocol::pb::{
-    friend_request_ack, FriendAcceptRequest, FriendListAck, FriendListRequest, FriendRequest,
+    friend_request_ack, FriendAcceptRequest, FriendApplyRequest, FriendAttemptAck,
+    FriendDecideRequest, FriendInboxAck, FriendInboxRequest, FriendListAck, FriendListRequest,
+    FriendRequest,
 };
-use iam_protocol::{DecodedBody, MsgType};
+use iam_protocol::{validate_id128, DecodedBody, Id128, MsgType};
 use prost::Message;
 
 impl Client {
+    /// Applies with a caller-owned UUIDv7. Persist this ID before sending and reuse it on retry.
+    /// An intentional reapplication after rejection uses a fresh ID.
+    pub async fn apply_friend(
+        &self,
+        transport: &mut impl Transport,
+        access_token: &[u8],
+        target_user_id: u64,
+        request_id: Id128,
+    ) -> Result<FriendAttemptAck> {
+        validate_id128(&request_id)?;
+        match self
+            .friend_call(
+                transport,
+                access_token,
+                MsgType::FriendApply,
+                &FriendApplyRequest {
+                    target_user_id: Some(target_user_id),
+                    request_id: Some(request_id.to_vec().into()),
+                },
+            )
+            .await?
+        {
+            DecodedBody::FriendApplyAck(ack) => Ok(ack),
+            _ => Err(Error::Invalid("expected FRIEND_APPLY_ACK")),
+        }
+    }
+
+    /// Lists pending requests with their IDs. Use zero for the first page.
+    pub async fn friend_inbox(
+        &self,
+        transport: &mut impl Transport,
+        access_token: &[u8],
+        after_user_id: u64,
+    ) -> Result<FriendInboxAck> {
+        match self
+            .friend_call(
+                transport,
+                access_token,
+                MsgType::FriendInbox,
+                &FriendInboxRequest {
+                    after_user_id: Some(after_user_id),
+                },
+            )
+            .await?
+        {
+            DecodedBody::FriendInboxAck(page)
+                if page
+                    .requests
+                    .first()
+                    .and_then(|r| r.from_user_id)
+                    .is_none_or(|user| user > after_user_id) =>
+            {
+                Ok(page)
+            }
+            _ => Err(Error::Invalid(
+                "expected FRIEND_INBOX_ACK for the requested range",
+            )),
+        }
+    }
+
+    /// Accepts or rejects one incoming request. If already decided, returns the original result.
+    pub async fn decide_friend(
+        &self,
+        transport: &mut impl Transport,
+        access_token: &[u8],
+        from_user_id: u64,
+        request_id: Id128,
+        accept: bool,
+    ) -> Result<FriendAttemptAck> {
+        validate_id128(&request_id)?;
+        match self
+            .friend_call(
+                transport,
+                access_token,
+                MsgType::FriendDecide,
+                &FriendDecideRequest {
+                    from_user_id: Some(from_user_id),
+                    request_id: Some(request_id.to_vec().into()),
+                    accept: Some(accept),
+                },
+            )
+            .await?
+        {
+            DecodedBody::FriendDecideAck(ack) => Ok(ack),
+            _ => Err(Error::Invalid("expected FRIEND_DECIDE_ACK")),
+        }
+    }
+
     /// Sends or retries an outgoing request. An established friendship returns its conversation ID.
     /// This call opens a fresh authenticated connection for the client's device.
     pub async fn request_friend(

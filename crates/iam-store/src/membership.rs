@@ -1,3 +1,4 @@
+use super::friends::migrate_friend_attempts;
 use super::*;
 
 impl TidbStore {
@@ -15,6 +16,7 @@ impl TidbStore {
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS conversation_retention ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS direct_pairs ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_requests ")
+                || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_attempts ")
             {
                 sqlx::query(statement).execute(&pool).await?;
             }
@@ -27,21 +29,16 @@ impl TidbStore {
         check_schema(&pool, false).await?;
         let mut tx = pool.begin().await?;
         lock_authority(&mut tx, id).await?;
-        if friends_ready(&mut tx).await? {
-            return finish(tx, Ok(())).await;
+        match friend_schema_version(&mut tx).await? {
+            FRIEND_SCHEMA_VERSION => return finish(tx, Ok(())).await,
+            0 => {
+                backfill_account_events(&mut tx).await?;
+                backfill_direct_pairs(&mut tx).await?;
+            }
+            1 => {}
+            _ => return Err(Error::Configuration("unrecognized friends schema version")),
         }
-        sqlx::query(
-            "INSERT INTO account_events
-             (tenant_id, user_id, account_sequence, conversation_id, history_id, access_version)
-             SELECT m.tenant_id, m.user_id, m.account_sequence, m.conversation_id, c.history_id, 1
-             FROM members m
-             JOIN conversations c ON c.tenant_id = m.tenant_id AND c.conversation_id = m.conversation_id
-             LEFT JOIN account_events e ON e.tenant_id = m.tenant_id AND e.user_id = m.user_id
-                AND e.account_sequence = m.account_sequence
-             WHERE e.account_sequence IS NULL",
-        )
-        .execute(&mut *tx)
-        .await?;
+        migrate_friend_attempts(&mut tx).await?;
         mark_friends_ready(&mut tx).await?;
         finish(tx, Ok(())).await
     }
@@ -204,16 +201,31 @@ pub(super) async fn create_direct_in(
     Ok(())
 }
 
-pub(super) async fn friends_ready(db: &mut MySqlConnection) -> Result<bool> {
+pub(super) async fn friend_schema_version(db: &mut MySqlConnection) -> Result<u8> {
     Ok(
-        sqlx::query_scalar::<_, u8>("SELECT friends_ready FROM store_control WHERE singleton = 1")
+        sqlx::query_scalar("SELECT friends_ready FROM store_control WHERE singleton = 1")
             .fetch_one(db)
-            .await?
-            == 1,
+            .await?,
     )
 }
 
-pub(super) async fn mark_friends_ready(tx: &mut Transaction<'_, MySql>) -> Result<()> {
+async fn backfill_account_events(tx: &mut Transaction<'_, MySql>) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO account_events
+         (tenant_id, user_id, account_sequence, conversation_id, history_id, access_version)
+         SELECT m.tenant_id, m.user_id, m.account_sequence, m.conversation_id, c.history_id, 1
+         FROM members m
+         JOIN conversations c ON c.tenant_id = m.tenant_id AND c.conversation_id = m.conversation_id
+         LEFT JOIN account_events e ON e.tenant_id = m.tenant_id AND e.user_id = m.user_id
+            AND e.account_sequence = m.account_sequence
+         WHERE e.account_sequence IS NULL",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn backfill_direct_pairs(tx: &mut Transaction<'_, MySql>) -> Result<()> {
     let invalid: Option<i32> = sqlx::query_scalar(
         "SELECT 1 FROM conversations c LEFT JOIN account_events e USING (tenant_id, conversation_id)
          GROUP BY c.tenant_id, c.conversation_id
@@ -239,7 +251,12 @@ pub(super) async fn mark_friends_ready(tx: &mut Transaction<'_, MySql>) -> Resul
     )
     .execute(&mut **tx)
     .await?;
-    sqlx::query("UPDATE store_control SET friends_ready = 1 WHERE singleton = 1")
+    Ok(())
+}
+
+pub(super) async fn mark_friends_ready(tx: &mut Transaction<'_, MySql>) -> Result<()> {
+    sqlx::query("UPDATE store_control SET friends_ready = ? WHERE singleton = 1")
+        .bind(FRIEND_SCHEMA_VERSION)
         .execute(&mut **tx)
         .await?;
     Ok(())

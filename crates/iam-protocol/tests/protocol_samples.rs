@@ -217,6 +217,66 @@ fn friend_wire_rejects_conflicting_fields_and_invalid_results() {
 }
 
 #[test]
+fn friend_decision_wire_preserves_an_explicit_rejection() {
+    use iam_protocol::pb::*;
+    use iam_protocol::DecodedBody;
+
+    let id = hex::decode("018bcfe5680070008000000000000001").unwrap();
+    let reject = FriendDecideRequest {
+        from_user_id: Some(42),
+        request_id: Some(id.into()),
+        accept: Some(false),
+    };
+    let body = reject.encode_to_vec();
+    assert_eq!(
+        hex::encode(&body),
+        "082a1210018bcfe56800700080000000000000011800"
+    );
+    assert!(matches!(
+        raw_body(MsgType::FriendDecide, &body).unwrap(),
+        DecodedBody::FriendDecide(value) if value == reject
+    ));
+    // An applied request can be pending. A decision response always has a terminal outcome.
+    assert!(raw_body(MsgType::FriendApplyAck, &[10, 0]).is_ok());
+    assert!(raw_body(MsgType::FriendDecideAck, &[10, 0]).is_err());
+    assert!(matches!(
+        raw_body(MsgType::FriendDecideAck, &[26, 0]).unwrap(),
+        DecodedBody::FriendDecideAck(FriendAttemptAck {
+            value: Some(friend_attempt_ack::Value::Rejected(_)),
+        })
+    ));
+}
+
+#[test]
+fn friend_inbox_validates_and_preserves_request_identity() {
+    use iam_protocol::pb::*;
+    use iam_protocol::{encode_frame, DecodedBody};
+
+    let request_id = iam_protocol::generate_id128().to_vec();
+    let mut page = FriendInboxAck {
+        requests: vec![FriendApplicant {
+            from_user_id: Some(u64::MAX),
+            request_id: Some(request_id.into()),
+        }],
+        next_after_user_id: None,
+    };
+    let head = Head { req_id: Some(1) };
+    for expected in [FriendInboxAck::default(), page.clone()] {
+        let bytes = encode_frame(MsgType::FriendInboxAck, &head, &expected).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&bytes);
+        let frame = decoder.next_frame().unwrap().unwrap();
+        assert!(
+            matches!(decode_frame(&frame).unwrap().body, DecodedBody::FriendInboxAck(ack) if ack == expected)
+        );
+    }
+    page.requests[0].request_id = None;
+    assert!(raw_body(MsgType::FriendInboxAck, &page.encode_to_vec()).is_err());
+    page.requests[0].request_id = Some(vec![0; 16].into());
+    assert!(raw_body(MsgType::FriendInboxAck, &page.encode_to_vec()).is_err());
+}
+
+#[test]
 fn recursive_wire_validation_rejects_duplicates_and_multiple_branches() {
     // Duplicate SendRequest.key and nested MessageKey.conversation_id.
     for body in [&[0x0a, 0, 0x0a, 0][..], &[0x0a, 4, 8, 1, 8, 1][..]] {

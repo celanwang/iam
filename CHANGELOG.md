@@ -14,6 +14,8 @@ a dated version section when cutting a release.
 
 ### Added
 
+- UUIDv7 friend applications with explicit rejection and safe reapplication.
+  Replayed decisions preserve their original result, including across upgrades.
 - Authenticated friend requests, paginated incoming requests, and acceptance
   over TCP + TLS, with durable retries and a shared direct conversation
   discovered through account sync.

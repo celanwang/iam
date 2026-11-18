@@ -87,3 +87,19 @@ CREATE TABLE IF NOT EXISTS friend_requests (
     PRIMARY KEY (tenant_id, to_user_id, from_user_id),
     KEY pending_incoming (tenant_id, to_user_id, pending, from_user_id)
 );
+
+CREATE TABLE IF NOT EXISTS friend_attempts (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    to_user_id BIGINT UNSIGNED NOT NULL,
+    from_user_id BIGINT UNSIGNED NOT NULL,
+    request_id BINARY(16) NOT NULL,
+    outcome TINYINT UNSIGNED NOT NULL,
+    conversation_id BIGINT UNSIGNED NULL,
+    legacy_slot TINYINT UNSIGNED NULL,
+    pending_slot TINYINT GENERATED ALWAYS AS (IF(outcome = 1, 1, NULL)) VIRTUAL,
+    PRIMARY KEY (tenant_id, to_user_id, from_user_id, request_id),
+    UNIQUE KEY sender_request (tenant_id, from_user_id, request_id),
+    UNIQUE KEY pending_attempt (tenant_id, to_user_id, pending_slot, from_user_id),
+    UNIQUE KEY legacy_attempt (tenant_id, to_user_id, from_user_id, legacy_slot),
+    KEY legacy_inbox (tenant_id, to_user_id, legacy_slot, pending_slot, from_user_id)
+);

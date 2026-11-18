@@ -58,16 +58,18 @@ pub(crate) fn validate_response(body: &crate::DecodedBody) -> Result<()> {
     use crate::DecodedBody as B;
     match body {
         B::FriendListAck(page) => {
-            let ids = &page.from_user_ids;
-            if ids.len() > crate::MAX_FRIEND_REQUESTS
-                || ids.first() == Some(&0)
-                || ids.windows(2).any(|pair| pair[0] >= pair[1])
-                || page.next_after_user_id.is_some_and(|next| {
-                    ids.len() != crate::MAX_FRIEND_REQUESTS || ids.last() != Some(&next)
-                })
-            {
-                return invalid("invalid friend request page");
-            }
+            validate_friend_page(page.from_user_ids.iter().copied(), page.next_after_user_id)?;
+        }
+        B::FriendInboxAck(page) => validate_friend_page(
+            page.requests
+                .iter()
+                .map(|request| request.from_user_id.unwrap()),
+            page.next_after_user_id,
+        )?,
+        B::FriendDecideAck(ack)
+            if matches!(ack.value, Some(friend_attempt_ack::Value::Pending(_))) =>
+        {
+            return invalid("friend decision must be final");
         }
         B::AuthAck(r) => {
             if let Some(auth_response::Value::Session(s)) = &r.value {
@@ -168,6 +170,23 @@ pub(crate) fn validate_response(body: &crate::DecodedBody) -> Result<()> {
 
 fn invalid<T>(reason: &'static str) -> Result<T> {
     Err(ProtocolErrorKind::InvalidArgument(reason))
+}
+
+fn validate_friend_page(ids: impl ExactSizeIterator<Item = u64>, next: Option<u64>) -> Result<()> {
+    let len = ids.len();
+    let mut last = 0;
+    for id in ids {
+        if id <= last {
+            return invalid("invalid friend request order");
+        }
+        last = id;
+    }
+    if len > crate::MAX_FRIEND_REQUESTS
+        || next.is_some_and(|next| len != crate::MAX_FRIEND_REQUESTS || next != last)
+    {
+        return invalid("invalid friend request page");
+    }
+    Ok(())
 }
 fn conversation(ctx: &pb::StreamContext) -> Option<u64> {
     match ctx.target.as_ref().and_then(|t| t.value.as_ref()) {
