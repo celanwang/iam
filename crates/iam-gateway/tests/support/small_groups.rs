@@ -597,3 +597,6 @@ async fn tidb_tls_groups_limit_counts_distinct_members_including_creator() {
     assert_group_view(&mut client, id, None, 2).await;
     gateway.stop().await;
 }
+
+#[path = "group_invites.rs"]
+mod invites;
