@@ -36,6 +36,12 @@ UUIDv7 可以由设备自行生成，重连后仍可用同一个 ID 指向原消
 
 每项包含 `ConversationState` 和可选的 `latest_cached_message`。预览取本地已保存的创建序号最大的一条消息，受当前同步进度和历史缓存范围限制。首次恢复前可能为空，离线时也可能落后于服务端。账户撤权变化或移除该会话的账户快照落盘后，列表项、预览和缓存消息一并移除。重新打开同一设备的数据库可继续读取已落盘的视图。
 
+### 跨设备读取和提交阅读位置
+
+使用列表项的 `ConversationState` 调用 `Client::read_position`，查询当前账号在该会话的共享阅读位置。尚未保存时返回 `None`。应用确认用户已读到某条消息后，可以把该消息的 `create_seq` 传给 `Client::advance_read_position`。返回值是 TiDB 确认保存的位置，可能被另一台设备推进得更远。消息同步和缓存读取本身不会推进阅读位置。
+
+两个方法均使用调用方提供的传输和设备凭证建立新的认证连接。若同一设备正在运行 `Client::run`，先结束同步循环再调用，以免触发同设备会话接管。收到 `CONTEXT_CHANGED` 时先同步会话状态。收到结果暂不可用时可重试原位置。
+
 ## 最后一条推送丢了
 
 设备已同步到 40，消息 41 已保存，但推送丢了，之后也没有新消息。即使连接一直在线，设备也会到点用原游标发起 `SYNC`，补回 41。真实 TiDB 验收已覆盖这条路径。
@@ -78,6 +84,14 @@ UUIDv7 可以由设备自行生成，重连后仍可用同一个 ID 指向原消
 IAM_TIDB_TEST_URL='mysql://root@127.0.0.1:4000/iam_test' \
 IAM_TIDB_ALLOW_TEST_WRITES=1 \
 cargo test -p iam-store --test client_reliability tidb_client_view_tracks_sync_without_reconnecting -- --ignored --exact
+```
+
+阅读位置的双设备、撤权、重启和丢回包验收使用真实 TiDB 与 TCP + TLS。
+
+```sh
+IAM_TIDB_TEST_URL='mysql://root@127.0.0.1:4000/iam_test' \
+IAM_TIDB_ALLOW_TEST_WRITES=1 \
+cargo test -p iam-gateway --test tls read_position -- --ignored --test-threads=1
 ```
 
 [消息协议](./protocol.md) · [存储设计](./storage.md)

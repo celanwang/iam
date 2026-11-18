@@ -29,6 +29,9 @@ pub(crate) mod perf;
 #[path = "membership.rs"]
 mod membership;
 
+#[path = "read_position.rs"]
+mod read_position;
+
 #[cfg(test)]
 #[path = "friend_tests.rs"]
 mod friend_tests;
@@ -56,7 +59,7 @@ const CONTROL: &str = "SELECT store_id, token_key, max_observed_now_ms, closed_t
 
 const INITIAL_ACCESS: u64 = 1;
 const STORAGE_SCHEMA_VERSION: u8 = 3;
-const TABLES: [&str; 11] = [
+const TABLES: [&str; 12] = [
     "store_control",
     "conversations",
     "messages",
@@ -64,6 +67,7 @@ const TABLES: [&str; 11] = [
     "members",
     "account_events",
     "conversation_retention",
+    "read_positions",
     "direct_pairs",
     "friend_requests",
     "friend_attempts",
@@ -855,6 +859,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
         sqlx::query(query).execute(pool).await?;
     }
     if !legacy_only {
+        read_position::check_schema(pool).await?;
         for query in [
             "SELECT tenant_id, user_id, account_sequence, conversation_id, history_id, access_version FROM account_events LIMIT 0",
             "SELECT tenant_id, conversation_id, floor_sequence FROM conversation_retention LIMIT 0",

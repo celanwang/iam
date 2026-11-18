@@ -13,6 +13,7 @@ impl TidbStore {
 
         for statement in include_str!("../schema.sql").split(';').map(str::trim) {
             if statement.starts_with("CREATE TABLE IF NOT EXISTS account_events ")
+                || statement.starts_with("CREATE TABLE IF NOT EXISTS read_positions ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS conversation_retention ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS direct_pairs ")
                 || statement.starts_with("CREATE TABLE IF NOT EXISTS friend_requests ")

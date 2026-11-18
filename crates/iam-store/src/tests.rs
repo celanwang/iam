@@ -66,6 +66,7 @@ async fn tidb_single_schema_supports_unsigned_ids_and_ordered_pages() {
             "group_creations",
             "members",
             "messages",
+            "read_positions",
             "rejections",
             "store_control"
         ]

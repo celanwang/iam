@@ -70,6 +70,16 @@ CREATE TABLE IF NOT EXISTS conversation_retention (
     PRIMARY KEY (tenant_id, conversation_id)
 );
 
+CREATE TABLE IF NOT EXISTS read_positions (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    conversation_id BIGINT UNSIGNED NOT NULL,
+    user_id BIGINT UNSIGNED NOT NULL,
+    history_id BINARY(16) NOT NULL,
+    access_version BIGINT UNSIGNED NOT NULL,
+    read_through BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (tenant_id, conversation_id, user_id, history_id, access_version)
+);
+
 CREATE TABLE IF NOT EXISTS direct_pairs (
     tenant_id BIGINT UNSIGNED NOT NULL,
     user_low BIGINT UNSIGNED NOT NULL,

@@ -27,6 +27,10 @@ pub enum Error {
     Unauthenticated,
     #[error("current session cannot access this conversation")]
     PermissionDenied,
+    #[error("the read position belongs to a different history or access period")]
+    ReadPositionContextChanged,
+    #[error("read position mutations are paused")]
+    ReadPositionPaused,
     #[error("friend account or incoming request not found")]
     FriendNotFound,
     #[error("the legacy friend request was closed or the pair uses explicit request IDs")]
