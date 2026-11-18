@@ -1,5 +1,7 @@
 use super::friends::validate_peer;
-use super::membership::{direct_pair, lock_authority, ordered_pair};
+use super::membership::{
+    direct_pair, lock_authority, ordered_pair, pause_direct_sends, resume_direct_sends,
+};
 use super::*;
 
 impl TidbStore {
@@ -38,30 +40,8 @@ impl TidbStore {
             .ok_or(Error::FriendNotFound)?;
         admit(true)?;
 
+        pause_direct_sends(&mut tx, tenant, pair).await?;
         let [low, high] = pair;
-        // Membership events retain the two original participants even after independent
-        // access revocation. This also finds non-canonical Directs from older stores.
-        let blocked = sqlx::query(
-            "INSERT INTO direct_send_blocks (tenant_id, conversation_id, user_low, user_high)
-             SELECT DISTINCT a.tenant_id, a.conversation_id, ?, ?
-             FROM account_events a
-             JOIN conversations c ON c.tenant_id = a.tenant_id AND c.conversation_id = a.conversation_id
-             WHERE a.tenant_id = ? AND a.user_id = ? AND c.kind = 1
-               AND EXISTS (SELECT 1 FROM account_events b WHERE b.tenant_id = a.tenant_id
-                           AND b.user_id = ? AND b.conversation_id = a.conversation_id)",
-        )
-        .bind(low)
-        .bind(high)
-        .bind(tenant)
-        .bind(low)
-        .bind(high)
-        .execute(&mut *tx)
-        .await?;
-        if blocked.rows_affected() == 0 {
-            return Err(Error::Integrity(
-                "friendship is missing its direct conversation",
-            ));
-        }
         sqlx::query(
             "INSERT INTO friend_removals (tenant_id, user_low, user_high, generation, conversation_id)
              VALUES (?, ?, ?, ?, ?)",
@@ -115,14 +95,7 @@ pub(super) async fn restart_friendship(
             break id;
         }
     };
-    sqlx::query(
-        "DELETE FROM direct_send_blocks WHERE tenant_id = ? AND user_low = ? AND user_high = ?",
-    )
-    .bind(tenant)
-    .bind(pair[0])
-    .bind(pair[1])
-    .execute(db)
-    .await?;
+    resume_direct_sends(db, tenant, pair).await?;
     Ok(generation)
 }
 

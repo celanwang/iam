@@ -14,6 +14,9 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Directional user blocks with durable block and unblock results. Either
+  direction prevents new direct sends, friend acceptance, and group admission
+  involving the creator while preserving existing history and group access.
 - Generation-scoped friend removal with durable retries and suspension of
   new direct sends while preserving chat history and existing group access.
 - Idempotent creation of groups with up to 32 initial members, with group

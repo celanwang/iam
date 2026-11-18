@@ -50,6 +50,11 @@ mod friend_removal_tests;
 mod group_tests;
 #[path = "groups.rs"]
 mod groups;
+#[cfg(test)]
+#[path = "user_block_tests.rs"]
+mod user_block_tests;
+#[path = "user_blocks.rs"]
+mod user_blocks;
 use membership::{
     backfill_direct_pairs, create_conversation_in, mark_schema_ready, schema_version,
 };
@@ -65,8 +70,8 @@ const CONTROL: &str = "SELECT store_id, token_key, max_observed_now_ms, closed_t
                        FROM store_control WHERE singleton = 1 FOR UPDATE";
 
 const INITIAL_ACCESS: u64 = 1;
-const STORAGE_SCHEMA_VERSION: u8 = 4;
-const TABLES: [&str; 14] = [
+const STORAGE_SCHEMA_VERSION: u8 = 5;
+const TABLES: [&str; 16] = [
     "store_control",
     "conversations",
     "messages",
@@ -81,6 +86,8 @@ const TABLES: [&str; 14] = [
     "group_creations",
     "friend_removals",
     "direct_send_blocks",
+    "user_blocks",
+    "user_block_changes",
 ];
 
 struct DecisionClock {
@@ -882,13 +889,15 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
             "SELECT tenant_id, creator_id, request_id, member_set, conversation_id FROM group_creations LIMIT 0",
             "SELECT tenant_id, user_low, user_high, generation, conversation_id FROM friend_removals LIMIT 0",
             "SELECT tenant_id, conversation_id, user_low, user_high FROM direct_send_blocks FORCE INDEX (blocked_pair) LIMIT 0",
+            "SELECT tenant_id, actor_id, peer_id FROM user_blocks LIMIT 0",
+            "SELECT tenant_id, actor_id, request_id, peer_id, blocked FROM user_block_changes LIMIT 0",
         ] {
             sqlx::query(query).execute(pool).await?;
         }
     }
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT table_name, index_name, column_name FROM information_schema.statistics \
-         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests', 'friend_attempts', 'group_creations', 'friend_removals', 'direct_send_blocks') \
+         WHERE table_schema = DATABASE() AND table_name IN ('store_control', 'conversations', 'messages', 'rejections', 'members', 'account_events', 'conversation_retention', 'direct_pairs', 'friend_requests', 'friend_attempts', 'group_creations', 'friend_removals', 'direct_send_blocks', 'user_blocks', 'user_block_changes') \
          AND non_unique = 0 ORDER BY table_name, index_name, seq_in_index",
     )
     .fetch_all(pool)
@@ -906,6 +915,8 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
                     | "group_creations"
                     | "friend_removals"
                     | "direct_send_blocks"
+                    | "user_blocks"
+                    | "user_block_changes"
             )
         {
             continue;
@@ -919,7 +930,7 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
         "conversation_id",
         "client_msg_id",
     ];
-    let expected: [(&str, &str, &[&str]); 21] = [
+    let expected: [(&str, &str, &[&str]); 23] = [
         ("store_control", "PRIMARY", &["singleton"]),
         (
             "conversations",
@@ -1012,6 +1023,16 @@ async fn check_schema(pool: &MySqlPool, legacy_only: bool) -> Result<()> {
             "direct_send_blocks",
             "PRIMARY",
             &["tenant_id", "conversation_id"],
+        ),
+        (
+            "user_blocks",
+            "PRIMARY",
+            &["tenant_id", "actor_id", "peer_id"],
+        ),
+        (
+            "user_block_changes",
+            "PRIMARY",
+            &["tenant_id", "actor_id", "request_id"],
         ),
     ];
     let expected = if legacy_only {

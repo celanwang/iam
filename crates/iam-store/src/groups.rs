@@ -86,15 +86,24 @@ async fn require_friends(db: &mut MySqlConnection, creator: Identity, peers: &[u
         .iter()
         .map(|&peer| ordered_pair(creator.user_id, peer));
     let mut query = sqlx::QueryBuilder::<MySql>::new(
-        "SELECT 1 FROM direct_pairs WHERE friends = TRUE AND tenant_id = ",
+        "SELECT 1 FROM direct_pairs p WHERE p.friends = TRUE AND p.tenant_id = ",
     );
     query
         .push_bind(creator.tenant_id)
-        .push(" AND (user_low, user_high) IN ");
+        .push(" AND (p.user_low, p.user_high) IN ");
     query.push_tuples(pairs, |mut values, [low, high]| {
         values.push_bind(low).push_bind(high);
     });
-    let friends = query.push(" FOR UPDATE").build().fetch_all(db).await?;
+    let friends = query
+        .push(
+            " AND NOT EXISTS (SELECT 1 FROM user_blocks b WHERE b.tenant_id = p.tenant_id AND
+                           ((b.actor_id = p.user_low AND b.peer_id = p.user_high)
+                            OR (b.actor_id = p.user_high AND b.peer_id = p.user_low)))
+          FOR UPDATE",
+        )
+        .build()
+        .fetch_all(db)
+        .await?;
     if friends.len() != peers.len() {
         return Err(Error::PermissionDenied);
     }

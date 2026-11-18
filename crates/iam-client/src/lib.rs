@@ -7,6 +7,7 @@ mod read_position;
 mod storage;
 mod sync;
 mod tls;
+mod user_blocks;
 mod wire;
 
 pub use storage::ClientView;
