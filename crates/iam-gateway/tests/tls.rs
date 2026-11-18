@@ -3,6 +3,8 @@ mod capacity;
 #[allow(dead_code)]
 #[path = "../../iam-store/tests/support/commit_proxy.rs"]
 mod commit_proxy;
+#[path = "support/friends.rs"]
+mod friends;
 #[path = "../../iam-store/tests/support/mod.rs"]
 mod support;
 
@@ -396,6 +398,7 @@ async fn tidb_tls_recovers_committed_send_after_client_disconnect() {
 }
 
 struct Fixture {
+    seed_direct: bool,
     database: Url,
     store: Id128,
     alice: Id128,
@@ -413,6 +416,7 @@ impl Fixture {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(certificate.clone()).unwrap();
         Self {
+            seed_direct: true,
             database: support::isolated_database().await,
             store: generate_id128(),
             alice: generate_id128(),
@@ -453,7 +457,9 @@ impl Fixture {
         _clock_window_ms: Option<u64>,
     ) -> RunningGateway {
         let mut engine = Engine::new(0);
-        engine.store.seed_direct(1, 1, 100, 200);
+        if self.seed_direct {
+            engine.store.seed_direct(1, 1, 100, 200);
+        }
         engine
             .store
             .configure_device_credentials(credentials)
@@ -615,29 +621,31 @@ async fn expect_close(transport: &mut TlsTransport, code: ErrorCode) {
 }
 
 fn key() -> MessageKey {
+    message_key(1)
+}
+
+fn message_key(conversation: u64) -> MessageKey {
     MessageKey {
-        conversation_id: Some(1),
+        conversation_id: Some(conversation),
         client_msg_id: Some(generate_id128().to_vec().into()),
     }
 }
 
 async fn send(transport: &mut TlsTransport, id: u64, key: MessageKey, text: &str) {
-    let result = request(
-        transport,
-        id,
-        MsgType::Send,
-        &SendRequest {
-            key: Some(key),
-            content: Some(MessageContent {
-                value: Some(message_content::Value::Text(TextContent {
-                    text: Some(text.to_owned()),
-                })),
-            }),
-        },
-    )
-    .await;
+    let result = request(transport, id, MsgType::Send, &send_request(key, text)).await;
     assert!(matches!(result, DecodedBody::SendAck(reply)
         if matches!(reply.outcome.as_ref().and_then(|result| result.value.as_ref()), Some(send_outcome::Value::Committed(_)))));
+}
+
+fn send_request(key: MessageKey, text: &str) -> SendRequest {
+    SendRequest {
+        key: Some(key),
+        content: Some(MessageContent {
+            value: Some(message_content::Value::Text(TextContent {
+                text: Some(text.to_owned()),
+            })),
+        }),
+    }
 }
 
 async fn wait_messages(client: &mut SqliteConnection, count: i64) {
