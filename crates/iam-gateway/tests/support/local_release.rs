@@ -1,5 +1,5 @@
 use super::*;
-use iam_protocol::pb::friend_attempt_ack;
+use iam_protocol::pb::{friend_attempt_ack, group_invite_result_ack};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -381,6 +381,52 @@ async fn tidb_tls_local_release_recovers_after_gateway_process_exit() {
         [direct]
     );
     drop(bob_wire);
+
+    assert!(!bob
+        .set_user_block(&mut bob_tls, BOB, 100, generate_id128(), false)
+        .await
+        .unwrap());
+    let invitation = generate_id128();
+    let mut alice_tls = config.transport(&address);
+    assert!(matches!(
+        alice
+            .invite_group_member(&mut alice_tls, ALICE, group, 200, invitation)
+            .await
+            .unwrap()
+            .value,
+        Some(group_invite_result_ack::Value::Pending(_))
+    ));
+    let pending = bob.group_invite_inbox(&mut bob_tls, BOB, 0).await.unwrap();
+    assert!(pending.invitations.iter().any(|invite| {
+        invite.conversation_id == Some(group)
+            && invite.inviter_user_id == Some(alice_identity.user_id)
+            && invite.request_id.as_deref() == Some(invitation.as_slice())
+    }));
+    assert_eq!(
+        bob.decide_group_invite(&mut bob_tls, BOB, group, invitation, true)
+            .await
+            .unwrap()
+            .value,
+        Some(group_invite_result_ack::Value::ConversationId(group))
+    );
+
+    let mut bob_wire = ObservedTls {
+        tls: config.transport(&address),
+        syncs: Vec::new(),
+    };
+    sync_through(&mut bob, &mut bob_wire, &mut bob_db, BOB, group, 2).await;
+    assert_eq!(bob.messages(group).await.unwrap().len(), 2);
+    drop(bob_wire);
+    bob.leave_group(&mut bob_tls, BOB, &group_state)
+        .await
+        .unwrap();
+    let rejoined = bob.group_members(&mut bob_tls, BOB, group).await.unwrap();
+    let bob_membership = rejoined
+        .members
+        .iter()
+        .find(|member| member.user_id == Some(bob_identity.user_id))
+        .expect("old leave must not remove the rejoined member");
+    assert_ne!(bob_membership.access_version, group_state.access_version);
     resumed.kill().await.unwrap();
 }
 
