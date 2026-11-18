@@ -60,6 +60,8 @@ async fn tidb_single_schema_supports_unsigned_ids_and_ordered_pages() {
             "account_events",
             "conversation_retention",
             "conversations",
+            "direct_pairs",
+            "friend_requests",
             "members",
             "messages",
             "rejections",
@@ -167,6 +169,15 @@ async fn tidb_resume_checks_schema_without_repairing_it() {
     TidbStore::open(url.as_str(), id, Some(&MemoryStore::new(0)))
         .await
         .unwrap();
+    sqlx::query("UPDATE store_control SET friends_ready = 0 WHERE singleton = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        TidbStore::open(url.as_str(), id, None).await,
+        Err(Error::Configuration(_))
+    ));
+    TidbStore::upgrade(url.as_str(), id).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP INDEX successful_send")
         .execute(&pool)
         .await
@@ -206,6 +217,267 @@ async fn tidb_initialize_leaves_legacy_rows_untouched() {
     .await
     .unwrap();
     assert_eq!(sequence, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_friend_crossed_requests_commit_one_direct_and_two_account_events() {
+    let url = support::isolated_database().await;
+    let id = generate_id128();
+    let store = TidbStore::open(url.as_str(), id, Some(&MemoryStore::new(0)))
+        .await
+        .unwrap();
+    let alice = friend_identity(1, u64::MAX);
+    let bob = friend_identity(1, 2);
+    let other_tenant = friend_identity(2, bob.user_id);
+
+    for (from, to) in [(alice, bob), (bob, alice)] {
+        assert_eq!(
+            store
+                .request_friend(from, to.user_id, |_| Ok(()))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .request_friend(from, to.user_id, |write| {
+                    assert!(!write);
+                    Ok(())
+                })
+                .await
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            store.incoming_friends(to, 0).await.unwrap().from_user_ids,
+            [from.user_id],
+        );
+        assert_eq!(store.stream(to, Scope::Account).await.unwrap().upper, 0);
+    }
+    assert!(matches!(
+        store
+            .accept_friend(other_tenant, alice.user_id, |_| Ok(()))
+            .await,
+        Err(Error::FriendNotFound)
+    ));
+
+    let (ab, ba) = tokio::join!(
+        store.accept_friend(alice, bob.user_id, |_| Ok(())),
+        store.accept_friend(bob, alice.user_id, |_| Ok(())),
+    );
+    let conversation = ab.unwrap();
+    assert_eq!(ba.unwrap(), conversation);
+
+    let resumed = TidbStore::open(url.as_str(), id, None).await.unwrap();
+    for (recipient, sender) in [(alice, bob), (bob, alice)] {
+        let no_write = |write: bool| {
+            assert!(!write);
+            Ok(())
+        };
+        assert_eq!(
+            resumed
+                .accept_friend(recipient, sender.user_id, no_write)
+                .await
+                .unwrap(),
+            conversation
+        );
+        assert_eq!(
+            resumed
+                .request_friend(recipient, sender.user_id, no_write)
+                .await
+                .unwrap(),
+            Some(conversation)
+        );
+        assert!(resumed
+            .incoming_friends(recipient, 0)
+            .await
+            .unwrap()
+            .from_user_ids
+            .is_empty());
+        assert_eq!(
+            resumed
+                .stream(recipient, Scope::Account)
+                .await
+                .unwrap()
+                .upper,
+            1
+        );
+        assert_eq!(
+            resumed
+                .stream(recipient, Scope::Conversation(conversation))
+                .await
+                .unwrap()
+                .access_version,
+            1
+        );
+    }
+    let count: i64 = sqlx::query_scalar("SELECT CAST(COUNT(*) AS SIGNED) FROM conversations")
+        .fetch_one(&resumed.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_friend_upgrade_preserves_legacy_ids_access_and_cursors() {
+    let url = support::isolated_database().await;
+    let id = generate_id128();
+    let mut seeds = MemoryStore::new(0);
+    let canonical = seeds.seed_direct(1, 4, 10, 20);
+    let duplicate = seeds.seed_direct(1, 7, 10, 20);
+    let store = TidbStore::open(url.as_str(), id, Some(&seeds))
+        .await
+        .unwrap();
+    let alice = friend_identity(1, 10);
+    let bob = friend_identity(1, 20);
+    store
+        .set_member_access(1, 4, bob.user_id, false)
+        .await
+        .unwrap();
+    let upper = store.stream(bob, Scope::Account).await.unwrap().upper;
+    let cursor = iam_core::SyncCursor {
+        tenant_id: bob.tenant_id,
+        user_id: bob.user_id,
+        device_id: bob.device_id,
+        conversation_id: 0,
+        epoch: id,
+        access_version: 0,
+        covered_through: upper,
+        issued_at_ms: store.now().await.unwrap(),
+        is_account: true,
+    };
+    let token = store.tokens.sign_cursor(&cursor);
+
+    // Recreate the pre-friends schema, keeping existing memberships and account events.
+    let pool = store.pool.clone();
+    drop(store);
+    drop_friend_schema(&pool).await;
+    assert!(TidbStore::open(url.as_str(), id, None).await.is_err());
+    assert!(TidbStore::upgrade(url.as_str(), generate_id128())
+        .await
+        .is_err());
+    assert!(!tables(&pool).await.contains(&"direct_pairs".to_owned()));
+
+    TidbStore::upgrade(url.as_str(), id).await.unwrap();
+    TidbStore::upgrade(url.as_str(), id).await.unwrap();
+    let store = TidbStore::open(url.as_str(), id, None).await.unwrap();
+    assert_eq!(
+        store
+            .tokens
+            .verify_cursor(&token, store.now().await.unwrap())
+            .unwrap(),
+        cursor
+    );
+    assert_eq!(
+        store.stream(bob, Scope::Account).await.unwrap().upper,
+        upper
+    );
+    assert_eq!(
+        store
+            .stream(bob, Scope::Conversation(7))
+            .await
+            .unwrap()
+            .epoch,
+        duplicate
+    );
+    assert!(matches!(
+        store.stream(bob, Scope::Conversation(4)).await,
+        Err(Error::PermissionDenied)
+    ));
+    assert!(store.create_direct(1, 9, 10, 20).await.is_err());
+    assert_eq!(
+        store
+            .request_friend(alice, bob.user_id, |_| Ok(()))
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        store.accept_friend(bob, alice.user_id, |_| Ok(())).await,
+        Err(Error::PermissionDenied)
+    ));
+    assert_eq!(
+        store.incoming_friends(bob, 0).await.unwrap().from_user_ids,
+        [alice.user_id]
+    );
+
+    store
+        .set_member_access(1, 4, bob.user_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .accept_friend(bob, alice.user_id, |_| Ok(()))
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        store
+            .stream(bob, Scope::Conversation(4))
+            .await
+            .unwrap()
+            .epoch,
+        canonical
+    );
+    assert_eq!(
+        store.stream(bob, Scope::Account).await.unwrap().upper,
+        upper + 1
+    );
+    assert_eq!(store.stream(alice, Scope::Account).await.unwrap().upper, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB"]
+async fn tidb_friend_lists_only_pending_requests_with_exclusive_paging() {
+    let url = support::isolated_database().await;
+    let store = TidbStore::open(url.as_str(), generate_id128(), Some(&MemoryStore::new(0)))
+        .await
+        .unwrap();
+    let bob = friend_identity(1, u64::MAX);
+    let mut insert = sqlx::QueryBuilder::<MySql>::new("INSERT INTO friend_requests ");
+    insert.push_values(1_u64..=102, |mut row, sender| {
+        row.push_bind(1_u64)
+            .push_bind(bob.user_id)
+            .push_bind(sender)
+            .push_bind(true);
+    });
+    insert.build().execute(&store.pool).await.unwrap();
+    store.accept_friend(bob, 1, |_| Ok(())).await.unwrap();
+    store
+        .request_friend(friend_identity(2, 3), bob.user_id, |_| Ok(()))
+        .await
+        .unwrap();
+
+    let first = store.incoming_friends(bob, 0).await.unwrap();
+    assert_eq!(first.from_user_ids, (2..=101).collect::<Vec<_>>());
+    assert_eq!(first.next_after_user_id, Some(101));
+    let last = store
+        .incoming_friends(bob, first.next_after_user_id.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(last.from_user_ids, [102]);
+    assert_eq!(last.next_after_user_id, None);
+}
+
+fn friend_identity(tenant_id: u64, user_id: u64) -> Identity {
+    Identity {
+        tenant_id,
+        user_id,
+        device_id: generate_id128(),
+    }
+}
+
+async fn drop_friend_schema(pool: &MySqlPool) {
+    for ddl in [
+        "DROP TABLE friend_requests",
+        "DROP TABLE direct_pairs",
+        "ALTER TABLE store_control DROP COLUMN friends_ready",
+    ] {
+        sqlx::query(ddl).execute(pool).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -358,6 +630,7 @@ async fn tidb_upgrade_preserves_receipts_and_account_cursors() {
     request.cursor = page.resume_cursor;
     assert!(request.cursor.is_some());
 
+    drop_friend_schema(&store.pool).await;
     for statement in [
         "DROP TABLE account_events",
         "DROP TABLE conversation_retention",

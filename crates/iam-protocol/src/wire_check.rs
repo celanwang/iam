@@ -273,6 +273,7 @@ fn optional(message: &str, field: &str) -> bool {
                 "history_window" | "next_page_token" | "resume_cursor"
             )
             | ("HistoryPage", "next_page_token")
+            | ("FriendListAck", "next_after_user_id")
             | ("ProtocolError", "ref_msg_type")
     )
 }

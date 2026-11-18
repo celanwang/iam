@@ -27,6 +27,10 @@ pub enum Error {
     Unauthenticated,
     #[error("current session cannot access this conversation")]
     PermissionDenied,
+    #[error("friend account or incoming request not found")]
+    FriendNotFound,
+    #[error("friend mutations are paused")]
+    FriendUnavailable,
     #[error("invalid request: {0}")]
     InvalidRequest(&'static str),
     #[error("conversation sequence exhausted")]

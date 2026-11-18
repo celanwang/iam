@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS store_control (
     token_key BINARY(32) NOT NULL,
     max_observed_now_ms BIGINT NOT NULL,
     closed_through_client_ms BIGINT NOT NULL,
+    friends_ready TINYINT UNSIGNED NOT NULL DEFAULT 0,
     PRIMARY KEY (singleton)
 );
 
@@ -66,4 +67,23 @@ CREATE TABLE IF NOT EXISTS conversation_retention (
     conversation_id BIGINT UNSIGNED NOT NULL,
     floor_sequence BIGINT UNSIGNED NOT NULL,
     PRIMARY KEY (tenant_id, conversation_id)
+);
+
+CREATE TABLE IF NOT EXISTS direct_pairs (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    user_low BIGINT UNSIGNED NOT NULL,
+    user_high BIGINT UNSIGNED NOT NULL,
+    conversation_id BIGINT UNSIGNED NOT NULL,
+    friends BOOLEAN NOT NULL,
+    PRIMARY KEY (tenant_id, user_low, user_high),
+    UNIQUE KEY direct_conversation (tenant_id, conversation_id)
+);
+
+CREATE TABLE IF NOT EXISTS friend_requests (
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    to_user_id BIGINT UNSIGNED NOT NULL,
+    from_user_id BIGINT UNSIGNED NOT NULL,
+    pending BOOLEAN NOT NULL,
+    PRIMARY KEY (tenant_id, to_user_id, from_user_id),
+    KEY pending_incoming (tenant_id, to_user_id, pending, from_user_id)
 );

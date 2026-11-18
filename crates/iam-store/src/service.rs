@@ -3,9 +3,9 @@ use crate::store::{unresolved, Decision, Scope, SendKey, TidbStore};
 use crate::{ConversationInfo, Error, Identity, Result, TextPage};
 use iam_core::{CoreError, DeviceCredential, Engine, EngineOutput, EngineReply, StorageRequest};
 use iam_protocol::pb::{
-    change, message_content, send_outcome, Change, ErrorCode, HistoryResponse, MessageContent,
-    MessageKey, RetryAction, SendOutcome, SendResponse, SendStatusResponse, SnapshotResponse,
-    SyncResponse,
+    change, friend_request_ack, message_content, send_outcome, Change, Empty, ErrorCode,
+    FriendAcceptAck, FriendRequestAck, HistoryResponse, MessageContent, MessageKey, RetryAction,
+    SendOutcome, SendResponse, SendStatusResponse, SnapshotResponse, SyncResponse,
 };
 use iam_protocol::{
     decode_frame, encode_frame, encode_protocol_error, validate_id128, DecodedBody, DecodedFrame,
@@ -38,12 +38,13 @@ pub struct TidbService {
 }
 
 impl TidbService {
-    /// Upgrade a stopped local store from the initial schema, keeping its identity and cursors.
+    /// Upgrade a stopped local store, keeping its identity and cursors.
     pub async fn upgrade_local(url: &str, store_id: Id128) -> Result<()> {
         TidbStore::upgrade(url, store_id).await
     }
 
     /// Trusted application operation. Wire clients cannot create conversations through this API.
+    /// A pair with an assigned conversation can only be opened under its canonical ID.
     pub async fn create_direct(
         &self,
         tenant: u64,
@@ -368,7 +369,93 @@ impl TidbService {
                     &HistoryResponse { value: Some(value) },
                 )
             }
+            DecodedBody::FriendRequest(req) => {
+                let Some(target) = req.target_user_id else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self
+                    .database
+                    .request_friend(identity, target, |write| {
+                        self.admit_friend(cid, write, Some(target))
+                    })
+                    .await
+                    .map(|conversation| FriendRequestAck {
+                        value: Some(conversation.map_or(
+                            friend_request_ack::Value::Pending(Empty {}),
+                            friend_request_ack::Value::ConversationId,
+                        )),
+                    });
+                self.friend_reply(cid, &decoded, MsgType::FriendRequestAck, result)
+            }
+            DecodedBody::FriendList(req) => {
+                let Some(after) = req.after_user_id else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self.database.incoming_friends(identity, after).await;
+                self.friend_reply(cid, &decoded, MsgType::FriendListAck, result)
+            }
+            DecodedBody::FriendAccept(req) => {
+                let Some(sender) = req.from_user_id else {
+                    return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
+                };
+                let result = self
+                    .database
+                    .accept_friend(identity, sender, |write| {
+                        self.admit_friend(cid, write, None)
+                    })
+                    .await
+                    .map(|conversation| FriendAcceptAck {
+                        conversation_id: Some(conversation),
+                    });
+                self.friend_reply(cid, &decoded, MsgType::FriendAcceptAck, result)
+            }
             _ => wire_error(cid, &decoded, ErrorCode::UnsupportedCommand),
+        }
+    }
+
+    fn admit_friend(&self, cid: Id128, write: bool, new_target: Option<u64>) -> Result<()> {
+        let engine = self.engine.lock().unwrap();
+        let identity = Self::identity(&engine, cid)?;
+        if write {
+            if !self.accepting.load(Ordering::Relaxed) {
+                return Err(Error::FriendUnavailable);
+            }
+            if new_target
+                .is_some_and(|target| !engine.store.has_account(identity.tenant_id, target))
+            {
+                return Err(Error::FriendNotFound);
+            }
+        }
+        Ok(())
+    }
+
+    fn friend_reply(
+        &self,
+        cid: Id128,
+        frame: &DecodedFrame,
+        kind: MsgType,
+        result: Result<impl Message>,
+    ) -> Result<EngineReply> {
+        if let Some(error) = self.check_read_session(cid, frame)? {
+            return Ok(error);
+        }
+        match result {
+            Ok(body) => reply(cid, frame, kind, &body),
+            Err(Error::InvalidRequest(_)) => wire_error(cid, frame, ErrorCode::InvalidArgument),
+            Err(Error::FriendNotFound) => wire_error(cid, frame, ErrorCode::NotFound),
+            Err(Error::PermissionDenied) => wire_error(cid, frame, ErrorCode::PermissionDenied),
+            Err(Error::Unauthenticated) => protocol_error(
+                None,
+                frame,
+                ErrorCode::Unauthenticated,
+                RetryAction::Reauthenticate,
+            ),
+            Err(_) => protocol_error(
+                Some(cid),
+                frame,
+                ErrorCode::ResultUnavailable,
+                RetryAction::RetrySameRequest,
+            ),
         }
     }
 

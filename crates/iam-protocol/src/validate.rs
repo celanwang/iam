@@ -57,6 +57,18 @@ pub(crate) fn validate_response(body: &crate::DecodedBody) -> Result<()> {
     use crate::pb::*;
     use crate::DecodedBody as B;
     match body {
+        B::FriendListAck(page) => {
+            let ids = &page.from_user_ids;
+            if ids.len() > crate::MAX_FRIEND_REQUESTS
+                || ids.first() == Some(&0)
+                || ids.windows(2).any(|pair| pair[0] >= pair[1])
+                || page.next_after_user_id.is_some_and(|next| {
+                    ids.len() != crate::MAX_FRIEND_REQUESTS || ids.last() != Some(&next)
+                })
+            {
+                return invalid("invalid friend request page");
+            }
+        }
         B::AuthAck(r) => {
             if let Some(auth_response::Value::Session(s)) = &r.value {
                 session(s)?;

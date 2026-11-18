@@ -75,7 +75,7 @@ Head {
 
 需要应答的请求必须显式携带非 0 的 `req_id`，按实际写入连接的顺序严格递增，发送队列在确定写入顺序时分配请求号。响应可以乱序返回，但必须回显原请求号；重试使用新请求号，逻辑消息身份不变。`PUSH`、`PUSH_ACK` 和无法关联请求的连接错误使用 0，不更新请求号水位；只有这些场景允许 `head_len = 0`。
 
-`Body` 根据 `msg_type` 解码为唯一指定结构。只有 `HEARTBEAT` 使用空消息体，其结构为 `HeartbeatRequest`，`body_len` 必须为 0。其他命令必须满足字段校验。线格式错误与业务错误分别按后文错误路由处理，不能仅凭解码成功就进入业务流程。
+`Body` 根据 `msg_type` 解码为唯一指定结构。`HEARTBEAT` 的 `body_len` 必须为 0。没有待接受申请时，`FRIEND_LIST_ACK` 也使用空消息体。其他命令必须满足字段校验。线格式错误与业务错误分别按后文错误路由处理，不能仅凭解码成功就进入业务流程。
 
 固定头的 `version` 用于校验帧与命令的兼容性，认证体不重复携带该信息。遇到不支持的版本或标志位时停止解码；可安全响应时返回协议错误，然后关闭连接。压缩扩展需要明确算法、压缩范围和解压后上限。
 
@@ -94,13 +94,16 @@ Head {
 14 SEND_STATUS   SendStatusRequest  -> 15 SEND_STATUS_ACK   SendStatusResponse
 16 SNAPSHOT      SnapshotRequest    -> 17 SNAPSHOT_ACK      SnapshotResponse
 18 HISTORY       HistoryRequest     -> 19 HISTORY_ACK       HistoryResponse
+20 FRIEND_REQUEST FriendRequest     -> 21 FRIEND_REQUEST_ACK FriendRequestAck
+22 FRIEND_LIST    FriendListRequest  -> 23 FRIEND_LIST_ACK    FriendListAck
+24 FRIEND_ACCEPT  FriendAcceptRequest -> 25 FRIEND_ACCEPT_ACK FriendAcceptAck
 ```
 
-`PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答，其余基本命令均需支持。
+`PUSH`、各类响应和 `ERROR` 由服务端发送，其余命令由客户端发送。服务端只在协商了 `push_ack` 能力后要求 `PUSH_ACK`，收悉本身不再应答。好友命令由 TiDB 服务支持，进程内消息引擎返回 `UNSUPPORTED_COMMAND`。
 
 命令方向错误、请求号未递增或需要应答的请求号为 0，属于协议错误，返回错误后关闭连接。未认证的业务请求返回 `UNAUTHENTICATED`，不改变认证状态，也不构成该逻辑发送的最终拒绝。
 
-业务响应使用 `oneof` 表达成功数据或错误，不能出现 `code = 0` 却缺少成功数据的情况。发送与发送查询使用专门的 `SendOutcome`，不能直接套用普通成功失败二分模型。
+认证、同步、快照和历史响应使用 `oneof` 表达成功数据或错误。发送与发送查询使用专门的 `SendOutcome`。好友命令的应答携带成功结果，业务错误通过 `ERROR` 返回。
 
 ## 公共结构
 
@@ -630,6 +633,16 @@ HistoryResponse = oneof {
 一轮历史分页固定读取上界和权限上下文，每页重新检查当前权限。`retention_floor_seq` 是从 1 起的历史保留下界，返回消息的创建序不得低于它，也不代表调用方可以看到范围内全部内容。过滤后可返回空页，但有下一页时内部扫描位置必须前进。没有下一页表示本轮可读范围结束，不表示这些消息从未存在或该会话没有新变化。
 
 历史读取不推进同步游标。返回的消息按历史代次和版本合并，不能覆盖已知较新的编辑、移除或撤回状态。历史代次或访问版本失效时停止分页，重新建立会话基线。
+
+## 好友申请与单聊
+
+- `FRIEND_REQUEST` 按 `target_user_id` 申请。服务端从认证会话取得租户、申请人身份，并在该租户账号目录里验证首次申请的目标。应答的 `pending` 表示已保存的待接受申请，`conversation_id` 表示已建立的好友单聊。
+- `FRIEND_LIST` 查询当前账号收到的待接受申请。首次将 `after_user_id` 显式设为 0。每页按申请人 ID 升序返回最多 100 条 `from_user_ids`，使用 Protobuf 非 packed 编码。有更多结果时，`next_after_user_id` 等于本页最后一个 ID，下一页以其为排他下界。各页反映查询时的状态，刷新列表从 0 开始。
+- `FRIEND_ACCEPT` 按 `from_user_id` 接受自己的入站申请。发送方和收件人身份均在认证租户范围内解析。交叉申请分别保存，在任一方明确接受后两条申请都退出待接受列表，任一合法方向后续重放返回同一个 `conversation_id`。
+
+首次成功接受使用已有的单聊，或原子建立单聊、授予两人访问权并写入各自的账号事件。双方用现有账号 `SYNC` 发现会话，随后按原规则 `SEND` 或同步会话。接受操作保留可信应用设置的撤权。预置单聊任一方已被撤权时，首次接受返回 `PERMISSION_DENIED`，申请保持待接受。
+
+目标或申请人 ID 缺失、为 0 或等于当前用户时，返回 `INVALID_ARGUMENT`。目标不是同租户的已知账号，或调用方没有该申请人的入站申请时，返回 `NOT_FOUND`。列表的 `after_user_id` 缺失时返回 `INVALID_ARGUMENT`。好友提交结果未知时返回 `RESULT_UNAVAILABLE / RETRY_SAME_REQUEST`。使用新的连接请求号和同一对端 ID 重试，从持久状态读取结果；申请重试在好友已建立时返回原单聊 ID。本轮每对账号只有一次申请周期，拒绝、解除或再次申请未开放。
 
 ## 错误路由与连接处理
 

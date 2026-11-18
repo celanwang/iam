@@ -4,7 +4,7 @@ use iam_protocol::pb::{
 };
 use iam_protocol::{generate_id128, id128_timestamp_ms, Id128};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 pub const ALLOW_SKEW_MS: i64 = 120_000;
 pub const ACCEPT_WINDOW_MS: i64 = 86_400_000;
@@ -113,7 +113,7 @@ pub struct MemoryStore {
     pub account_streams: HashMap<(u64, u64), AccountStream>,
     pub revoked_auth_epochs: HashSet<Id128>,
     pub(crate) device_credentials: Option<HashMap<[u8; 32], (Id128, DeviceCredential)>>,
-    pub(crate) credential_devices: HashMap<(u64, u64, Id128), [u8; 32]>,
+    pub(crate) credential_devices: BTreeMap<(u64, u64, Id128), [u8; 32]>,
     /// Monotonic close proof watermark over client_msg time coverage (ms).
     pub close_watermark_ms: i64,
     pub now_ms: i64,
@@ -154,7 +154,7 @@ impl MemoryStore {
         credentials: impl IntoIterator<Item = DeviceCredential>,
     ) -> Result<Vec<Id128>, &'static str> {
         let mut tokens = HashMap::new();
-        let mut devices = HashMap::new();
+        let mut devices = BTreeMap::new();
         let mut retained_revocations = HashSet::new();
         for c in credentials {
             if c.tenant_id == 0
@@ -209,6 +209,20 @@ impl MemoryStore {
 
     pub fn uses_device_credentials(&self) -> bool {
         self.device_credentials.is_some()
+    }
+
+    /// Whether the configured credentials or local user directory contain this account.
+    pub fn has_account(&self, tenant: u64, user: u64) -> bool {
+        if self.uses_device_credentials() {
+            self.credential_devices
+                .range((tenant, user, [0; 16])..=(tenant, user, [u8::MAX; 16]))
+                .next()
+                .is_some()
+        } else {
+            self.users_by_token
+                .values()
+                .any(|record| record.tenant_id == tenant && record.user_id == user)
+        }
     }
 
     pub(crate) fn credential_for_token(&self, token: &[u8]) -> Option<(Id128, DeviceCredential)> {

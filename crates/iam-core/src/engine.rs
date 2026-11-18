@@ -221,6 +221,21 @@ impl Engine {
             DecodedBody::Sync(req) => self.handle_sync(connection_id, req, frame),
             DecodedBody::Snapshot(req) => self.handle_snapshot(connection_id, req, frame),
             DecodedBody::History(req) => self.handle_history(connection_id, req, frame),
+            DecodedBody::FriendRequest(_)
+            | DecodedBody::FriendList(_)
+            | DecodedBody::FriendAccept(_) => {
+                match self.prepare_storage_request(connection_id, frame)? {
+                    StorageRequest::Ready(cid) => self.wire_error(
+                        frame,
+                        Some(cid),
+                        ErrorCode::UnsupportedCommand,
+                        RetryAction::None,
+                        false,
+                        None,
+                    ),
+                    StorageRequest::Respond(reply) => Ok(reply),
+                }
+            }
             DecodedBody::PushAck(ack) => self.handle_push_ack(connection_id, ack.push_id, frame),
             DecodedBody::Error(_) => self.wire_error(
                 frame,

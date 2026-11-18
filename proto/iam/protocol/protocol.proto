@@ -328,6 +328,34 @@ message HistoryResponse {
   }
 }
 
+message FriendRequest {
+  optional uint64 target_user_id = 1;
+}
+
+message FriendRequestAck {
+  oneof value {
+    Empty pending = 1;
+    uint64 conversation_id = 2;
+  }
+}
+
+message FriendListRequest {
+  optional uint64 after_user_id = 1;
+}
+
+message FriendListAck {
+  repeated uint64 from_user_ids = 1 [packed = false];
+  optional uint64 next_after_user_id = 2;
+}
+
+message FriendAcceptRequest {
+  optional uint64 from_user_id = 1;
+}
+
+message FriendAcceptAck {
+  optional uint64 conversation_id = 1;
+}
+
 message ProtocolError {
   optional uint32 ref_msg_type = 1;
   optional ErrorInfo error = 2;
