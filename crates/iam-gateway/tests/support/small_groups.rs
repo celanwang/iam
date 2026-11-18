@@ -221,6 +221,30 @@ async fn tidb_tls_groups_discovered_by_account_sync_and_recover_offline_messages
             matches!(view.content.as_ref().unwrap().value.as_ref(), Some(message_content::Value::Text(text)) if text.text.as_deref() == Some(value))
         );
     }
+    drop(socket);
+    let group_state = bob
+        .list_conversations(0, 100)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|summary| summary.state.conversation_id == Some(group))
+        .unwrap()
+        .state;
+    let mut read_socket = resumed.client();
+    assert_eq!(
+        bob.read_position(&mut read_socket, BOB, &group_state)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        bob.advance_read_position(&mut read_socket, BOB, &group_state, 2)
+            .await
+            .unwrap(),
+        2
+    );
+    drop(read_socket);
 
     // The other two members start with empty local stores, exercising account snapshots.
     for (device, token, total) in [(a, ALICE, 3), (fixture.charlie, CHARLIE, 2)] {
@@ -246,6 +270,10 @@ async fn tidb_tls_groups_discovered_by_account_sync_and_recover_offline_messages
     assert_eq!(remaining.items.len(), 1);
     assert_eq!(remaining.items[0].state.kind(), ConversationKind::Direct);
     assert!(bob.messages(group).await.unwrap().is_empty());
+    assert!(matches!(
+        bob.read_position(&mut resumed.client(), BOB, &group_state).await,
+        Err(iam_client::Error::Server(error)) if error.code() == ErrorCode::PermissionDenied
+    ));
     resumed.stop().await;
 }
 
