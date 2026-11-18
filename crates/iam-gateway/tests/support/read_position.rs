@@ -430,3 +430,6 @@ async fn tidb_tls_unread_count_respects_sender_retention_and_member_period() {
     assert_eq!(bob.unread_count(&mut wire, BOB, &renewed).await.unwrap(), 2);
     gateway.stop().await;
 }
+
+#[path = "client_commands.rs"]
+mod commands;
