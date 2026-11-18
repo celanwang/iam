@@ -1,5 +1,7 @@
 #[path = "friend_decisions.rs"]
 mod decisions;
+#[path = "small_groups.rs"]
+mod groups;
 
 use super::*;
 use iam_protocol::pb::{
@@ -102,6 +104,41 @@ impl ObservedTls {
     }
 }
 
+async fn competing_requests(
+    db: &MySqlPool,
+    first: impl std::future::Future<Output = DecodedBody>,
+    second: impl std::future::Future<Output = DecodedBody>,
+) -> (DecodedBody, DecodedBody) {
+    let mut blocker = db.acquire().await.unwrap();
+    sqlx::query("SET SESSION tidb_txn_mode = 'pessimistic'")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let mut lock = blocker.begin().await.unwrap();
+    sqlx::query("SELECT singleton FROM store_control WHERE singleton = 1 FOR UPDATE")
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap();
+    let release = async {
+        // Verify overlap at TiDB before allowing either request to commit.
+        timeout(WAIT, async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM information_schema.processlist
+                     WHERE DB = DATABASE() AND ID <> CONNECTION_ID() AND INFO LIKE 'SELECT store_id, token_key,%'",
+                ).fetch_one(db).await.unwrap();
+                if waiting == 2 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("both requests must reach the authority lock");
+        lock.rollback().await.unwrap();
+    };
+    let (first, second, ()) = tokio::join!(first, second, release);
+    (first, second)
+}
+
 async fn saved_cursor(db: &mut SqliteConnection, target: u64, sequence: u64) -> Option<Vec<u8>> {
     sqlx::query_scalar("SELECT cursor FROM streams WHERE target = ? AND covered = ?")
         .bind(target.to_be_bytes().to_vec())
@@ -111,10 +148,11 @@ async fn saved_cursor(db: &mut SqliteConnection, target: u64, sequence: u64) -> 
         .unwrap()
 }
 
-async fn sync_bob_through(
+async fn sync_through(
     client: &mut Client,
     socket: &mut ObservedTls,
     observer: &mut SqliteConnection,
+    token: &[u8],
     target: u64,
     sequence: u64,
 ) -> Vec<u8> {
@@ -133,7 +171,7 @@ async fn sync_bob_through(
         ..Options::default()
     };
     let ((), cursor) = timeout(WAIT, async {
-        tokio::try_join!(client.run(socket, BOB, options, &mut submissions), watch)
+        tokio::try_join!(client.run(socket, token, options, &mut submissions), watch)
     })
     .await
     .expect("timed out waiting for durable client progress")
@@ -167,7 +205,7 @@ async fn tidb_tls_friends_discovered_from_saved_account_cursor_and_recover_misse
     .await
     .unwrap();
     let mut socket = ObservedTls::new(&gateway);
-    let empty_cursor = sync_bob_through(&mut bob, &mut socket, &mut observer, 0, 0).await;
+    let empty_cursor = sync_through(&mut bob, &mut socket, &mut observer, BOB, 0, 0).await;
     assert_eq!(socket.syncs.len(), 1);
     drop(socket);
     drop(bob);
@@ -231,7 +269,7 @@ async fn tidb_tls_friends_discovered_from_saved_account_cursor_and_recover_misse
     let mut bob = Client::open(&path, bob_id).await.unwrap();
     let mut socket = ObservedTls::new(&gateway);
     let message_cursor =
-        sync_bob_through(&mut bob, &mut socket, &mut observer, conversation, 1).await;
+        sync_through(&mut bob, &mut socket, &mut observer, BOB, conversation, 1).await;
     assert_eq!(socket.first_cursor(0), Some(empty_cursor.as_slice()));
     assert_eq!(socket.first_cursor(conversation), None);
     let account_cursor = saved_cursor(&mut observer, 0, 1).await.unwrap();
@@ -257,7 +295,7 @@ async fn tidb_tls_friends_discovered_from_saved_account_cursor_and_recover_misse
     let resumed = fixture.start(OpenMode::Resume, Limits::default()).await;
     let mut socket = ObservedTls::new(&resumed);
     let mut bob = Client::open(&path, bob_id).await.unwrap();
-    sync_bob_through(&mut bob, &mut socket, &mut observer, conversation, 2).await;
+    sync_through(&mut bob, &mut socket, &mut observer, BOB, conversation, 2).await;
     assert_eq!(socket.first_cursor(0), Some(account_cursor.as_slice()));
     assert_eq!(
         socket.first_cursor(conversation),
