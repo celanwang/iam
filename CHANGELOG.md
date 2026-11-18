@@ -21,6 +21,8 @@ a dated version section when cutting a release.
   account pairs while preserving conversation IDs, access, and cursors.
 - TiDB-backed history pagination and durable client backfill after a sync
   cursor expires, including ranges below the retention floor.
+- Client-side pagination of synchronized conversations, including empty
+  conversations and previews of the latest locally saved messages.
 - Durable account changes for direct conversations and access changes, with
   a local schema upgrade that preserves existing cursors and send receipts.
 - Real TiDB acceptance tests for reordered and duplicate pushes, expired

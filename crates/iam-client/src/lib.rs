@@ -11,8 +11,9 @@ pub use tls::TlsTransport;
 
 use history::HistoryRounds;
 use iam_protocol::pb::{
-    message_content, send_outcome, ErrorCode, ErrorInfo, MessageContent, MessageKey, MessageView,
-    ResetReason, RetryAction, SendOutcome, SendRequest, SendStatusRequest, TextContent,
+    message_content, send_outcome, ConversationState, ErrorCode, ErrorInfo, MessageContent,
+    MessageKey, MessageView, ResetReason, RetryAction, SendOutcome, SendRequest, SendStatusRequest,
+    TextContent,
 };
 use iam_protocol::{
     generate_id128, validate_id128, validate_message_content, DecodedBody, Id128, MsgType,
@@ -71,6 +72,22 @@ pub struct HistoryRange {
     pub from: u64,
     pub through: u64,
     pub unavailable: bool,
+}
+
+/// A conversation discovered by account sync and its local message preview.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationSummary {
+    pub state: ConversationState,
+    /// The saved message with the highest creation sequence, if any. The cache may be incomplete.
+    pub latest_cached_message: Option<MessageView>,
+}
+
+/// One page of the currently saved account view, in ascending conversation ID order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationPage {
+    pub items: Vec<ConversationSummary>,
+    /// The exclusive ID to pass to the next call, if more rows existed when this page was read.
+    pub next_after: Option<u64>,
 }
 
 /// Exchanges complete wire frames for a single logical connection. Implementations route pushes
@@ -163,6 +180,25 @@ impl Client {
     /// Returns the saved result after a queue entry is released, including an unknown closed outcome.
     pub async fn outcome(&mut self, key: &MessageKey) -> Result<Option<SendOutcome>> {
         self.storage.outcome(key).await
+    }
+
+    /// Lists up to `limit` (1–100) locally accessible conversations, including those with no messages.
+    /// Pass zero for the first page, then use [`ConversationPage::next_after`].
+    ///
+    /// This reads SQLite without contacting the server. Each call sees the latest committed local
+    /// view at the time of the read. If sync adds a conversation at or below a used cursor, start
+    /// again from zero to see it. Call this when the client is available outside [`Client::run`].
+    pub async fn list_conversations(
+        &mut self,
+        after_conversation_id: u64,
+        limit: u32,
+    ) -> Result<ConversationPage> {
+        if !(1..=100).contains(&limit) {
+            return Err(Error::Invalid("conversation page size"));
+        }
+        self.storage
+            .list_conversations(after_conversation_id, limit)
+            .await
     }
 
     pub async fn messages(&mut self, conversation_id: u64) -> Result<Vec<MessageView>> {
