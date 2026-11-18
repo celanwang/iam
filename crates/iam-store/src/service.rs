@@ -473,6 +473,22 @@ impl TidbService {
                     });
                 self.membership_reply(cid, &decoded, MsgType::GroupCreateAck, result)
             }
+            DecodedBody::GroupMembers(req) => {
+                let result = self
+                    .database
+                    .group_members(identity, req.conversation_id.unwrap_or(0))
+                    .await;
+                self.membership_reply(cid, &decoded, MsgType::GroupMembersAck, result)
+            }
+            DecodedBody::GroupMemberRemove(req) => {
+                let result = self
+                    .database
+                    .remove_group_member(identity, req, |write| {
+                        self.admit_membership(cid, write, None)
+                    })
+                    .await;
+                self.membership_reply(cid, &decoded, MsgType::GroupMemberRemoveAck, result)
+            }
             DecodedBody::FriendStatus(req) => {
                 let Some(peer) = req.peer_user_id else {
                     return wire_error(cid, &decoded, ErrorCode::InvalidArgument);
@@ -573,8 +589,12 @@ impl TidbService {
         match result {
             Ok(body) => reply(cid, frame, kind, &body),
             Err(Error::InvalidRequest(_)) => wire_error(cid, frame, ErrorCode::InvalidArgument),
-            Err(Error::FriendNotFound) => wire_error(cid, frame, ErrorCode::NotFound),
-            Err(Error::FriendChanged) => wire_error(cid, frame, ErrorCode::ContextChanged),
+            Err(Error::FriendNotFound | Error::GroupMemberNotFound) => {
+                wire_error(cid, frame, ErrorCode::NotFound)
+            }
+            Err(Error::FriendChanged | Error::GroupMemberContextChanged) => {
+                wire_error(cid, frame, ErrorCode::ContextChanged)
+            }
             Err(
                 Error::FriendKeyConflict | Error::GroupKeyConflict | Error::UserBlockKeyConflict,
             ) => wire_error(cid, frame, ErrorCode::IdempotencyConflict),

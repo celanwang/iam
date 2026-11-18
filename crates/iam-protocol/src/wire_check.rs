@@ -40,7 +40,9 @@ pub(crate) fn check(name: &str, bytes: &[u8], total: &mut usize) -> Result<()> {
         bytes,
         1,
         total,
-        name.ends_with(".SendRequest") || name.ends_with(".ReadPositionRequest"),
+        name.ends_with(".SendRequest")
+            || name.ends_with(".ReadPositionRequest")
+            || name.ends_with(".GroupMemberRemoveRequest"),
         response,
     )
 }

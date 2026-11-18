@@ -44,6 +44,10 @@ pub enum MsgType {
     UnreadCountAck = 41,
     UserBlock = 42,
     UserBlockAck = 43,
+    GroupMembers = 44,
+    GroupMembersAck = 45,
+    GroupMemberRemove = 46,
+    GroupMemberRemoveAck = 47,
 }
 
 impl MsgType {
@@ -92,6 +96,10 @@ impl MsgType {
             41 => Self::UnreadCountAck,
             42 => Self::UserBlock,
             43 => Self::UserBlockAck,
+            44 => Self::GroupMembers,
+            45 => Self::GroupMembersAck,
+            46 => Self::GroupMemberRemove,
+            47 => Self::GroupMemberRemoveAck,
             _ => return None,
         })
     }
@@ -128,6 +136,8 @@ impl MsgType {
                 | Self::FriendInbox
                 | Self::FriendDecide
                 | Self::GroupCreate
+                | Self::GroupMembers
+                | Self::GroupMemberRemove
                 | Self::FriendStatus
                 | Self::FriendRemove
                 | Self::UserBlock

@@ -46,6 +46,12 @@ UUIDv7 可以由设备自行生成，重连后仍可用同一个 ID 指向原消
 
 使用已同步的 `ConversationState` 调用 `Client::unread_count`，获取本人在一个单聊或小群的服务端未读数。计数只包含其他人发送且仍可见的消息，并以本人当前阅读位置为下界。计数反映服务端执行查询时的状态，本地会话预览可能尚未同步到这一进度。该方法采用与阅读位置方法相同的设备认证和范围校验。
 
+### 小群成员名单和撤权
+
+活跃成员用 `Client::group_members` 读取服务端名单及固定群主。普通成员用已同步的 `ConversationState` 调用 `Client::leave_group`。群主用名单和目标成员项调用 `Client::remove_group_member`。结果暂不可用时保留原参数重试。原周期结束的确认也可能在成员已重新加入后返回，新周期可通过刷新名单获取。
+
+这些调用会为设备建立新的认证连接，调用前结束同设备的同步循环。退出或被移除后，下一次账户同步清除本地群会话和消息缓存。原发送回执仍可在原查询期限内获取。
+
 ## 最后一条推送丢了
 
 设备已同步到 40，消息 41 已保存，但推送丢了，之后也没有新消息。即使连接一直在线，设备也会到点用原游标发起 `SYNC`，补回 41。真实 TiDB 验收已覆盖这条路径。
@@ -103,6 +109,14 @@ cargo test -p iam-gateway --test tls read_position -- --ignored --test-threads=1
 ```sh
 cargo test -p iam-gateway --test tls tidb_tls_unread_count_respects_sender_retention_and_member_period -- --ignored
 cargo test -p iam-gateway --test tls tidb_tls_groups_discovered_by_account_sync_and_recover_offline_messages -- --ignored
+```
+
+小群成员验收覆盖主动退出、群主移除、提交应答丢失、重新授权和消息访问撤权。
+
+```sh
+IAM_TIDB_TEST_URL='mysql://root@127.0.0.1:4000/iam_test' \
+IAM_TIDB_ALLOW_TEST_WRITES=1 \
+cargo test -p iam-gateway --test tls tidb_tls_group_members -- --ignored --test-threads=1
 ```
 
 [消息协议](./protocol.md) · [存储设计](./storage.md)

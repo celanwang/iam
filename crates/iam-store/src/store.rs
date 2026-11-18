@@ -45,6 +45,8 @@ mod friend_removal;
 #[cfg(test)]
 #[path = "friend_removal_tests.rs"]
 mod friend_removal_tests;
+#[path = "group_members.rs"]
+mod group_members;
 #[cfg(test)]
 #[path = "group_tests.rs"]
 mod group_tests;

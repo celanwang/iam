@@ -45,6 +45,10 @@ pub enum Error {
     GroupKeyConflict,
     #[error("the user block change ID is bound to a different target or state")]
     UserBlockKeyConflict,
+    #[error("the requested group membership period does not match")]
+    GroupMemberContextChanged,
+    #[error("the requested group member was not found")]
+    GroupMemberNotFound,
     #[error("invalid request: {0}")]
     InvalidRequest(&'static str),
     #[error("conversation sequence exhausted")]
