@@ -16,7 +16,7 @@
 
 ## 数据类型约定
 
-IDL 入口通过 `import public` 汇总通用类型、连接、会话、好友、群、消息和同步定义。各领域文件共用 `iam.protocol` 包名，Rust 从 `iam_protocol::pb` 使用生成类型。[protocol.proto](../proto/iam/protocol/protocol.proto)
+IDL 文件放在 `proto/`，以它作为导入根目录时使用 `import "protocol.proto";`。入口通过 `import public` 汇总各领域定义。各文件共用 `iam.protocol` 包名，Rust 从 `iam_protocol::pb` 使用生成类型。[protocol.proto](../proto/protocol.proto)
 
 字段默认业务必填，`?` 表示可缺省，`list<T>` 表示列表，`oneof` 表示必须且只能选择一个分支。所有字段号在各自 message 内唯一；oneof 组本身不占字段号，其成员与同一 message 的其他字段共用编号空间。
 

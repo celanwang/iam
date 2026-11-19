@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package iam.protocol;
 
-import "iam/protocol/common.proto";
+import "common.proto";
 
 message FriendRequest {
   optional uint64 target_user_id = 1;

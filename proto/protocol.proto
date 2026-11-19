@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package iam.protocol;
+
+// Logical IDL from docs/protocol.md. Field numbers are frozen.
+
+import public "common.proto";
+import public "connection.proto";
+import public "conversation.proto";
+import public "friends.proto";
+import public "groups.proto";
+import public "message.proto";
+import public "sync.proto";
