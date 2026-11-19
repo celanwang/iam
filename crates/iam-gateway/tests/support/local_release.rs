@@ -3,8 +3,8 @@ use iam_protocol::pb::{friend_attempt_ack, group_invite_result_ack};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+use tokio::process::{Child, ChildStderr, Command};
 
 const CHARLIE: &[u8] = b"local-release-charlie";
 
@@ -80,11 +80,11 @@ impl ProcessConfig {
     }
 
     async fn start(&self, mode: &str, bind: &str) -> (Child, String) {
-        let mut child = self
-            .command(mode, bind)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+        Self::start_command(self.command(mode, bind)).await
+    }
+
+    async fn start_command(mut command: Command) -> (Child, String) {
+        let mut child = command.stdout(Stdio::piped()).spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let line = timeout(WAIT, BufReader::new(stdout).lines().next_line())
             .await
@@ -105,6 +105,14 @@ impl ProcessConfig {
             self.roots.clone(),
         )
     }
+}
+
+async fn gateway_log(logs: &mut Lines<BufReader<ChildStderr>>, wait: Duration) -> String {
+    timeout(wait, logs.next_line())
+        .await
+        .expect("gateway did not report its state")
+        .unwrap()
+        .expect("gateway exited without reporting its state")
 }
 
 async fn observer(path: &Path) -> SqliteConnection {
@@ -427,6 +435,229 @@ async fn tidb_tls_local_release_recovers_after_gateway_process_exit() {
         .find(|member| member.user_id == Some(bob_identity.user_id))
         .expect("old leave must not remove the rejoined member");
     assert_ne!(bob_membership.access_version, group_state.access_version);
+    resumed.kill().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB and starts the gateway binary"]
+async fn tidb_tls_local_release_preflights_before_initializing() {
+    let config = ProcessConfig::new().await;
+    let wrong_key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let wrong_key_path = config.file("wrong-key.pem");
+    std::fs::write(&wrong_key_path, wrong_key.signing_key.serialize_pem()).unwrap();
+    let bad_credentials = config.file("bad-devices.txt");
+    std::fs::write(&bad_credentials, "invalid credentials\n").unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let mut tls = config.command("fresh", "127.0.0.1:0");
+    tls.env("IAM_TLS_KEY", wrong_key_path);
+    let mut credentials = config.command("fresh", "127.0.0.1:0");
+    credentials.env("IAM_DEVICE_CREDENTIALS", bad_credentials);
+    let binding = config.command("fresh", &occupied.local_addr().unwrap().to_string());
+    for (mut command, reason) in [
+        (tls, "invalid IAM_TLS_CERT or IAM_TLS_KEY"),
+        (credentials, "invalid device credential on line 1"),
+        (binding, "cannot bind IAM_GATEWAY_BIND"),
+    ] {
+        let failed = timeout(WAIT, command.output()).await.unwrap().unwrap();
+        let error = String::from_utf8_lossy(&failed.stderr);
+        assert!(!failed.status.success(), "{error}");
+        assert!(error.contains(reason), "{error}");
+        assert!(failed.stdout.is_empty());
+    }
+
+    let db = sqlx::MySqlPool::connect(config.database.as_str())
+        .await
+        .unwrap();
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(tables, 0, "startup preflight mutated an empty database");
+    let (mut gateway, address) = config.start("fresh", "127.0.0.1:0").await;
+    connect_as(&config, &address, config.users[0], ALICE).await;
+    gateway.kill().await.unwrap();
+
+    let mut wrong_store = config.command("resume", &address);
+    wrong_store.env("IAM_STORE_ID", hex::encode(generate_id128()));
+    let failed = timeout(WAIT, wrong_store.output()).await.unwrap().unwrap();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("protocol store ID does not match"));
+    assert!(failed.stdout.is_empty());
+    let failed = timeout(WAIT, config.command("fresh", &address).output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!failed.status.success(), "fresh accepted an existing store");
+    assert!(failed.stdout.is_empty());
+    let (mut resumed, _) = config.start("resume", &address).await;
+    connect_as(&config, &address, config.users[0], ALICE).await;
+    resumed.kill().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires real local TiDB and starts the gateway binary"]
+async fn tidb_tls_local_release_reports_storage_outage_and_recovery() {
+    let config = ProcessConfig::new().await;
+    let proxy = CommitProxy::start(&config.database).await;
+    let proxy_address = ("127.0.0.1", proxy.url.port().unwrap());
+    let mut command = config.command("fresh", "127.0.0.1:0");
+    command
+        .env("IAM_TIDB_URL", proxy.url.as_str())
+        .stderr(Stdio::piped());
+    let (mut gateway, address) = ProcessConfig::start_command(command).await;
+    let mut logs = BufReader::new(gateway.stderr.take().unwrap()).lines();
+    assert_eq!(gateway_log(&mut logs, WAIT).await, "IAM gateway ready");
+
+    let mut session = connect_as(&config, &address, config.users[0], ALICE).await;
+    drop(proxy);
+    let unhealthy = gateway_log(&mut logs, WAIT * 2).await;
+    assert!(
+        unhealthy.starts_with("IAM gateway not ready reason="),
+        "{unhealthy}"
+    );
+    assert!(gateway.try_wait().unwrap().is_none());
+    let listener = TcpListener::bind(proxy_address).await.unwrap();
+    let _proxy = CommitProxy::start_on(&config.database, listener);
+    assert_eq!(gateway_log(&mut logs, WAIT).await, "IAM gateway ready");
+    assert!(matches!(
+        request(
+            &mut session,
+            2,
+            MsgType::Heartbeat,
+            &iam_protocol::pb::HeartbeatRequest {}
+        )
+        .await,
+        DecodedBody::HeartbeatAck(_)
+    ));
+    gateway.kill().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires real local TiDB and starts the gateway binary"]
+async fn tidb_tls_local_release_sigterm_before_commit_reports_drain_timeout() {
+    check_sigterm(CommitPhase::Before).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires real local TiDB and starts the gateway binary"]
+async fn tidb_tls_local_release_sigterm_after_commit_recovers_lost_receipt() {
+    check_sigterm(CommitPhase::After).await;
+}
+
+#[cfg(unix)]
+async fn check_sigterm(phase: CommitPhase) {
+    let config = ProcessConfig::new().await;
+    let [alice, bob, _] = config.users;
+    let proxy = CommitProxy::start(&config.database).await;
+    let mut command = config.command("fresh", "127.0.0.1:0");
+    command
+        .env("IAM_TIDB_URL", proxy.url.as_str())
+        .stderr(Stdio::piped());
+    let (mut gateway, address) = ProcessConfig::start_command(command).await;
+    let mut logs = BufReader::new(gateway.stderr.take().unwrap()).lines();
+    assert_eq!(gateway_log(&mut logs, WAIT).await, "IAM gateway ready");
+    let alice_client = Client::open(config.file("alice.db"), alice).await.unwrap();
+    let bob_path = config.file("bob.db");
+    let mut bob_client = Client::open(&bob_path, bob).await.unwrap();
+    let direct = establish(&config, &address, &alice_client, &bob_client, 200, BOB).await;
+
+    let mut sender = connect_as(&config, &address, alice, ALICE).await;
+    send(&mut sender, 2, message_key(direct), "before drain").await;
+    let mut db = observer(&bob_path).await;
+    let mut wire = ObservedTls {
+        tls: config.transport(&address),
+        syncs: Vec::new(),
+    };
+    let cursor = sync_through(&mut bob_client, &mut wire, &mut db, BOB, direct, 1).await;
+    drop(wire);
+
+    let key = message_key(direct);
+    let send_body = send_request(key.clone(), "during drain");
+    let frame = encode_frame(MsgType::Send, &Head { req_id: Some(3) }, &send_body).unwrap();
+    let (reached, release) = proxy.arm(phase);
+    let sending = tokio::spawn(async move { sender.exchange(frame).await });
+    timeout(WAIT, reached).await.unwrap().unwrap().unwrap();
+    assert!(Command::new("kill")
+        .args(["-TERM", &gateway.id().unwrap().to_string()])
+        .status()
+        .await
+        .unwrap()
+        .success());
+    let started = gateway_log(&mut logs, WAIT).await;
+    assert!(started.starts_with("IAM gateway draining "), "{started}");
+    assert!(started.ends_with(" in_flight=1"), "{started}");
+    assert!(gateway.try_wait().unwrap().is_none());
+    assert!(tokio::net::TcpStream::connect(&address).await.is_err());
+
+    let (drained, expected_exit) = match phase {
+        CommitPhase::Before => ("IAM gateway drain timed out ", false),
+        CommitPhase::After => {
+            release.send(()).unwrap();
+            ("IAM gateway drained ", true)
+        }
+    };
+    let finished = gateway_log(&mut logs, WAIT * 2).await;
+    assert!(finished.starts_with(drained), "{finished}");
+    if !expected_exit {
+        assert!(finished.ends_with(" in_flight=1"), "{finished}");
+    }
+    let exit = timeout(WAIT, gateway.wait()).await.unwrap().unwrap();
+    assert_eq!(exit.success(), expected_exit);
+
+    let response = timeout(WAIT, sending).await.unwrap().unwrap();
+    match phase {
+        CommitPhase::Before => assert!(response.is_err()),
+        CommitPhase::After => assert!(matches!(
+            decode(&response.unwrap()),
+            DecodedBody::SendAck(ack)
+                if matches!(ack.outcome.as_ref().and_then(|outcome| outcome.value.as_ref()),
+                    Some(send_outcome::Value::Unresolved(result))
+                        if result.error.as_ref().unwrap().code() == ErrorCode::ResultUnavailable)
+        )),
+    }
+    drop(proxy);
+
+    let (mut resumed, _) = config.start("resume", &address).await;
+    let mut sender = connect_as(&config, &address, alice, ALICE).await;
+    let DecodedBody::SendStatusAck(status) = request(
+        &mut sender,
+        2,
+        MsgType::SendStatus,
+        &SendStatusRequest { key: Some(key) },
+    )
+    .await
+    else {
+        panic!("expected SEND_STATUS_ACK");
+    };
+    let status = status.outcome.unwrap().value.unwrap();
+    assert!(match phase {
+        CommitPhase::Before => matches!(&status, send_outcome::Value::Unresolved(_)),
+        CommitPhase::After => matches!(&status, send_outcome::Value::Committed(_)),
+    });
+    let DecodedBody::SendAck(replay) = request(&mut sender, 3, MsgType::Send, &send_body).await
+    else {
+        panic!("expected SEND_ACK");
+    };
+    let Some(send_outcome::Value::Committed(receipt)) = replay.outcome.unwrap().value else {
+        panic!("send did not settle after restart");
+    };
+    if let send_outcome::Value::Committed(original) = status {
+        assert_eq!(original, receipt);
+    }
+    assert_eq!(receipt.position.unwrap().create_seq, Some(2));
+
+    wire = ObservedTls {
+        tls: config.transport(&address),
+        syncs: Vec::new(),
+    };
+    sync_through(&mut bob_client, &mut wire, &mut db, BOB, direct, 2).await;
+    assert_eq!(wire.first_cursor(direct), Some(cursor.as_slice()));
+    assert_eq!(bob_client.messages(direct).await.unwrap().len(), 2);
     resumed.kill().await.unwrap();
 }
 

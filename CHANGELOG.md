@@ -14,6 +14,7 @@ a dated version section when cutting a release.
 
 ### Added
 
+- Report gateway readiness and TiDB outages from bounded read-only probes.
 - Bounded typed client commands for reading and advancing read positions and
   querying unread counts over the active sync connection.
 
@@ -82,6 +83,8 @@ a dated version section when cutting a release.
 
 ### Fixed
 
+- Validate gateway TLS and bind the address before initializing the database.
+- Report gateway drain timeouts with remaining work and exit with an error.
 - Validate nested wire occurrences, scalar ranges, required response fields and
   response invariants before applying data; reject unknown write semantics.
 - Route malformed frames and unsupported commands through protocol errors,

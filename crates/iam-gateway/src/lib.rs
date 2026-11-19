@@ -51,6 +51,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+const STORAGE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const STORAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const STORAGE_PROBE_FAILURES: u8 = 2;
 const RECOVERY_ADMISSION_WAIT: Duration = Duration::from_millis(75);
 const RESPONSE_SLOTS: usize = 4;
 const PUSH_SLOTS: usize = 16;
@@ -101,6 +104,22 @@ pub struct Gateway {
     responses: Arc<Semaphore>,
 }
 
+/// Validated TLS configuration for a gateway.
+pub struct GatewayTls(TlsAcceptor);
+
+impl GatewayTls {
+    pub fn new(
+        certificates: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> io::Result<Self> {
+        let tls = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+            .map_err(io::Error::other)?;
+        Ok(Self(TlsAcceptor::from(Arc::new(tls))))
+    }
+}
+
 struct Peer {
     binding: Mutex<Binding>,
     responses: mpsc::Sender<Queued>,
@@ -136,6 +155,14 @@ impl Gateway {
         key: PrivateKeyDer<'static>,
         limits: Limits,
     ) -> io::Result<Arc<Self>> {
+        Self::with_tls(service, GatewayTls::new(certificates, key)?, limits)
+    }
+
+    pub fn with_tls(
+        service: TidbService,
+        tls: GatewayTls,
+        limits: Limits,
+    ) -> io::Result<Arc<Self>> {
         if !service.uses_device_credentials() {
             return Err(invalid("gateway requires device credentials"));
         }
@@ -158,7 +185,7 @@ impl Gateway {
         }
         Ok(Arc::new(Self {
             service,
-            acceptor: Mutex::new(tls_acceptor(certificates, key)?),
+            acceptor: Mutex::new(tls.0),
             handshakes: budget(limits.handshakes),
             auth: budget(limits.auth_requests),
             waiting_auth: Semaphore::new(limits.auth_requests),
@@ -181,7 +208,7 @@ impl Gateway {
         key: PrivateKeyDer<'static>,
         credentials: Vec<DeviceCredential>,
     ) -> io::Result<()> {
-        let acceptor = tls_acceptor(certificates, key)?;
+        let GatewayTls(acceptor) = GatewayTls::new(certificates, key)?;
         // Serialize with session publication so a racing AUTH cannot publish a removed credential.
         let peers = self.peers.lock().unwrap();
         let mut current_acceptor = self.acceptor.lock().unwrap();
@@ -215,53 +242,108 @@ impl Gateway {
         let (stop, stopped) = watch::channel(false);
         let mut connections = JoinSet::new();
         tokio::pin!(shutdown);
-        let result = loop {
-            tokio::select! {
-                biased;
-                _ = &mut shutdown => break Ok(()),
-                _ = connections.join_next(), if !connections.is_empty() => {},
-                accepted = listener.accept() => {
-                    let (socket, address) = match accepted {
-                        Ok(accepted) => accepted,
-                        Err(error) => break Err(error),
-                    };
-                    if connections.len() >= self.limits.connections {
-                        continue;
+        let result = {
+            eprintln!("IAM gateway ready");
+            let storage = self.watch_storage();
+            tokio::pin!(storage);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown => break Ok(()),
+                    _ = &mut storage => unreachable!(),
+                    _ = connections.join_next(), if !connections.is_empty() => {},
+                    accepted = listener.accept() => {
+                        let (socket, address) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(error) => break Err(error),
+                        };
+                        if connections.len() >= self.limits.connections {
+                            continue;
+                        }
+                        let Ok(handshake) = self.handshakes.clone().try_acquire_owned() else {
+                            continue;
+                        };
+                        let Some(source) = self.admit_source(address.ip()) else {
+                            continue;
+                        };
+                        let gateway = self.clone();
+                        let stopped = stopped.clone();
+                        connections.spawn(async move {
+                            let _source = source;
+                            gateway.connect(socket, handshake, stopped).await;
+                        });
                     }
-                    let Ok(handshake) = self.handshakes.clone().try_acquire_owned() else {
-                        continue;
-                    };
-                    let Some(source) = self.admit_source(address.ip()) else {
-                        continue;
-                    };
-                    let gateway = self.clone();
-                    let stopped = stopped.clone();
-                    connections.spawn(async move {
-                        let _source = source;
-                        gateway.connect(socket, handshake, stopped).await;
-                    });
                 }
             }
         };
         drop(listener);
         stop.send_replace(true);
-        let deadline = Instant::now() + DRAIN_TIMEOUT;
-        if timeout_at(deadline, async {
+        let started = Instant::now();
+        let pools = [
+            (&self.auth, self.limits.auth_requests),
+            (&self.requests, self.limits.requests),
+            (&self.recovery, self.limits.recovery_requests),
+        ];
+        let in_flight = || {
+            pools
+                .iter()
+                .map(|(pool, capacity)| capacity - pool.available_permits())
+                .sum::<usize>()
+        };
+        eprintln!(
+            "IAM gateway draining connections={} in_flight={}",
+            connections.len(),
+            in_flight(),
+        );
+        if timeout_at(started + DRAIN_TIMEOUT, async {
             while connections.join_next().await.is_some() {}
-            for (pool, capacity) in [
-                (&self.auth, self.limits.auth_requests),
-                (&self.requests, self.limits.requests),
-                (&self.recovery, self.limits.recovery_requests),
-            ] {
+            for (pool, capacity) in pools {
                 let _ = pool.acquire_many(capacity as u32).await;
             }
         })
         .await
         .is_err()
         {
+            eprintln!(
+                "IAM gateway drain timed out elapsed_ms={} connections={} in_flight={}",
+                started.elapsed().as_millis(),
+                connections.len(),
+                in_flight(),
+            );
             connections.shutdown().await;
+            result?;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "gateway drain deadline exceeded",
+            ));
         }
+        eprintln!(
+            "IAM gateway drained elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         result
+    }
+
+    async fn watch_storage(&self) -> ! {
+        let mut failures = 0u8;
+        loop {
+            tokio::time::sleep(STORAGE_PROBE_INTERVAL).await;
+            let reason = match timeout(STORAGE_PROBE_TIMEOUT, self.service.probe_storage()).await {
+                Ok(Ok(())) => {
+                    if failures >= STORAGE_PROBE_FAILURES {
+                        eprintln!("IAM gateway ready");
+                    }
+                    failures = 0;
+                    continue;
+                }
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "TiDB probe timed out".to_owned(),
+            };
+            failures = failures.saturating_add(1);
+            if failures == STORAGE_PROBE_FAILURES {
+                eprintln!("IAM gateway not ready reason={reason}");
+            }
+        }
     }
 
     fn admit_source(self: &Arc<Self>, ip: IpAddr) -> Option<Source> {
@@ -744,17 +826,6 @@ async fn expiry(deadline: Option<Instant>) {
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
-fn tls_acceptor(
-    certificates: Vec<CertificateDer<'static>>,
-    key: PrivateKeyDer<'static>,
-) -> io::Result<TlsAcceptor> {
-    let tls = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_no_client_auth()
-        .with_single_cert(certificates, key)
-        .map_err(io::Error::other)?;
-    Ok(TlsAcceptor::from(Arc::new(tls)))
 }
 
 #[cfg(test)]
