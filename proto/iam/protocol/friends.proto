@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package iam.protocol;
+
+import "iam/protocol/common.proto";
+
+message FriendRequest {
+  optional uint64 target_user_id = 1;
+}
+
+message FriendRequestAck {
+  oneof value {
+    Empty pending = 1;
+    uint64 conversation_id = 2;
+  }
+}
+
+message FriendListRequest {
+  optional uint64 after_user_id = 1;
+}
+
+message FriendListAck {
+  repeated uint64 from_user_ids = 1 [packed = false];
+  optional uint64 next_after_user_id = 2;
+}
+
+message FriendAcceptRequest {
+  optional uint64 from_user_id = 1;
+}
+
+message FriendAcceptAck {
+  optional uint64 conversation_id = 1;
+}
+
+message FriendApplyRequest {
+  optional uint64 target_user_id = 1;
+  optional bytes request_id = 2;
+}
+
+message FriendInboxRequest {
+  optional uint64 after_user_id = 1;
+}
+
+message FriendApplicant {
+  optional uint64 from_user_id = 1;
+  optional bytes request_id = 2;
+}
+
+message FriendInboxAck {
+  repeated FriendApplicant requests = 1;
+  optional uint64 next_after_user_id = 2;
+}
+
+message FriendDecideRequest {
+  optional uint64 from_user_id = 1;
+  optional bytes request_id = 2;
+  optional bool accept = 3;
+}
+
+message FriendAttemptAck {
+  oneof value {
+    Empty pending = 1;
+    uint64 conversation_id = 2;
+    Empty rejected = 3;
+  }
+}
+
+message FriendStatusRequest {
+  optional uint64 peer_user_id = 1;
+}
+
+message FriendRelationship {
+  optional bytes generation = 1;
+  optional uint64 conversation_id = 2;
+}
+
+message FriendStatusAck {
+  oneof value {
+    Empty not_friends = 1;
+    FriendRelationship relationship = 2;
+  }
+}
+
+message FriendRemoveRequest {
+  optional uint64 peer_user_id = 1;
+  optional bytes generation = 2;
+}
+
+message FriendRemoveAck {
+  optional uint64 conversation_id = 1;
+}
+
+message UserBlockRequest {
+  optional uint64 peer_user_id = 1;
+  optional bytes request_id = 2;
+  optional bool blocked = 3;
+}
+
+message UserBlockAck {
+  optional bool blocked = 1;
+}
