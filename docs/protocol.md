@@ -16,6 +16,8 @@
 
 ## 数据类型约定
 
+IDL 文件放在 `proto/`，以它作为导入根目录时使用 `import "protocol.proto";`。入口通过 `import public` 汇总各领域定义。各文件共用 `iam.protocol` 包名，Rust 从 `iam_protocol::pb` 使用生成类型。[protocol.proto](../proto/protocol.proto)
+
 字段默认业务必填，`?` 表示可缺省，`list<T>` 表示列表，`oneof` 表示必须且只能选择一个分支。所有字段号在各自 message 内唯一；oneof 组本身不占字段号，其成员与同一 message 的其他字段共用编号空间。
 
 IDL 使用 `syntax = "proto3"` 和 `package iam.protocol`。普通单值标量、字符串、bytes 和枚举统一使用 `optional` 保留存在性；message 字段使用原生存在性，列表使用 `repeated`，oneof 成员不加 `optional`。`Type = oneof` 映射为同名 message 内名为 `value` 的 oneof；显式命名的 `payload` 保持原名。固定头不使用 Protobuf。

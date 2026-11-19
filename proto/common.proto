@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package iam.protocol;
+
+message Empty {}
+
+message ErrorInfo {
+  optional ErrorCode code = 1;
+  optional RetryAction action = 2;
+  optional uint32 retry_after_ms = 3;
+  optional string detail = 4;
+}
+
+enum RetryAction {
+  RETRY_ACTION_UNSPECIFIED = 0;
+  NONE = 1;
+  RETRY_SAME_REQUEST = 2;
+  QUERY_SEND = 3;
+  REAUTHENTICATE = 4;
+  RESTART_SYNC = 5;
+  RETRY_SEND = 6;
+  RESUME_SYNC = 7;
+  RESTART_HISTORY = 8;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  INVALID_ARGUMENT = 1;
+  UNAUTHENTICATED = 2;
+  PERMISSION_DENIED = 3;
+  UNSUPPORTED_VERSION = 4;
+  UNSUPPORTED_COMMAND = 5;
+  UNSUPPORTED_CAPABILITY = 6;
+  MALFORMED_FRAME = 7;
+  RESOURCE_LIMIT = 8;
+  RATE_LIMITED = 9;
+  OVERLOADED = 10;
+  IDEMPOTENCY_CONFLICT = 11;
+  NOT_FOUND = 12;
+  IN_PROGRESS = 13;
+  RESULT_UNAVAILABLE = 14;
+  INVALID_CURSOR = 15;
+  PAGE_TOKEN_EXPIRED = 16;
+  PAGE_BUDGET_TOO_SMALL = 17;
+  INTERNAL_ERROR = 18;
+  CONTEXT_CHANGED = 19;
+  INVALID_TOKEN = 20;
+  REQUEST_EXPIRED = 21;
+  RESULT_EXPIRED = 22;
+  CLOCK_SKEW = 23;
+  UNSUPPORTED_CONTENT = 24;
+  SESSION_REPLACED = 25;
+  UNSUPPORTED_FLAGS = 26;
+}
+
+message PageLimit {
+  optional uint32 max_items = 1;
+  optional uint32 max_bytes = 2;
+}

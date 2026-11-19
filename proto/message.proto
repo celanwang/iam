@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package iam.protocol;
+
+import "common.proto";
+
+message MessageKey {
+  optional uint64 conversation_id = 1;
+  optional bytes client_msg_id = 2;
+}
+
+message MessageRef {
+  optional uint64 conversation_id = 1;
+  optional bytes message_id = 2;
+}
+
+message MessagePosition {
+  optional bytes history_id = 1;
+  optional uint64 create_seq = 2;
+}
+
+message MessageContent {
+  oneof value {
+    TextContent text = 1;
+  }
+}
+
+message TextContent {
+  optional string text = 1;
+}
+
+message MessageView {
+  optional MessageRef ref = 1;
+  optional MessagePosition position = 2;
+  optional uint64 revision_seq = 3;
+  optional uint64 sender_id = 4;
+  optional int64 accepted_at_ms = 5;
+  optional MessageState state = 6;
+  optional MessageContent content = 7;
+}
+
+enum MessageState {
+  MESSAGE_STATE_UNSPECIFIED = 0;
+  ACTIVE = 1;
+  RECALLED = 2;
+  DELETED = 3;
+}
+
+message SendRequest {
+  optional MessageKey key = 1;
+  optional MessageContent content = 2;
+}
+
+message SendReceipt {
+  optional MessageRef ref = 1;
+  optional MessagePosition position = 2;
+  optional int64 accepted_at_ms = 3;
+}
+
+message SendOutcome {
+  oneof value {
+    SendReceipt committed = 1;
+    ErrorInfo rejected_final = 2;
+    SendUnresolved unresolved = 3;
+  }
+}
+
+message SendUnresolved {
+  optional ErrorInfo error = 1;
+  optional bool acceptance_closed = 2;
+}
+
+message SendResponse {
+  optional MessageKey key = 1;
+  optional SendOutcome outcome = 2;
+}
+
+message SendStatusRequest {
+  optional MessageKey key = 1;
+}
+
+message SendStatusResponse {
+  optional MessageKey key = 1;
+  optional SendOutcome outcome = 2;
+}

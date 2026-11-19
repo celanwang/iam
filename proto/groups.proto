@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package iam.protocol;
+
+import "common.proto";
+
+message GroupCreateRequest {
+  optional bytes request_id = 1;
+  repeated uint64 member_user_ids = 2 [packed = false];
+}
+
+message GroupCreateAck {
+  optional uint64 conversation_id = 1;
+}
+
+message GroupMembersRequest {
+  optional uint64 conversation_id = 1;
+}
+
+message GroupMember {
+  optional uint64 user_id = 1;
+  optional uint64 access_version = 2;
+}
+
+message GroupMembersAck {
+  optional uint64 conversation_id = 1;
+  optional bytes history_id = 2;
+  optional uint64 owner_user_id = 3;
+  repeated GroupMember members = 4;
+}
+
+message GroupMemberRemoveRequest {
+  optional uint64 conversation_id = 1;
+  optional bytes history_id = 2;
+  optional uint64 user_id = 3;
+  optional uint64 access_version = 4;
+}
+
+message GroupMemberRemoveAck {
+  optional uint64 conversation_id = 1;
+  optional uint64 user_id = 2;
+  optional uint64 access_version = 3;
+}
+
+message GroupInviteRequest {
+  optional uint64 conversation_id = 1;
+  optional uint64 target_user_id = 2;
+  optional bytes request_id = 3;
+}
+
+message GroupInviteInboxRequest {
+  optional uint64 after_conversation_id = 1;
+}
+
+message GroupInvitation {
+  optional uint64 conversation_id = 1;
+  optional uint64 inviter_user_id = 2;
+  optional bytes request_id = 3;
+}
+
+message GroupInviteInboxAck {
+  repeated GroupInvitation invitations = 1;
+  optional uint64 next_after_conversation_id = 2;
+}
+
+message GroupInviteDecideRequest {
+  optional uint64 conversation_id = 1;
+  optional bytes request_id = 2;
+  optional bool accept = 3;
+}
+
+message GroupInviteResultAck {
+  oneof value {
+    Empty pending = 1;
+    uint64 conversation_id = 2;
+    Empty rejected = 3;
+  }
+}

@@ -1,4 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=../../proto");
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
     std::env::set_var("PROTOC", protoc);
 
@@ -8,9 +9,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .file_descriptor_set_path(
             std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("protocol.bin"),
         )
-        .compile_protos(
-            &["../../proto/iam/protocol/protocol.proto"],
-            &["../../proto"],
-        )?;
+        .compile_protos(&["../../proto/protocol.proto"], &["../../proto"])?;
     Ok(())
 }
