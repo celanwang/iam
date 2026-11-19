@@ -161,6 +161,11 @@ impl TidbService {
         self.engine.lock().unwrap().store.uses_device_credentials()
     }
 
+    /// Check the configured TiDB store without updating its clock or locking the control row.
+    pub async fn probe_storage(&self) -> Result<()> {
+        self.database.probe().await
+    }
+
     pub fn reload_device_credentials(
         &self,
         credentials: Vec<DeviceCredential>,

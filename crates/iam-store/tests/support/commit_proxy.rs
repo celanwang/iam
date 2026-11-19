@@ -31,6 +31,10 @@ pub struct CommitProxy {
 impl CommitProxy {
     pub async fn start(database: &Url) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        Self::start_on(database, listener)
+    }
+
+    pub fn start_on(database: &Url, listener: TcpListener) -> Self {
         let upstream = (
             database
                 .host_str()

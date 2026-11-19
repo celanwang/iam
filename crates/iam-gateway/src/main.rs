@@ -1,9 +1,9 @@
 use iam_core::{DeviceCredential, Engine};
-use iam_gateway::{Gateway, Limits};
+use iam_gateway::{Gateway, GatewayTls, Limits};
 use iam_protocol::parse_id128_bytes;
 use iam_store::{OpenMode, TidbService};
-use std::{error::Error, io};
-use tokio::net::TcpListener;
+use std::{error::Error, io, net::SocketAddr};
+use tokio::net::{lookup_host, TcpSocket};
 use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 #[tokio::main]
@@ -14,6 +14,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         credentials: required("IAM_DEVICE_CREDENTIALS")?,
     };
     let config = files.read()?;
+    let tls = GatewayTls::new(config.certificates, config.key)
+        .map_err(|error| format!("invalid IAM_TLS_CERT or IAM_TLS_KEY: {error}"))?;
     let mut engine = Engine::new(0);
     engine
         .store
@@ -25,9 +27,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let url = required("IAM_TIDB_URL")?;
     let store_id = parse_id(&required("IAM_STORE_ID")?)?;
+    let socket = bind_socket(&required("IAM_GATEWAY_BIND")?)
+        .await
+        .map_err(|error| format!("cannot bind IAM_GATEWAY_BIND: {error}"))?;
     let service = TidbService::connect_local(&url, store_id, engine, mode).await?;
-    let gateway = Gateway::new(service, config.certificates, config.key, Limits::default())?;
-    let listener = TcpListener::bind(required("IAM_GATEWAY_BIND")?).await?;
+    let gateway = Gateway::with_tls(service, tls, Limits::default())?;
+    let listener = socket.listen(1024)?;
     let shutdown = shutdown_signal()?;
     let address = listener.local_addr()?;
     #[cfg(unix)]
@@ -56,6 +61,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
     reload.abort();
     result?;
     Ok(())
+}
+
+async fn bind_socket(bind: &str) -> io::Result<TcpSocket> {
+    let mut error = io::Error::new(io::ErrorKind::InvalidInput, "no addresses to bind");
+    for address in lookup_host(bind).await? {
+        match bind_address(address) {
+            Ok(socket) => return Ok(socket),
+            Err(cause) => error = cause,
+        }
+    }
+    Err(error)
+}
+
+fn bind_address(address: SocketAddr) -> io::Result<TcpSocket> {
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    #[cfg(unix)]
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    Ok(socket)
 }
 
 #[derive(Clone)]

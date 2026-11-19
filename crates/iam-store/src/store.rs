@@ -254,6 +254,20 @@ impl TidbStore {
         })
     }
 
+    pub async fn probe(&self) -> Result<()> {
+        let row =
+            sqlx::query("SELECT store_id, friends_ready FROM store_control WHERE singleton = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        check_store_id(&row, self.id)?;
+        if row.try_get::<u8, _>("friends_ready")? != STORAGE_SCHEMA_VERSION {
+            return Err(Error::Configuration(
+                "run the offline storage schema upgrade",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn now(&self) -> Result<i64> {
         #[cfg(any(test, feature = "profile"))]
         let start = std::time::Instant::now();
